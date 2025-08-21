@@ -13,6 +13,7 @@ class EpisodeConfig:
     min_base: int = 5
     max_base: int = 10
     device: str = "cpu"
+    canonicalize: bool = True
 
 
 class EpisodeGenerator:
@@ -246,10 +247,14 @@ class EpisodeGenerator:
             digits = self._to_base(x, b)  # 0..b-1
             remap = list(range(b))
             random.shuffle(remap)
-            remapped = [remap[d] for d in digits]
-            remapped = [d + 1 for d in remapped]
-            L = min(len(remapped), max_len)
-            seq[i, max_len - L : max_len] = torch.tensor(remapped[-L:], device=device)
+            if self.cfg.canonicalize:
+                # Ignore random remap; keep canonical digits for stability
+                tokens = [d + 1 for d in digits]
+            else:
+                remapped = [remap[d] for d in digits]
+                tokens = [d + 1 for d in remapped]
+            L = min(len(tokens), max_len)
+            seq[i, max_len - L : max_len] = torch.tensor(tokens[-L:], device=device)
             attn[i, max_len - L : max_len] = True
         return seq, attn, base
 
@@ -266,9 +271,12 @@ class EpisodeGenerator:
             digits = self._to_base(x, b)
             remap = list(range(b))
             random.shuffle(remap)
-            remapped = [d + 1 for d in (remap[d] for d in digits)]
-            L = min(len(remapped), max_len)
-            seq[i, max_len - L : max_len] = torch.tensor(remapped[-L:], device=device)
+            if self.cfg.canonicalize:
+                tokens = [d + 1 for d in digits]
+            else:
+                tokens = [d + 1 for d in (remap[d] for d in digits)]
+            L = min(len(tokens), max_len)
+            seq[i, max_len - L : max_len] = torch.tensor(tokens[-L:], device=device)
             attn[i, max_len - L : max_len] = True
         return seq, attn, base
 
