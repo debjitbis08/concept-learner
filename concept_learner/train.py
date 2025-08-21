@@ -94,17 +94,25 @@ def run_step(
 
     # Invariance & identification
     # Views curriculum: keep base fixed; schedule easy positives (identical remap)
-    if step_idx < 3000:
+    if step_idx < 6000:
         easy_prob = 1.0
-    elif step_idx < 6000:
+    elif step_idx < 10000:
         easy_prob = 0.5
-    elif step_idx < 8000:
+    elif step_idx < 14000:
         easy_prob = 0.2
     else:
         easy_prob = 0.0
+    # Base-change schedule (stay off for a long time)
+    if step_idx < 10000:
+        change_base_prob = 0.0
+    elif step_idx < 14000:
+        change_base_prob = 0.5
+    else:
+        change_base_prob = 1.0
     if adapt and adapt.get("recovery", False):
         easy_prob = 1.0
-    views = gen.sample_views(cfg.batch, change_base_prob=0.0, easy_same_remap_prob=easy_prob)
+        change_base_prob = 0.0
+    views = gen.sample_views(cfg.batch, change_base_prob=change_base_prob, easy_same_remap_prob=easy_prob)
     v1 = views["view1_desc"].to(device)
     v1m = views["view1_mask"].to(device)
     v2 = views["view2_desc"].to(device)
@@ -152,15 +160,15 @@ def run_step(
     loss_rel = nn.CrossEntropyLoss()(logits_rel, labels_rel)
     losses["rel"] = loss_rel
 
-    # Restrict analogies to parity only for first 4000 steps
-    allowed = [0] if step_idx < 4000 else None
+    # Restrict analogies to parity only for a long warmup
+    allowed = [0] if step_idx < 8000 else None
     analog = gen.sample_analogies(cfg.batch, allowed_relations=allowed)
     A = model.encode(analog["A_desc"].to(device), analog["A_mask"].to(device))["z_q"]
     B = model.encode(analog["B_desc"].to(device), analog["B_mask"].to(device))["z_q"]
     C = model.encode(analog["C_desc"].to(device), analog["C_mask"].to(device))["z_q"]
     D = model.encode(analog["D_desc"].to(device), analog["D_mask"].to(device))["z_q"]
     # Analogy classification with scheduled temperature
-    an_temp = 0.5 if step_idx < 3000 else 0.2
+    an_temp = 0.5 if step_idx < 8000 else 0.2
     loss_analogy = model.analogy.analogy_loss(A, B, C, D, temp=an_temp)
     # Add offset loss in concept space (strong early)
     r_off1 = A - B
@@ -207,16 +215,16 @@ def run_step(
 
     # Mix
     # Scheduled weights
-    w_c = 0.1 if step_idx < 4000 else cfg.loss_contrastive
-    w_rel = 2.0 if step_idx < 4000 else cfg.loss_rel
-    w_an = 1.5 if step_idx < 4000 else cfg.loss_analogy
+    w_c = 0.1 if step_idx < 8000 else cfg.loss_contrastive
+    w_rel = 2.0 if step_idx < 8000 else cfg.loss_rel
+    w_an = 1.5 if step_idx < 8000 else cfg.loss_analogy
     w_mdl = cfg.loss_mdl
     w_vq_usage = cfg.loss_vq_usage
     w_codes = cfg.loss_codes
     if adapt and adapt.get("recovery", False):
         w_c = 0.0
-        w_rel = max(w_rel, 2.0)
-        w_an = max(w_an, 1.5)
+        w_rel = max(w_rel, 3.0)
+        w_an = max(w_an, 2.0)
         w_mdl = 0.0
         w_vq_usage = max(w_vq_usage, 0.3)
         w_codes = max(w_codes, 0.2)
@@ -338,6 +346,7 @@ def train_main():
 
     collapse_counter = 0
     recovery_until = 0
+    last_an_acc = float('nan')
     for step in range(start_step, end_step + 1):
         # Increase stability penalty a bit during sleep steps
         if step % tcfg.sleep_every == 0:
@@ -363,11 +372,12 @@ def train_main():
                 mean_q_s = q_s.mean(dim=0)
                 perplexity = torch.exp(-(mean_q_s * torch.log(mean_q_s + 1e-8)).sum()).item()
                 unique = int((mean_q_s > (1.0 / model.num_codes) * 0.01).sum().item())
-            # Quick in-batch analogy accuracy probe (parity-only early)
-            if step % 500 == 0:
+            # Quick in-batch analogy accuracy probe (parity-only early), more frequent and persistent value
+            if step % 100 == 0:
                 with torch.no_grad():
-                    allowed_eval = [0] if step < 4000 else None
-                    analog_small = gen.sample_analogies(64, allowed_relations=allowed_eval)
+                    allowed_eval = [0] if step < 8000 else None
+                    probe_bs = 64
+                    analog_small = gen.sample_analogies(probe_bs, allowed_relations=allowed_eval)
                     Aev = model.encode(analog_small["A_desc"].to(tcfg.device), analog_small["A_mask"].to(tcfg.device))["z_q"]
                     Bev = model.encode(analog_small["B_desc"].to(tcfg.device), analog_small["B_mask"].to(tcfg.device))["z_q"]
                     Cev = model.encode(analog_small["C_desc"].to(tcfg.device), analog_small["C_mask"].to(tcfg.device))["z_q"]
@@ -377,15 +387,16 @@ def train_main():
                     sim = torch.einsum("bp,bnp->bn", F.normalize(r_ab, dim=-1), F.normalize(r_cd_all, dim=-1))
                     pred = sim.argmax(dim=-1)
                     labels = torch.arange(sim.size(0), device=tcfg.device)
-                    an_acc = (pred == labels).float().mean().item()
-            else:
-                an_acc = float('nan')
+                    last_an_acc = (pred == labels).float().mean().item()
+            an_acc = last_an_acc
             c_disp = (losses.get('contrast_align', 0.0) + losses.get('code_ce', 0.0))
+            baseline = 1.0 / 64.0
             print(
                 f"step {step:04d} total={total:.3f} "
                 f"c={c_disp:.3f} rel={losses['rel']:.3f} an={losses['analogy']:.3f} "
                 f"mdl={losses['mdl']:.3f} task={losses['task']:.3f} vq={losses['vq']:.3f} st={losses['stability']:.3f} "
-                f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} an_acc={an_acc:.3f} rec={(step<=recovery_until)}"
+                f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} "
+                f"an_acc={an_acc:.3f} (EMA, in-batch parity; random~{baseline:.3f}) rec={(step<=recovery_until)}"
             )
             # Watchdog: auto-recover on codebook collapse
             if perplexity < 5.0:
