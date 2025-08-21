@@ -1,6 +1,6 @@
 import argparse
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Tuple, Optional
 
 import torch
 import torch.nn as nn
@@ -15,6 +15,145 @@ from concept_learner.model.relation_head import DistMultHead, AnalogyProjector
 from concept_learner.losses import EWC, info_nce, code_usage_entropy
 from utils.checkpoints import CheckpointManager
 from utils.ema import EMA
+
+
+class ReplayBuffer:
+    """
+    Tiny replay buffer storing indices for different episode types.
+    We re-render descriptors on demand using the attached generator to avoid
+    storing full token tensors in memory.
+    """
+
+    def __init__(self, gen: EpisodeGenerator, cap_per_type: int = 4096):
+        self.gen = gen
+        self.cap = cap_per_type
+        self.views: List[int] = []
+        self.triples: List[Tuple[int, int, int]] = []
+        self.analogies: List[Tuple[int, int, int, int]] = []
+        self.pairs: List[Tuple[int, int, int]] = []  # (a,b,label)
+
+    def __len__(self) -> int:
+        return max(len(self.views), len(self.triples), len(self.analogies), len(self.pairs))
+
+    def add_from_batches(self, views: Dict[str, torch.Tensor], triples: Dict[str, torch.Tensor], analog: Dict[str, torch.Tensor], pairs: Dict[str, torch.Tensor]) -> None:
+        # Views: just keep indices
+        if "idx" in views:
+            for v in views["idx"].tolist():
+                self.views.append(int(v))
+        # Triples: (s,r,o)
+        if all(k in triples for k in ("s_idx", "r", "o_idx")):
+            for s, r, o in zip(triples["s_idx"].tolist(), triples["r"].tolist(), triples["o_idx"].tolist()):
+                self.triples.append((int(s), int(r), int(o)))
+        # Analogies: (A,B,C,D)
+        if all(k in analog for k in ("A_idx", "B_idx", "C_idx", "D_idx")):
+            for A, B, C, D in zip(
+                analog["A_idx"].tolist(), analog["B_idx"].tolist(), analog["C_idx"].tolist(), analog["D_idx"].tolist()
+            ):
+                self.analogies.append((int(A), int(B), int(C), int(D)))
+        # Pairs: (a,b,label)
+        if all(k in pairs for k in ("a_idx", "b_idx", "label")):
+            for a, b, y in zip(pairs["a_idx"].tolist(), pairs["b_idx"].tolist(), pairs["label"].tolist()):
+                self.pairs.append((int(a), int(b), int(y)))
+
+        # Truncate to capacity (keep most recent)
+        self.views = self.views[-self.cap :]
+        self.triples = self.triples[-self.cap :]
+        self.analogies = self.analogies[-self.cap :]
+        self.pairs = self.pairs[-self.cap :]
+
+    def _choice(self, n: int, size: int) -> List[int]:
+        idx = torch.randint(0, max(1, n), (size,), device=self.gen.cfg.device)
+        return idx.tolist()
+
+    def sample_views(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
+        if len(self.views) < batch:
+            return None
+        choice = self._choice(len(self.views), batch)
+        idx = torch.tensor([self.views[i] for i in choice], device=self.gen.cfg.device)
+        v1_desc, v1_mask, v1_base = self.gen._render_batch(idx)
+        v2_desc, v2_mask, v2_base = self.gen._render_batch(idx)
+        return {
+            "idx": idx,
+            "view1_desc": v1_desc,
+            "view1_mask": v1_mask,
+            "view1_base": v1_base,
+            "view2_desc": v2_desc,
+            "view2_mask": v2_mask,
+            "view2_base": v2_base,
+        }
+
+    def sample_triples(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
+        if len(self.triples) < batch:
+            return None
+        choice = self._choice(len(self.triples), batch)
+        s = torch.tensor([self.triples[i][0] for i in choice], device=self.gen.cfg.device)
+        r = torch.tensor([self.triples[i][1] for i in choice], device=self.gen.cfg.device)
+        o = torch.tensor([self.triples[i][2] for i in choice], device=self.gen.cfg.device)
+        s_desc, s_mask, s_base = self.gen._render_batch(s)
+        o_desc, o_mask, o_base = self.gen._render_batch(o)
+        return {
+            "s_idx": s,
+            "r": r,
+            "o_idx": o,
+            "s_desc": s_desc,
+            "s_mask": s_mask,
+            "s_base": s_base,
+            "o_desc": o_desc,
+            "o_mask": o_mask,
+            "o_base": o_base,
+        }
+
+    def sample_analogies(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
+        if len(self.analogies) < batch:
+            return None
+        choice = self._choice(len(self.analogies), batch)
+        A = torch.tensor([self.analogies[i][0] for i in choice], device=self.gen.cfg.device)
+        B = torch.tensor([self.analogies[i][1] for i in choice], device=self.gen.cfg.device)
+        C = torch.tensor([self.analogies[i][2] for i in choice], device=self.gen.cfg.device)
+        D = torch.tensor([self.analogies[i][3] for i in choice], device=self.gen.cfg.device)
+        A_desc, A_mask, A_base = self.gen._render_batch(A)
+        B_desc, B_mask, B_base = self.gen._render_batch(B)
+        C_desc, C_mask, C_base = self.gen._render_batch(C)
+        D_desc, D_mask, D_base = self.gen._render_batch(D)
+        return {
+            "A_idx": A,
+            "B_idx": B,
+            "C_idx": C,
+            "D_idx": D,
+            "A_desc": A_desc,
+            "A_mask": A_mask,
+            "A_base": A_base,
+            "B_desc": B_desc,
+            "B_mask": B_mask,
+            "B_base": B_base,
+            "C_desc": C_desc,
+            "C_mask": C_mask,
+            "C_base": C_base,
+            "D_desc": D_desc,
+            "D_mask": D_mask,
+            "D_base": D_base,
+        }
+
+    def sample_pairs(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
+        if len(self.pairs) < batch:
+            return None
+        choice = self._choice(len(self.pairs), batch)
+        a = torch.tensor([self.pairs[i][0] for i in choice], device=self.gen.cfg.device)
+        b = torch.tensor([self.pairs[i][1] for i in choice], device=self.gen.cfg.device)
+        y = torch.tensor([self.pairs[i][2] for i in choice], device=self.gen.cfg.device)
+        a_desc, a_mask, a_base = self.gen._render_batch(a)
+        b_desc, b_mask, b_base = self.gen._render_batch(b)
+        return {
+            "a_idx": a,
+            "b_idx": b,
+            "a_desc": a_desc,
+            "a_mask": a_mask,
+            "a_base": a_base,
+            "b_desc": b_desc,
+            "b_mask": b_mask,
+            "b_base": b_base,
+            "label": y.long(),
+        }
 
 
 @dataclass
@@ -87,6 +226,7 @@ def run_step(
     ema: EMA | None = None,
     adapt: Dict[str, bool] | None = None,
     sleep: bool = False,
+    replay: ReplayBuffer | None = None,
 ):
     model.train()
     device = cfg.device
@@ -112,7 +252,12 @@ def run_step(
     if adapt and adapt.get("recovery", False):
         easy_prob = 1.0
         change_base_prob = 0.0
-    views = gen.sample_views(cfg.batch, change_base_prob=change_base_prob, easy_same_remap_prob=easy_prob)
+    if sleep and replay is not None:
+        views = replay.sample_views(cfg.batch) or gen.sample_views(
+            cfg.batch, change_base_prob=change_base_prob, easy_same_remap_prob=easy_prob
+        )
+    else:
+        views = gen.sample_views(cfg.batch, change_base_prob=change_base_prob, easy_same_remap_prob=easy_prob)
     v1 = views["view1_desc"].to(device)
     v1m = views["view1_mask"].to(device)
     v2 = views["view2_desc"].to(device)
@@ -147,7 +292,9 @@ def run_step(
     losses["code_ce"] = nn.CrossEntropyLoss()(torch.log_softmax(logits_codes, dim=-1), e2["indices"])  # type: ignore
 
     # Relational & analogical
-    triples = gen.sample_triples(cfg.batch)
+    triples = replay.sample_triples(cfg.batch) if (sleep and replay is not None) else None
+    if triples is None:
+        triples = gen.sample_triples(cfg.batch)
     s = model.encode(triples["s_desc"].to(device), triples["s_mask"].to(device))["z_q"]
     o = model.encode(triples["o_desc"].to(device), triples["o_mask"].to(device))["z_q"]
     r = triples["r"].to(device)
@@ -162,7 +309,9 @@ def run_step(
 
     # Restrict analogies to parity only for a long warmup
     allowed = [0] if step_idx < 8000 else None
-    analog = gen.sample_analogies(cfg.batch, allowed_relations=allowed)
+    analog = replay.sample_analogies(cfg.batch) if (sleep and replay is not None) else None
+    if analog is None:
+        analog = gen.sample_analogies(cfg.batch, allowed_relations=allowed)
     A = model.encode(analog["A_desc"].to(device), analog["A_mask"].to(device))["z_q"]
     B = model.encode(analog["B_desc"].to(device), analog["B_mask"].to(device))["z_q"]
     C = model.encode(analog["C_desc"].to(device), analog["C_mask"].to(device))["z_q"]
@@ -198,7 +347,9 @@ def run_step(
     losses["vq_usage"] = usage_loss
 
     # Light task head: same/different concept pairs
-    pairs = gen.sample_posneg_pairs(cfg.batch)
+    pairs = replay.sample_pairs(cfg.batch) if (sleep and replay is not None) else None
+    if pairs is None:
+        pairs = gen.sample_posneg_pairs(cfg.batch)
     a = F.normalize(model.encode(pairs["a_desc"].to(device), pairs["a_mask"].to(device))["z_q"], dim=-1)
     b = F.normalize(model.encode(pairs["b_desc"].to(device), pairs["b_mask"].to(device))["z_q"], dim=-1)
     y = pairs["label"].to(device)
@@ -249,6 +400,13 @@ def run_step(
     if ema is not None:
         ema.update(model)
 
+    # Update replay with most recent on-policy batches (not during sleep)
+    if (replay is not None) and (not sleep):
+        try:
+            replay.add_from_batches(views, triples, analog, pairs)
+        except Exception:
+            pass
+
     return {k: v.detach().item() for k, v in losses.items()}, total.detach().item()
 
 
@@ -296,6 +454,7 @@ def train_main():
         weight_decay=1e-2,
     )
     ewc = EWC(model.parameters(), weight=0.0)
+    replay = ReplayBuffer(gen)
 
     ckpts = CheckpointManager(dir=args.ckpt_dir, keep=5)
     best_rel = float("inf")
@@ -354,7 +513,13 @@ def train_main():
         else:
             ewc.weight = 0.0
         adapt = {"recovery": step <= recovery_until}
-        losses, total = run_step(model, gen, tcfg, opt, ewc, step, ema, adapt)
+        losses, total = run_step(model, gen, tcfg, opt, ewc, step, ema, adapt, sleep=False, replay=replay)
+        # Mini-nap: a few replay-only consolidation steps
+        if step % tcfg.sleep_every == 0 and len(replay) > 0:
+            nap_iters = max(1, min(tcfg.sleep_steps, len(replay) // max(1, tcfg.batch)))
+            for _ in range(nap_iters):
+                ewc.weight = 0.2
+                _losses, _total = run_step(model, gen, tcfg, opt, ewc, step, ema, {"recovery": True}, sleep=True, replay=replay)
         if step % 10 == 0 or step == 1:
             # Codebook stats (approximate, from a small batch)
             # For lightweight logging, recompute a small batch indices
@@ -416,61 +581,52 @@ def train_main():
                         break
                 if chosen is not None:
                     try:
-                        ckpt = torch.load(chosen, map_location="cpu")
-                        model.load_state_dict(ckpt.get("model", ckpt))
-                        if ckpt.get("optim") is not None:
-                            opt.load_state_dict(ckpt["optim"])  # type: ignore
-                        if ckpt.get("ema") is not None:
-                            ema.load_state_dict(ckpt["ema"])  # type: ignore
-                        recovery_until = step + 1000
-                        collapse_counter = 0
-                        print(f"[watchdog] Rolled back from {chosen}; entering recovery until step {recovery_until}")
+                        state = torch.load(chosen, map_location="cpu")
+                        model.load_state_dict(state.get("model", state))
+                        if state.get("optim") is not None:
+                            opt.load_state_dict(state["optim"])  # type: ignore
+                        if state.get("ema") is not None:
+                            ema.load_state_dict(state["ema"])  # type: ignore
+                        # Refresh EWC snapshot to the recovered params
+                        ewc.update(model.parameters())
+                        recovery_until = step + 500
+                        print(f"[watchdog] Recovered from {chosen}; entering recovery mode until step {recovery_until}")
                     except Exception as e:
-                        print(f"[watchdog] Failed to rollback from {chosen}: {e}")
-        # Checkpointing cadence: every N steps and at curriculum boundaries
-        if (step % args.save_every == 0) or (step in curriculum_boundaries):
-            # Periodic checkpoint via CheckpointManager + latest copy
-            os.makedirs(args.ckpt_dir, exist_ok=True)
-            allowed_eval = [0] if step < 4000 else None
-            probe_acc = probe_analogy_acc(batch_size=128, allowed_eval=allowed_eval)
-            extra_state = {"metrics": losses, "total": total, "an_acc": probe_acc}
-            ckpts.save(step, model, opt, ema=ema, extra=extra_state)
-            latest = os.path.join(args.ckpt_dir, "latest.pt")
-            torch.save({
+                        print(f"[watchdog] Failed to recover from {chosen}: {e}")
+                collapse_counter = 0
+
+        # Checkpointing and periodic eval
+        if (step % max(1, args.save_every)) == 0 or step == end_step:
+            latest_path = os.path.join(args.ckpt_dir, "latest.pt")
+            state = {
                 "step": step,
                 "model": model.state_dict(),
                 "optim": opt.state_dict(),
                 "ema": ema.state_dict(),
-                "extra": extra_state,
-            }, latest)
-            # Track best by relation CE and in-batch analogy acc (if available)
-            if losses["rel"] < best_rel:
-                best_rel = losses["rel"]
-                torch.save(
-                    {
-                        "step": step,
-                        "model": model.state_dict(),
-                        "optim": opt.state_dict(),
-                        "ema": ema.state_dict(),
-                        "extra": extra_state,
-                    },
-                    os.path.join(args.ckpt_dir, "best_rel.pt"),
-                )
-            if not (probe_acc != probe_acc):  # not NaN
-                if probe_acc > best_an:
-                    best_an = probe_acc
-                    torch.save(
-                        {
-                            "step": step,
-                            "model": model.state_dict(),
-                            "optim": opt.state_dict(),
-                            "ema": ema.state_dict(),
-                            "extra": extra_state,
-                        },
-                        os.path.join(args.ckpt_dir, "best_an.pt"),
-                    )
-        if step % tcfg.sleep_every == 0:
-            ewc.update(model.parameters())
+                "extra": {},
+            }
+            os.makedirs(args.ckpt_dir, exist_ok=True)
+            torch.save(state, latest_path)
+            # Update bests
+            try:
+                if losses["rel"] < best_rel:
+                    best_rel = float(losses["rel"]) 
+                    torch.save(state, os.path.join(args.ckpt_dir, "best_rel.pt"))
+                # Probe EMA analogy accuracy (parity-only early)
+                allowed_eval = [0] if step < 8000 else None
+                an_acc_probe = probe_analogy_acc(batch_size=128, allowed_eval=allowed_eval)
+                if an_acc_probe > best_an:
+                    best_an = float(an_acc_probe)
+                    torch.save(state, os.path.join(args.ckpt_dir, "best_an.pt"))
+            except Exception:
+                pass
+
+        # Curriculum hook: example toggle for canonicalization later
+        if step in curriculum_boundaries:
+            if step >= 10000:
+                gen.cfg.canonicalize = False
+
+    print("[train] Done.")
 
 
 if __name__ == "__main__":
