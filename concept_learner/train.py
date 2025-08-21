@@ -6,12 +6,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
+import os
 
 from concept_learner.data.episode_gen import EpisodeConfig, EpisodeGenerator
 from concept_learner.model.backbone import TinyBackbone
 from concept_learner.model.vq_layer import EmaVectorQuantizer
 from concept_learner.model.relation_head import DistMultHead, AnalogyProjector
 from concept_learner.losses import EWC, info_nce, code_usage_entropy
+from utils.checkpoints import CheckpointManager
 
 
 @dataclass
@@ -225,6 +227,8 @@ def train_main():
     parser.add_argument("--device", default="auto", help="cuda|cpu|auto (default auto)")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--batch", type=int, default=128)
+    parser.add_argument("--ckpt_dir", default="checkpoints")
+    parser.add_argument("--save_every", type=int, default=1000)
     args = parser.parse_args()
 
     device = _resolve_device(args.device)
@@ -250,6 +254,12 @@ def train_main():
         weight_decay=1e-2,
     )
     ewc = EWC(model.parameters(), weight=0.0)
+
+    ckpts = CheckpointManager(dir=args.ckpt_dir, keep=5)
+    best_rel = float("inf")
+    best_an = -float("inf")
+
+    curriculum_boundaries = {3000, 6000, 8000}
 
     for step in range(1, tcfg.steps + 1):
         # Increase stability penalty a bit during sleep steps
@@ -298,6 +308,42 @@ def train_main():
                 f"mdl={losses['mdl']:.3f} task={losses['task']:.3f} vq={losses['vq']:.3f} st={losses['stability']:.3f} "
                 f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} an_acc={an_acc:.3f}"
             )
+        # Checkpointing cadence: every N steps and at curriculum boundaries
+        if (step % args.save_every == 0) or (step in curriculum_boundaries):
+            # Periodic checkpoint via CheckpointManager + latest copy
+            os.makedirs(args.ckpt_dir, exist_ok=True)
+            ckpts.save(step, model, opt, ema=None, extra={"metrics": losses, "total": total})
+            latest = os.path.join(args.ckpt_dir, "latest.pt")
+            torch.save({
+                "step": step,
+                "model": model.state_dict(),
+                "optim": opt.state_dict(),
+                "extra": {"metrics": losses, "total": total},
+            }, latest)
+            # Track best by relation CE and in-batch analogy acc (if available)
+            if losses["rel"] < best_rel:
+                best_rel = losses["rel"]
+                torch.save(
+                    {
+                        "step": step,
+                        "model": model.state_dict(),
+                        "optim": opt.state_dict(),
+                        "extra": {"metrics": losses, "total": total},
+                    },
+                    os.path.join(args.ckpt_dir, "best_rel.pt"),
+                )
+            if not (an_acc != an_acc):  # not NaN
+                if an_acc > best_an:
+                    best_an = an_acc
+                    torch.save(
+                        {
+                            "step": step,
+                            "model": model.state_dict(),
+                            "optim": opt.state_dict(),
+                            "extra": {"metrics": losses, "total": total, "an_acc": an_acc},
+                        },
+                        os.path.join(args.ckpt_dir, "best_an.pt"),
+                    )
         if step % tcfg.sleep_every == 0:
             ewc.update(model.parameters())
 
