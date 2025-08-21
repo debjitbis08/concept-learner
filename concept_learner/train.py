@@ -55,7 +55,7 @@ class ConceptLearner(nn.Module):
         super().__init__()
         self.backbone = TinyBackbone(cfg.vocab_size, cfg.d_model, cfg.nhead, cfg.num_layers, cfg.max_len)
         self.to_code = nn.Linear(cfg.d_model, cfg.code_dim)
-        self.vq = EmaVectorQuantizer(cfg.num_codes, cfg.code_dim)
+        self.vq = EmaVectorQuantizer(cfg.num_codes, cfg.code_dim, decay=0.995)
         self.rel = DistMultHead(cfg.code_dim, cfg.relations)
         self.analogy = AnalogyProjector(cfg.code_dim, proj_dim=min(32, cfg.code_dim))
         self.same_head = nn.Sequential(
@@ -130,14 +130,13 @@ def run_step(
         # Use pre-quantized features for InfoNCE (smoother alignment)
         z1 = model.proj1(e1["z"])  # pre-quantized
         z2 = model.proj2(e2["z"])  # pre-quantized
-    # symmetric stop-grad InfoNCE
+    # symmetric stop-grad InfoNCE (alignment)
     loss_c12 = info_nce(z1.detach(), z2, temperature)
     loss_c21 = info_nce(z2.detach(), z1, temperature)
-    loss_contrast = 0.5 * (loss_c12 + loss_c21)
-    # Encourage same code across views via cross-entropy on indices (small weight)
+    losses["contrast_align"] = 0.5 * (loss_c12 + loss_c21)
+    # Code-tying CE (match codes across views)
     logits_codes = torch.matmul(e1["z_q"], model.vq.codebook.weight.t())
-    loss_codes = nn.CrossEntropyLoss()(torch.log_softmax(logits_codes, dim=-1), e2["indices"])  # type: ignore
-    losses["contrast"] = loss_contrast + cfg.loss_codes * loss_codes
+    losses["code_ce"] = nn.CrossEntropyLoss()(torch.log_softmax(logits_codes, dim=-1), e2["indices"])  # type: ignore
 
     # Relational & analogical
     triples = gen.sample_triples(cfg.batch)
@@ -213,14 +212,17 @@ def run_step(
     w_an = 1.5 if step_idx < 4000 else cfg.loss_analogy
     w_mdl = cfg.loss_mdl
     w_vq_usage = cfg.loss_vq_usage
+    w_codes = cfg.loss_codes
     if adapt and adapt.get("recovery", False):
-        w_c = 0.02
+        w_c = 0.0
         w_rel = max(w_rel, 2.0)
         w_an = max(w_an, 1.5)
         w_mdl = 0.0
         w_vq_usage = max(w_vq_usage, 0.3)
+        w_codes = max(w_codes, 0.2)
     total = (
-        w_c * losses["contrast"]
+        w_c * losses["contrast_align"]
+        + w_codes * losses["code_ce"]
         + w_rel * losses["rel"]
         + w_an * losses["analogy"]
         + w_mdl * losses["mdl"]
@@ -233,7 +235,8 @@ def run_step(
 
     optimizer.zero_grad()
     total.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+    clip_val = 0.2 if (adapt and adapt.get("recovery", False)) else 0.5
+    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_val)
     optimizer.step()
     if ema is not None:
         ema.update(model)
@@ -377,9 +380,10 @@ def train_main():
                     an_acc = (pred == labels).float().mean().item()
             else:
                 an_acc = float('nan')
+            c_disp = (losses.get('contrast_align', 0.0) + losses.get('code_ce', 0.0))
             print(
                 f"step {step:04d} total={total:.3f} "
-                f"c={losses['contrast']:.3f} rel={losses['rel']:.3f} an={losses['analogy']:.3f} "
+                f"c={c_disp:.3f} rel={losses['rel']:.3f} an={losses['analogy']:.3f} "
                 f"mdl={losses['mdl']:.3f} task={losses['task']:.3f} vq={losses['vq']:.3f} st={losses['stability']:.3f} "
                 f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} an_acc={an_acc:.3f} rec={(step<=recovery_until)}"
             )
