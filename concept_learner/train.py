@@ -81,11 +81,11 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
 
     # Invariance & identification
     # Views curriculum: keep base fixed; schedule easy positives (identical remap)
-    if step_idx < 2000:
+    if step_idx < 3000:
         easy_prob = 1.0
-    elif step_idx < 4000:
-        easy_prob = 0.5
     elif step_idx < 6000:
+        easy_prob = 0.5
+    elif step_idx < 8000:
         easy_prob = 0.2
     else:
         easy_prob = 0.0
@@ -122,11 +122,14 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
     triples = gen.sample_triples(cfg.batch)
     s = model.encode(triples["s_desc"].to(device), triples["s_mask"].to(device))["z_q"]
     o = model.encode(triples["o_desc"].to(device), triples["o_mask"].to(device))["z_q"]
-    o_neg = model.encode(triples["o_neg_desc"].to(device), triples["o_neg_mask"].to(device))["z_q"]
     r = triples["r"].to(device)
-    pos = model.rel(s, r, o)
-    neg = model.rel(s, r, o_neg)
-    loss_rel = torch.clamp(1.0 - pos + neg, min=0.0).mean()
+    # In-batch multiclass relation loss (many negatives)
+    # v_i = s_i * W_{r_i}; logits = v @ o^T
+    W_sel = model.rel.rel[r]  # (B, D)
+    v = s * W_sel
+    logits_rel = torch.matmul(v, o.t())
+    labels_rel = torch.arange(logits_rel.size(0), device=device)
+    loss_rel = nn.CrossEntropyLoss()(logits_rel, labels_rel)
     losses["rel"] = loss_rel
 
     # Restrict analogies to parity only for first 4000 steps
@@ -136,12 +139,15 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
     B = model.encode(analog["B_desc"].to(device), analog["B_mask"].to(device))["z_q"]
     C = model.encode(analog["C_desc"].to(device), analog["C_mask"].to(device))["z_q"]
     D = model.encode(analog["D_desc"].to(device), analog["D_mask"].to(device))["z_q"]
-    loss_analogy = model.analogy.analogy_loss(A, B, C, D)
-    # Add offset loss in concept space
+    # Analogy classification with scheduled temperature
+    an_temp = 0.5 if step_idx < 3000 else 0.2
+    loss_analogy = model.analogy.analogy_loss(A, B, C, D, temp=an_temp)
+    # Add offset loss in concept space (strong early)
     r_off1 = A - B
     r_off2 = C - D
     loss_offset = F.mse_loss(r_off1, r_off2)
-    losses["analogy"] = loss_analogy + 0.5 * loss_offset if step_idx < 2000 else loss_analogy + 0.2 * loss_offset
+    off_w = 1.0 if step_idx < 3000 else 0.2
+    losses["analogy"] = loss_analogy + off_w * loss_offset
 
     # Minimality (MDL)
     indices = torch.cat([e1["indices"], e2["indices"]])
@@ -269,11 +275,28 @@ def train_main():
                 mean_q_s = q_s.mean(dim=0)
                 perplexity = torch.exp(-(mean_q_s * torch.log(mean_q_s + 1e-8)).sum()).item()
                 unique = int((mean_q_s > (1.0 / model.num_codes) * 0.01).sum().item())
+            # Quick in-batch analogy accuracy probe (parity-only early)
+            if step % 500 == 0:
+                with torch.no_grad():
+                    allowed_eval = [0] if step < 4000 else None
+                    analog_small = gen.sample_analogies(64, allowed_relations=allowed_eval)
+                    Aev = model.encode(analog_small["A_desc"].to(tcfg.device), analog_small["A_mask"].to(tcfg.device))["z_q"]
+                    Bev = model.encode(analog_small["B_desc"].to(tcfg.device), analog_small["B_mask"].to(tcfg.device))["z_q"]
+                    Cev = model.encode(analog_small["C_desc"].to(tcfg.device), analog_small["C_mask"].to(tcfg.device))["z_q"]
+                    Dev = model.encode(analog_small["D_desc"].to(tcfg.device), analog_small["D_mask"].to(tcfg.device))["z_q"]
+                    r_ab = model.analogy.rel_vec(Aev, Bev)
+                    r_cd_all = model.analogy.rel_vec(Cev.unsqueeze(1), Dev.unsqueeze(0))
+                    sim = torch.einsum("bp,bnp->bn", F.normalize(r_ab, dim=-1), F.normalize(r_cd_all, dim=-1))
+                    pred = sim.argmax(dim=-1)
+                    labels = torch.arange(sim.size(0), device=tcfg.device)
+                    an_acc = (pred == labels).float().mean().item()
+            else:
+                an_acc = float('nan')
             print(
                 f"step {step:04d} total={total:.3f} "
                 f"c={losses['contrast']:.3f} rel={losses['rel']:.3f} an={losses['analogy']:.3f} "
                 f"mdl={losses['mdl']:.3f} task={losses['task']:.3f} vq={losses['vq']:.3f} st={losses['stability']:.3f} "
-                f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes}"
+                f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} an_acc={an_acc:.3f}"
             )
         if step % tcfg.sleep_every == 0:
             ewc.update(model.parameters())
