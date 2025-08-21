@@ -14,6 +14,7 @@ from concept_learner.model.vq_layer import EmaVectorQuantizer
 from concept_learner.model.relation_head import DistMultHead, AnalogyProjector
 from concept_learner.losses import EWC, info_nce, code_usage_entropy
 from utils.checkpoints import CheckpointManager
+from utils.ema import EMA
 
 
 @dataclass
@@ -76,7 +77,7 @@ class ConceptLearner(nn.Module):
         return {"h": h, "z": z, "z_q": z_q, "indices": indices, "vq_loss": vq_loss}
 
 
-def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, optimizer, ewc: EWC, step_idx: int, sleep: bool = False):
+def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, optimizer, ewc: EWC, step_idx: int, ema: EMA | None = None, sleep: bool = False):
     model.train()
     device = cfg.device
     losses = {}
@@ -208,6 +209,8 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
     total.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()
+    if ema is not None:
+        ema.update(model)
 
     return {k: v.detach().item() for k, v in losses.items()}, total.detach().item()
 
@@ -229,6 +232,8 @@ def train_main():
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--ckpt_dir", default="checkpoints")
     parser.add_argument("--save_every", type=int, default=1000)
+    parser.add_argument("--resume_latest", action="store_true", help="resume from latest checkpoint in ckpt_dir")
+    parser.add_argument("--resume_path", default="", help="resume from a specific checkpoint path")
     args = parser.parse_args()
 
     device = _resolve_device(args.device)
@@ -258,16 +263,57 @@ def train_main():
     ckpts = CheckpointManager(dir=args.ckpt_dir, keep=5)
     best_rel = float("inf")
     best_an = -float("inf")
+    ema = EMA(model, decay=0.999)
+
+    # Resume logic
+    loaded_step = 0
+    if args.resume_latest:
+        try:
+            loaded_step, extra = ckpts.load_latest(model, opt, ema)
+            print(f"[train] Resumed from latest checkpoint at step {loaded_step}")
+        except AssertionError:
+            print("[train] No latest checkpoint found; starting fresh")
+    elif args.resume_path:
+        ckpt = torch.load(args.resume_path, map_location="cpu")
+        model.load_state_dict(ckpt.get("model", ckpt))
+        if ckpt.get("optim") is not None:
+            opt.load_state_dict(ckpt["optim"])  # type: ignore
+        if ckpt.get("ema") is not None:
+            ema.load_state_dict(ckpt["ema"])  # type: ignore
+        loaded_step = int(ckpt.get("step", 0))
+        print(f"[train] Resumed from path {args.resume_path} at step {loaded_step}")
+
+    def probe_analogy_acc(batch_size: int = 128, allowed_eval=None) -> float:
+        # Use EMA weights for a stable probe
+        ema.apply_to(model)
+        try:
+            analog_small = gen.sample_analogies(batch_size, allowed_relations=allowed_eval)
+            Aev = model.encode(analog_small["A_desc"].to(tcfg.device), analog_small["A_mask"].to(tcfg.device))["z_q"]
+            Bev = model.encode(analog_small["B_desc"].to(tcfg.device), analog_small["B_mask"].to(tcfg.device))["z_q"]
+            Cev = model.encode(analog_small["C_desc"].to(tcfg.device), analog_small["C_mask"].to(tcfg.device))["z_q"]
+            Dev = model.encode(analog_small["D_desc"].to(tcfg.device), analog_small["D_mask"].to(tcfg.device))["z_q"]
+            r_ab = model.analogy.rel_vec(Aev, Bev)
+            r_cd_all = model.analogy.rel_vec(Cev.unsqueeze(1), Dev.unsqueeze(0))
+            sim = torch.einsum("bp,bnp->bn", F.normalize(r_ab, dim=-1), F.normalize(r_cd_all, dim=-1))
+            pred = sim.argmax(dim=-1)
+            labels = torch.arange(sim.size(0), device=tcfg.device)
+            return (pred == labels).float().mean().item()
+        finally:
+            ema.restore(model)
 
     curriculum_boundaries = {3000, 6000, 8000}
 
-    for step in range(1, tcfg.steps + 1):
+    # If resuming, interpret --steps as additional steps to run from loaded_step
+    start_step = loaded_step + 1
+    end_step = loaded_step + tcfg.steps
+
+    for step in range(start_step, end_step + 1):
         # Increase stability penalty a bit during sleep steps
         if step % tcfg.sleep_every == 0:
             ewc.weight = 0.2
         else:
             ewc.weight = 0.0
-        losses, total = run_step(model, gen, tcfg, opt, ewc, step)
+        losses, total = run_step(model, gen, tcfg, opt, ewc, step, ema)
         if step % 10 == 0 or step == 1:
             # Codebook stats (approximate, from a small batch)
             # For lightweight logging, recompute a small batch indices
@@ -312,13 +358,17 @@ def train_main():
         if (step % args.save_every == 0) or (step in curriculum_boundaries):
             # Periodic checkpoint via CheckpointManager + latest copy
             os.makedirs(args.ckpt_dir, exist_ok=True)
-            ckpts.save(step, model, opt, ema=None, extra={"metrics": losses, "total": total})
+            allowed_eval = [0] if step < 4000 else None
+            probe_acc = probe_analogy_acc(batch_size=128, allowed_eval=allowed_eval)
+            extra_state = {"metrics": losses, "total": total, "an_acc": probe_acc}
+            ckpts.save(step, model, opt, ema=ema, extra=extra_state)
             latest = os.path.join(args.ckpt_dir, "latest.pt")
             torch.save({
                 "step": step,
                 "model": model.state_dict(),
                 "optim": opt.state_dict(),
-                "extra": {"metrics": losses, "total": total},
+                "ema": ema.state_dict(),
+                "extra": extra_state,
             }, latest)
             # Track best by relation CE and in-batch analogy acc (if available)
             if losses["rel"] < best_rel:
@@ -328,19 +378,21 @@ def train_main():
                         "step": step,
                         "model": model.state_dict(),
                         "optim": opt.state_dict(),
-                        "extra": {"metrics": losses, "total": total},
+                        "ema": ema.state_dict(),
+                        "extra": extra_state,
                     },
                     os.path.join(args.ckpt_dir, "best_rel.pt"),
                 )
-            if not (an_acc != an_acc):  # not NaN
-                if an_acc > best_an:
-                    best_an = an_acc
+            if not (probe_acc != probe_acc):  # not NaN
+                if probe_acc > best_an:
+                    best_an = probe_acc
                     torch.save(
                         {
                             "step": step,
                             "model": model.state_dict(),
                             "optim": opt.state_dict(),
-                            "extra": {"metrics": losses, "total": total, "an_acc": an_acc},
+                            "ema": ema.state_dict(),
+                            "extra": extra_state,
                         },
                         os.path.join(args.ckpt_dir, "best_an.pt"),
                     )

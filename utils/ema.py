@@ -51,3 +51,20 @@ class EMA:
                 i += 1
         self.backup = None
 
+    # Serialization helpers
+    def state_dict(self):
+        return {
+            "decay": self.decay,
+            "shadow": [t.clone().cpu() for t in self.shadow],
+        }
+
+    def load_state_dict(self, state) -> None:
+        self.decay = float(state.get("decay", self.decay))
+        sh = state.get("shadow", None)
+        if sh is not None:
+            # Move to current device of first param
+            device = None
+            for t in self.shadow:
+                device = t.device
+                break
+            self.shadow = [t.to(device or "cpu") for t in sh]

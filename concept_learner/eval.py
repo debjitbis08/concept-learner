@@ -4,6 +4,7 @@ import torch
 
 from concept_learner.data.episode_gen import EpisodeConfig, EpisodeGenerator
 from concept_learner.train import ConceptLearner, TrainConfig
+from utils.ema import EMA
 
 
 @torch.no_grad()
@@ -47,6 +48,7 @@ def _resolve_device(arg_device: str | None) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", default="auto", help="cuda|cpu|auto (default auto)")
+    parser.add_argument("--ckpt", default="", help="optional checkpoint path to load (uses ema if present)")
     args = parser.parse_args()
     device = _resolve_device(args.device)
     print(f"[eval] Using device: {device} (cuda_available={torch.cuda.is_available()})")
@@ -55,6 +57,15 @@ def main():
     ecfg = EpisodeConfig(device=device)
     gen = EpisodeGenerator(ecfg)
     model = ConceptLearner(tcfg).to(device)
+    if args.ckpt:
+        state = torch.load(args.ckpt, map_location="cpu")
+        model.load_state_dict(state.get("model", state))
+        # If EMA present, apply EMA weights for eval
+        ema_state = state.get("ema", None)
+        if ema_state is not None:
+            ema = EMA(model)
+            ema.load_state_dict(ema_state)
+            ema.apply_to(model)
     eval_analogy(model, gen, device=device)
 
 
