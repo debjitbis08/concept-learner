@@ -77,7 +77,17 @@ class ConceptLearner(nn.Module):
         return {"h": h, "z": z, "z_q": z_q, "indices": indices, "vq_loss": vq_loss}
 
 
-def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, optimizer, ewc: EWC, step_idx: int, ema: EMA | None = None, sleep: bool = False):
+def run_step(
+    model: ConceptLearner,
+    gen: EpisodeGenerator,
+    cfg: TrainConfig,
+    optimizer,
+    ewc: EWC,
+    step_idx: int,
+    ema: EMA | None = None,
+    adapt: Dict[str, bool] | None = None,
+    sleep: bool = False,
+):
     model.train()
     device = cfg.device
     losses = {}
@@ -92,6 +102,8 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
         easy_prob = 0.2
     else:
         easy_prob = 0.0
+    if adapt and adapt.get("recovery", False):
+        easy_prob = 1.0
     views = gen.sample_views(cfg.batch, change_base_prob=0.0, easy_same_remap_prob=easy_prob)
     v1 = views["view1_desc"].to(device)
     v1m = views["view1_mask"].to(device)
@@ -109,9 +121,15 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
             temperature = cfg.temp_max * (1 - t) + cfg.temp_min * t
         else:
             temperature = cfg.temperature
-    # Use pre-quantized features for InfoNCE (smoother alignment)
-    z1 = model.proj1(e1["z"])  # pre-quantized
-    z2 = model.proj2(e2["z"])  # pre-quantized
+    if adapt and adapt.get("recovery", False):
+        # Couple alignment tightly to codes during recovery
+        temperature = 1.0
+        z1 = model.proj1(e1["z_q"])  # quantized
+        z2 = model.proj2(e2["z_q"])  # quantized
+    else:
+        # Use pre-quantized features for InfoNCE (smoother alignment)
+        z1 = model.proj1(e1["z"])  # pre-quantized
+        z2 = model.proj2(e2["z"])  # pre-quantized
     # symmetric stop-grad InfoNCE
     loss_c12 = info_nce(z1.detach(), z2, temperature)
     loss_c21 = info_nce(z2.detach(), z1, temperature)
@@ -193,15 +211,23 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
     w_c = 0.1 if step_idx < 4000 else cfg.loss_contrastive
     w_rel = 2.0 if step_idx < 4000 else cfg.loss_rel
     w_an = 1.5 if step_idx < 4000 else cfg.loss_analogy
+    w_mdl = cfg.loss_mdl
+    w_vq_usage = cfg.loss_vq_usage
+    if adapt and adapt.get("recovery", False):
+        w_c = 0.02
+        w_rel = max(w_rel, 2.0)
+        w_an = max(w_an, 1.5)
+        w_mdl = 0.0
+        w_vq_usage = max(w_vq_usage, 0.3)
     total = (
         w_c * losses["contrast"]
         + w_rel * losses["rel"]
         + w_an * losses["analogy"]
-        + cfg.loss_mdl * losses["mdl"]
+        + w_mdl * losses["mdl"]
         + cfg.loss_task * losses["task"]
         + cfg.loss_stability * losses["stability"]
         + cfg.loss_vq_entropy * losses["vq_ent"]
-        + cfg.loss_vq_usage * losses["vq_usage"]
+        + w_vq_usage * losses["vq_usage"]
         + cfg.loss_vq * losses["vq"]
     )
 
@@ -307,13 +333,16 @@ def train_main():
     start_step = loaded_step + 1
     end_step = loaded_step + tcfg.steps
 
+    collapse_counter = 0
+    recovery_until = 0
     for step in range(start_step, end_step + 1):
         # Increase stability penalty a bit during sleep steps
         if step % tcfg.sleep_every == 0:
             ewc.weight = 0.2
         else:
             ewc.weight = 0.0
-        losses, total = run_step(model, gen, tcfg, opt, ewc, step, ema)
+        adapt = {"recovery": step <= recovery_until}
+        losses, total = run_step(model, gen, tcfg, opt, ewc, step, ema, adapt)
         if step % 10 == 0 or step == 1:
             # Codebook stats (approximate, from a small batch)
             # For lightweight logging, recompute a small batch indices
@@ -352,8 +381,37 @@ def train_main():
                 f"step {step:04d} total={total:.3f} "
                 f"c={losses['contrast']:.3f} rel={losses['rel']:.3f} an={losses['analogy']:.3f} "
                 f"mdl={losses['mdl']:.3f} task={losses['task']:.3f} vq={losses['vq']:.3f} st={losses['stability']:.3f} "
-                f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} an_acc={an_acc:.3f}"
+                f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} an_acc={an_acc:.3f} rec={(step<=recovery_until)}"
             )
+            # Watchdog: auto-recover on codebook collapse
+            if perplexity < 5.0:
+                collapse_counter += 1
+            else:
+                collapse_counter = 0
+            if collapse_counter >= 3:
+                cand = [
+                    os.path.join(args.ckpt_dir, "best_an.pt"),
+                    os.path.join(args.ckpt_dir, "best_rel.pt"),
+                    os.path.join(args.ckpt_dir, "latest.pt"),
+                ]
+                chosen = None
+                for p in cand:
+                    if os.path.exists(p):
+                        chosen = p
+                        break
+                if chosen is not None:
+                    try:
+                        ckpt = torch.load(chosen, map_location="cpu")
+                        model.load_state_dict(ckpt.get("model", ckpt))
+                        if ckpt.get("optim") is not None:
+                            opt.load_state_dict(ckpt["optim"])  # type: ignore
+                        if ckpt.get("ema") is not None:
+                            ema.load_state_dict(ckpt["ema"])  # type: ignore
+                        recovery_until = step + 1000
+                        collapse_counter = 0
+                        print(f"[watchdog] Rolled back from {chosen}; entering recovery until step {recovery_until}")
+                    except Exception as e:
+                        print(f"[watchdog] Failed to rollback from {chosen}: {e}")
         # Checkpointing cadence: every N steps and at curriculum boundaries
         if (step % args.save_every == 0) or (step in curriculum_boundaries):
             # Periodic checkpoint via CheckpointManager + latest copy

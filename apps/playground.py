@@ -10,10 +10,25 @@ except Exception as e:  # pragma: no cover
     sys.exit(0)
 
 from concept_learner.api import ConceptAPI
+import argparse
 
 
 def main():
-    api = ConceptAPI.load("checkpoints/latest.pt")  # adjust path as needed
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", default="checkpoints/latest.pt", help="path to checkpoint (latest.pt or a specific ckpt_*.pt)")
+    parser.add_argument("--device", default="auto", help="cuda|cpu|auto")
+    parser.add_argument("--share", action="store_true", help="launch Gradio with public share link (useful in Colab)")
+    args = parser.parse_args()
+
+    dev = args.device.lower()
+    if dev in ("auto", "gpu"):
+        import torch
+
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        device = dev
+
+    api = ConceptAPI.load(args.ckpt, device=device)
 
     def analogy(a: str, b: str, c: str):
         res = api.complete_analogy(a, b, c)
@@ -29,11 +44,10 @@ def main():
         outputs=gr.JSON(label="Result"),
         allow_flagging="never",
         title="Concept Learner Playground",
-        description="Query analogies and inspect model concepts.",
+        description=f"Query analogies and inspect model concepts. Using device={device} ckpt={args.ckpt}",
     )
-    demo.launch()
+    demo.launch(share=args.share)
 
 
 if __name__ == "__main__":
     main()
-
