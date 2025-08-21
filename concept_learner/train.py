@@ -204,14 +204,29 @@ def run_step(model: ConceptLearner, gen: EpisodeGenerator, cfg: TrainConfig, opt
     return {k: v.detach().item() for k, v in losses.items()}, total.detach().item()
 
 
+def _resolve_device(arg_device: str | None) -> str:
+    dev = (arg_device or "auto").lower()
+    if dev in ("auto", "", "gpu"):
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
+    return dev
+
+
 def train_main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto", help="cuda|cpu|auto (default auto)")
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--batch", type=int, default=128)
     args = parser.parse_args()
 
-    tcfg = TrainConfig(device=args.device, steps=args.steps, batch=args.batch)
+    device = _resolve_device(args.device)
+    print(f"[train] Using device: {device} (cuda_available={torch.cuda.is_available()})")
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    tcfg = TrainConfig(device=device, steps=args.steps, batch=args.batch)
     ecfg = EpisodeConfig(device=tcfg.device)
     gen = EpisodeGenerator(ecfg)
 

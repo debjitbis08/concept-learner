@@ -34,16 +34,28 @@ def eval_analogy(model: ConceptLearner, gen: EpisodeGenerator, device: str = "cp
     print(f"Analogy accuracy (in-batch): {acc:.3f}")
 
 
+def _resolve_device(arg_device: str | None) -> str:
+    dev = (arg_device or "auto").lower()
+    if dev in ("auto", "", "gpu"):
+        if torch.cuda.is_available():
+            return "cuda"
+        else:
+            return "cpu"
+    return dev
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--device", default="auto", help="cuda|cpu|auto (default auto)")
     args = parser.parse_args()
+    device = _resolve_device(args.device)
+    print(f"[eval] Using device: {device} (cuda_available={torch.cuda.is_available()})")
 
-    tcfg = TrainConfig(device=args.device)
-    ecfg = EpisodeConfig(device=args.device)
+    tcfg = TrainConfig(device=device)
+    ecfg = EpisodeConfig(device=device)
     gen = EpisodeGenerator(ecfg)
-    model = ConceptLearner(tcfg).to(args.device)
-    eval_analogy(model, gen, device=args.device)
+    model = ConceptLearner(tcfg).to(device)
+    eval_analogy(model, gen, device=device)
 
 
 if __name__ == "__main__":
