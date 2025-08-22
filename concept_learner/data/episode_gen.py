@@ -25,12 +25,22 @@ class EpisodeGenerator:
     def __init__(self, cfg: EpisodeConfig):
         self.cfg = cfg
         self.n_items = cfg.max_number
+        # Optional per-generator context token to prepend to sequences
+        self._context_token_id: int | None = None
 
         # Precompute hidden factors (not shown to the model)
         device = cfg.device
         self.parity = torch.tensor([i % 2 for i in range(self.n_items)], device=device)
         self.mod3 = torch.tensor([i % 3 for i in range(self.n_items)], device=device)
         self.magnitude = torch.tensor([i // 10 for i in range(self.n_items)], device=device)
+
+    # ----- Context tokens -----
+    def set_context_token_id(self, token_id: int | None) -> None:
+        """
+        Set a special context token id (e.g., <home>, <park>) to prepend at the
+        leftmost position of every rendered sequence. Pass None to disable.
+        """
+        self._context_token_id = int(token_id) if token_id is not None else None
 
     # ----- Public API -----
     def sample_views(self, batch: int, change_base_prob: float = 0.0, easy_same_remap_prob: float = 0.2) -> Dict[str, torch.Tensor]:
@@ -260,6 +270,10 @@ class EpisodeGenerator:
             L = min(len(tokens), max_len)
             seq[i, max_len - L : max_len] = torch.tensor(tokens[-L:], device=device)
             attn[i, max_len - L : max_len] = True
+            # Prepend context token if configured; use leftmost slot
+            if self._context_token_id is not None and max_len > 0:
+                seq[i, 0] = int(self._context_token_id)
+                attn[i, 0] = True
         return seq, attn, base
 
     def _render_batch_with_fixed_base(self, idx: torch.Tensor, base: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -282,6 +296,10 @@ class EpisodeGenerator:
             L = min(len(tokens), max_len)
             seq[i, max_len - L : max_len] = torch.tensor(tokens[-L:], device=device)
             attn[i, max_len - L : max_len] = True
+            # Prepend context token if configured; use leftmost slot
+            if self._context_token_id is not None and max_len > 0:
+                seq[i, 0] = int(self._context_token_id)
+                attn[i, 0] = True
         return seq, attn, base
 
     @staticmethod

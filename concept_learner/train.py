@@ -267,6 +267,11 @@ class TrainConfig:
     usage_temp: float = 2.0
     # Multi-domain overlap regularizer
     loss_cross_domain_align: float = 0.2
+    # Context token controls
+    use_context_tokens: bool = True
+    # Instance permanence head
+    use_instance_head: bool = True
+    loss_instance: float = 0.3
 
 
 class ConceptLearner(nn.Module):
@@ -302,6 +307,14 @@ class ConceptLearner(nn.Module):
         self.same_head = nn.Sequential(
             nn.Linear(cfg.code_dim * 2, cfg.code_dim), nn.ReLU(), nn.Linear(cfg.code_dim, 2)
         )
+        # Optional instance permanence head (same-instance across views)
+        self.use_instance_head = cfg.use_instance_head
+        if self.use_instance_head:
+            self.instance_head = nn.Sequential(
+                nn.Linear(cfg.code_dim * 2, cfg.code_dim), nn.ReLU(), nn.Linear(cfg.code_dim, 2)
+            )
+        else:
+            self.instance_head = None
         # Expose global codebook meta for compatibility
         self.num_codes = cfg.num_codes
         # Projection heads for contrastive stability
@@ -501,6 +514,24 @@ def run_step(
     loss_task = nn.CrossEntropyLoss()(logits, y)
     losses["task"] = loss_task
 
+    # Instance permanence head: predict whether two views are the same instance
+    if getattr(model, "use_instance_head", False) and model.instance_head is not None:
+        # Positive pairs: views from the same idx; Negatives: mismatched pairs within batch
+        pos_a = F.normalize(e1["z_q"], dim=-1)
+        pos_b = F.normalize(e2["z_q"], dim=-1)
+        neg_b = torch.roll(pos_b, shifts=1, dims=0)
+        logits_pos = model.instance_head(torch.cat([pos_a, pos_b], dim=-1))
+        logits_neg = model.instance_head(torch.cat([pos_a, neg_b], dim=-1))
+        logits_all = torch.cat([logits_pos, logits_neg], dim=0)
+        labels_all = torch.cat([
+            torch.ones(pos_a.size(0), dtype=torch.long, device=device),
+            torch.zeros(pos_a.size(0), dtype=torch.long, device=device),
+        ], dim=0)
+        loss_inst = nn.CrossEntropyLoss()(logits_all, labels_all)
+        losses["instance"] = loss_inst
+    else:
+        losses["instance"] = torch.tensor(0.0, device=device)
+
     # VQ commitment/codebook
     losses["vq"] = e1["vq_loss"] + e2["vq_loss"]
 
@@ -543,6 +574,7 @@ def run_step(
         + w_an * losses["analogy"]
         + w_mdl * losses["mdl"]
         + cfg.loss_task * losses["task"]
+        + cfg.loss_instance * losses.get("instance", torch.tensor(0.0, device=device))
         + cfg.loss_stability * losses["stability"]
         + cfg.loss_vq_entropy * losses["vq_ent"]
         + w_vq_usage * losses["vq_usage"]
@@ -594,7 +626,8 @@ def train_main():
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
 
-    tcfg = TrainConfig(device=device, steps=args.steps, batch=args.batch)
+    # Allow a slightly larger vocab by default to host context tokens comfortably
+    tcfg = TrainConfig(device=device, steps=args.steps, batch=args.batch, vocab_size=32)
     ecfg = EpisodeConfig(device=tcfg.device)
     if tcfg.num_domains > 1:
         gens: List[EpisodeGenerator] = []
@@ -608,10 +641,18 @@ def train_main():
                 max_base=10 - (d % 2),
                 canonicalize=(d % 2 == 0),
             )
-            gens.append(EpisodeGenerator(cfg_d))
+            g_d = EpisodeGenerator(cfg_d)
+            # Optionally enable context tokens as <domain> tags
+            if tcfg.use_context_tokens:
+                start_tok = cfg_d.max_base + 2  # 1..max_base digits; PAD=max_base+1; context starts here
+                g_d.set_context_token_id(start_tok + d)
+            gens.append(g_d)
         gen: EpisodeGenerator | MultiDomainEpisodeGenerator = MultiDomainEpisodeGenerator(gens, domain_batch_mix="uniform")
     else:
         gen = EpisodeGenerator(ecfg)
+        if tcfg.use_context_tokens:
+            start_tok = ecfg.max_base + 2
+            gen.set_context_token_id(start_tok)
 
     model = ConceptLearner(tcfg).to(tcfg.device)
     # Optimizer with param groups
@@ -729,6 +770,30 @@ def train_main():
                     labels = torch.arange(sim.size(0), device=tcfg.device)
                     last_an_acc = (pred == labels).float().mean().item()
             an_acc = last_an_acc
+            # Additional child-like metrics every 200 steps
+            if step % 200 == 0:
+                try:
+                    # Code sharing ratio across two domains for same item ids
+                    if hasattr(gen, "sample_equivalent_pairs") and tcfg.num_domains > 1:
+                        eq = gen.sample_equivalent_pairs(128)
+                        X1 = model.encode(eq["x1_desc"].to(tcfg.device), eq["x1_mask"].to(tcfg.device), eq["x1_domain"].to(tcfg.device))
+                        X2 = model.encode(eq["x2_desc"].to(tcfg.device), eq["x2_mask"].to(tcfg.device), eq["x2_domain"].to(tcfg.device))
+                        share = (X1["indices"] == X2["indices"]).float().mean().item()
+                    else:
+                        share = float('nan')
+                    # Nearest-neighbor diversity across domains
+                    mv = gen.sample_views(128)
+                    Z = model.encode(mv["view1_desc"].to(tcfg.device), mv["view1_mask"].to(tcfg.device), mv.get("domain", None))["z_q"]
+                    doms = mv.get("domain", torch.zeros(Z.size(0), dtype=torch.long, device=tcfg.device)).to(tcfg.device)
+                    sims = torch.matmul(F.normalize(Z, -1), F.normalize(Z, -1).t())
+                    sims.fill_diagonal_(-1.0)
+                    topk = sims.topk(k=5, dim=1).indices
+                    nn_div = []
+                    for i in range(Z.size(0)):
+                        nn_div.append((doms[topk[i]] != doms[i]).float().mean().item())
+                    nn_div = sum(nn_div) / max(1, len(nn_div))
+                except Exception:
+                    share, nn_div = float('nan'), float('nan')
             c_disp = (losses.get('contrast_align', 0.0) + losses.get('code_ce', 0.0))
             baseline = 1.0 / 64.0
             print(
@@ -738,6 +803,8 @@ def train_main():
                 f"ppx={perplexity:.2f} uniq={unique}/{model.num_codes} "
                 f"an_acc={an_acc:.3f} (EMA, in-batch parity; random~{baseline:.3f}) rec={(step<=recovery_until)}"
             )
+            if step % 200 == 0:
+                print(f"  metrics: code_share={share:.3f} nn_div={nn_div:.3f}")
             # Watchdog: auto-recover on codebook collapse
             if perplexity < 5.0:
                 collapse_counter += 1

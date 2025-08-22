@@ -13,6 +13,14 @@ Repository layout
 - utils/ema.py — simple EMA wrapper and serialization helpers.
 - PLANS_NEXT.md — extended plan and scaffolding for LLM teacher, playground/API, and long runs.
 
+What's new (child-like grounding & overlap)
+- Context tokens: each domain can prepend a special token (e.g., <home>, <park>) to encourage shared codes across contexts. Enable via TrainConfig.use_context_tokens (default True).
+- Hierarchical codes: global shared VQ plus optional per-domain private residual VQs (TrainConfig.use_private_vq).
+- Instance permanence head: lightweight head that learns to predict whether two views are the same instance (TrainConfig.use_instance_head). Trained alongside contrastive and relation/analogy losses.
+- Sleep/consolidation: tiny replay buffer with periodic replay-only steps; stability regularizer (EWC-style) during sleep.
+- Cross-domain alignment: optional regularizer aligning equivalent pairs across domains.
+- Metrics: periodic reporting of codebook perplexity/usage, in-batch analogy accuracy, cross-context code sharing ratio, and nearest-neighbor domain diversity.
+
 Requirements
 - Python 3.10+
 - PyTorch (CUDA build recommended for GPU)
@@ -51,4 +59,3 @@ Notes
 - EMA VQ with dead code reinit and usage entropy is used to stabilize the bottleneck.
 - Relation loss uses in-batch multiclass CE; analogy loss mixes a temperature-controlled classifier with an offset penalty.
 - Checkpoints include model, optimizer, EMA, step, and metrics (including an EMA-based analogy accuracy probe).
-
