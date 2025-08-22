@@ -57,6 +57,7 @@ class EpisodeGenerator:
             "view2_desc": v2_desc,
             "view2_mask": v2_mask,
             "view2_base": v2_base,
+            "domain": torch.zeros(batch, dtype=torch.long, device=device),
         }
 
     def sample_posneg_pairs(self, batch: int) -> Dict[str, torch.Tensor]:
@@ -84,6 +85,7 @@ class EpisodeGenerator:
             "b_mask": b_mask,
             "b_base": b_base,
             "label": y,
+            "domain": torch.zeros(batch, dtype=torch.long, device=self.cfg.device),
         }
 
     def sample_triples(self, batch: int) -> Dict[str, torch.Tensor]:
@@ -133,6 +135,7 @@ class EpisodeGenerator:
             "o_neg_desc": o_neg_desc,
             "o_neg_mask": o_neg_mask,
             "o_neg_base": o_neg_base,
+            "domain": torch.zeros(batch, dtype=torch.long, device=self.cfg.device),
         }
 
     def sample_analogies(self, batch: int, allowed_relations: List[int] | None = None) -> Dict[str, torch.Tensor]:
@@ -202,6 +205,7 @@ class EpisodeGenerator:
             "D_desc": D_desc,
             "D_mask": D_mask,
             "D_base": D_base,
+            "domain": torch.zeros(batch, dtype=torch.long, device=self.cfg.device),
         }
 
     # ----- Internal helpers -----

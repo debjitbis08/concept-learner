@@ -9,8 +9,10 @@ import torch.nn.functional as F
 import os
 
 from concept_learner.data.episode_gen import EpisodeConfig, EpisodeGenerator
+from concept_learner.data.multi_domain import MultiDomainEpisodeGenerator
 from concept_learner.model.backbone import TinyBackbone
 from concept_learner.model.vq_layer import EmaVectorQuantizer
+from concept_learner.model.domain import DomainAdapter
 from concept_learner.model.relation_head import DistMultHead, AnalogyProjector
 from concept_learner.losses import EWC, info_nce, code_usage_entropy
 from utils.checkpoints import CheckpointManager
@@ -27,10 +29,11 @@ class ReplayBuffer:
     def __init__(self, gen: EpisodeGenerator, cap_per_type: int = 4096):
         self.gen = gen
         self.cap = cap_per_type
-        self.views: List[int] = []
-        self.triples: List[Tuple[int, int, int]] = []
-        self.analogies: List[Tuple[int, int, int, int]] = []
-        self.pairs: List[Tuple[int, int, int]] = []  # (a,b,label)
+        # Store domain along with indices so we can re-render from the right generator
+        self.views: List[Tuple[int, int]] = []  # (idx, dom)
+        self.triples: List[Tuple[int, int, int, int]] = []  # (s,r,o,dom)
+        self.analogies: List[Tuple[int, int, int, int, int]] = []  # (A,B,C,D,dom)
+        self.pairs: List[Tuple[int, int, int, int]] = []  # (a,b,label,dom)
 
     def __len__(self) -> int:
         return max(len(self.views), len(self.triples), len(self.analogies), len(self.pairs))
@@ -38,22 +41,34 @@ class ReplayBuffer:
     def add_from_batches(self, views: Dict[str, torch.Tensor], triples: Dict[str, torch.Tensor], analog: Dict[str, torch.Tensor], pairs: Dict[str, torch.Tensor]) -> None:
         # Views: just keep indices
         if "idx" in views:
-            for v in views["idx"].tolist():
-                self.views.append(int(v))
+            dom = views.get("domain", torch.zeros_like(views["idx"]))
+            for v, d in zip(views["idx"].tolist(), dom.tolist()):
+                self.views.append((int(v), int(d)))
         # Triples: (s,r,o)
         if all(k in triples for k in ("s_idx", "r", "o_idx")):
-            for s, r, o in zip(triples["s_idx"].tolist(), triples["r"].tolist(), triples["o_idx"].tolist()):
-                self.triples.append((int(s), int(r), int(o)))
+            dom = triples.get("domain", torch.zeros_like(triples["s_idx"]))
+            for s, r, o, d in zip(
+                triples["s_idx"].tolist(), triples["r"].tolist(), triples["o_idx"].tolist(), dom.tolist()
+            ):
+                self.triples.append((int(s), int(r), int(o), int(d)))
         # Analogies: (A,B,C,D)
         if all(k in analog for k in ("A_idx", "B_idx", "C_idx", "D_idx")):
-            for A, B, C, D in zip(
-                analog["A_idx"].tolist(), analog["B_idx"].tolist(), analog["C_idx"].tolist(), analog["D_idx"].tolist()
+            dom = analog.get("domain", torch.zeros_like(analog["A_idx"]))
+            for A, B, C, D, d in zip(
+                analog["A_idx"].tolist(),
+                analog["B_idx"].tolist(),
+                analog["C_idx"].tolist(),
+                analog["D_idx"].tolist(),
+                dom.tolist(),
             ):
-                self.analogies.append((int(A), int(B), int(C), int(D)))
+                self.analogies.append((int(A), int(B), int(C), int(D), int(d)))
         # Pairs: (a,b,label)
         if all(k in pairs for k in ("a_idx", "b_idx", "label")):
-            for a, b, y in zip(pairs["a_idx"].tolist(), pairs["b_idx"].tolist(), pairs["label"].tolist()):
-                self.pairs.append((int(a), int(b), int(y)))
+            dom = pairs.get("domain", torch.zeros_like(pairs["a_idx"]))
+            for a, b, y, d in zip(
+                pairs["a_idx"].tolist(), pairs["b_idx"].tolist(), pairs["label"].tolist(), dom.tolist()
+            ):
+                self.pairs.append((int(a), int(b), int(y), int(d)))
 
         # Truncate to capacity (keep most recent)
         self.views = self.views[-self.cap :]
@@ -65,13 +80,38 @@ class ReplayBuffer:
         idx = torch.randint(0, max(1, n), (size,), device=self.gen.cfg.device)
         return idx.tolist()
 
+    def _render_one(self, idx: int, dom: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Support EpisodeGenerator and MultiDomainEpisodeGenerator
+        if hasattr(self.gen, "_render_batch"):
+            import torch as _torch
+
+            t = _torch.tensor([idx], device=self.gen.cfg.device)
+            return self.gen._render_batch(t)  # type: ignore[attr-defined]
+        elif hasattr(self.gen, "gens"):
+            g = self.gen.gens[dom]  # type: ignore[attr-defined]
+            import torch as _torch
+
+            t = _torch.tensor([idx], device=g.cfg.device)
+            return g._render_batch(t)
+        else:
+            raise RuntimeError("Unsupported generator type for ReplayBuffer re-rendering")
+
     def sample_views(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
         if len(self.views) < batch:
             return None
         choice = self._choice(len(self.views), batch)
-        idx = torch.tensor([self.views[i] for i in choice], device=self.gen.cfg.device)
-        v1_desc, v1_mask, v1_base = self.gen._render_batch(idx)
-        v2_desc, v2_mask, v2_base = self.gen._render_batch(idx)
+        samples = [self.views[i] for i in choice]
+        # Render per-sample to match domain
+        outs1 = [self._render_one(ix, dm) for ix, dm in samples]
+        outs2 = [self._render_one(ix, dm) for ix, dm in samples]
+        v1_desc = torch.cat([o[0] for o in outs1], dim=0)
+        v1_mask = torch.cat([o[1] for o in outs1], dim=0)
+        v1_base = torch.cat([o[2] for o in outs1], dim=0)
+        v2_desc = torch.cat([o[0] for o in outs2], dim=0)
+        v2_mask = torch.cat([o[1] for o in outs2], dim=0)
+        v2_base = torch.cat([o[2] for o in outs2], dim=0)
+        idx = torch.tensor([ix for ix, _ in samples], device=self.gen.cfg.device)
+        dom = torch.tensor([dm for _, dm in samples], device=self.gen.cfg.device)
         return {
             "idx": idx,
             "view1_desc": v1_desc,
@@ -80,6 +120,7 @@ class ReplayBuffer:
             "view2_desc": v2_desc,
             "view2_mask": v2_mask,
             "view2_base": v2_base,
+            "domain": dom,
         }
 
     def sample_triples(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
@@ -89,8 +130,15 @@ class ReplayBuffer:
         s = torch.tensor([self.triples[i][0] for i in choice], device=self.gen.cfg.device)
         r = torch.tensor([self.triples[i][1] for i in choice], device=self.gen.cfg.device)
         o = torch.tensor([self.triples[i][2] for i in choice], device=self.gen.cfg.device)
-        s_desc, s_mask, s_base = self.gen._render_batch(s)
-        o_desc, o_mask, o_base = self.gen._render_batch(o)
+        dom = torch.tensor([self.triples[i][3] for i in choice], device=self.gen.cfg.device)
+        outs_s = [self._render_one(int(si), int(di)) for si, di in zip(s.tolist(), dom.tolist())]
+        outs_o = [self._render_one(int(oi), int(di)) for oi, di in zip(o.tolist(), dom.tolist())]
+        s_desc = torch.cat([o_[0] for o_ in outs_s], dim=0)
+        s_mask = torch.cat([o_[1] for o_ in outs_s], dim=0)
+        s_base = torch.cat([o_[2] for o_ in outs_s], dim=0)
+        o_desc = torch.cat([o_[0] for o_ in outs_o], dim=0)
+        o_mask = torch.cat([o_[1] for o_ in outs_o], dim=0)
+        o_base = torch.cat([o_[2] for o_ in outs_o], dim=0)
         return {
             "s_idx": s,
             "r": r,
@@ -101,6 +149,7 @@ class ReplayBuffer:
             "o_desc": o_desc,
             "o_mask": o_mask,
             "o_base": o_base,
+            "domain": dom,
         }
 
     def sample_analogies(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
@@ -111,10 +160,23 @@ class ReplayBuffer:
         B = torch.tensor([self.analogies[i][1] for i in choice], device=self.gen.cfg.device)
         C = torch.tensor([self.analogies[i][2] for i in choice], device=self.gen.cfg.device)
         D = torch.tensor([self.analogies[i][3] for i in choice], device=self.gen.cfg.device)
-        A_desc, A_mask, A_base = self.gen._render_batch(A)
-        B_desc, B_mask, B_base = self.gen._render_batch(B)
-        C_desc, C_mask, C_base = self.gen._render_batch(C)
-        D_desc, D_mask, D_base = self.gen._render_batch(D)
+        dom = torch.tensor([self.analogies[i][4] for i in choice], device=self.gen.cfg.device)
+        outA = [self._render_one(int(ai), int(di)) for ai, di in zip(A.tolist(), dom.tolist())]
+        outB = [self._render_one(int(bi), int(di)) for bi, di in zip(B.tolist(), dom.tolist())]
+        outC = [self._render_one(int(ci), int(di)) for ci, di in zip(C.tolist(), dom.tolist())]
+        outD = [self._render_one(int(di_), int(di2)) for di_, di2 in zip(D.tolist(), dom.tolist())]
+        A_desc = torch.cat([o_[0] for o_ in outA], dim=0)
+        A_mask = torch.cat([o_[1] for o_ in outA], dim=0)
+        A_base = torch.cat([o_[2] for o_ in outA], dim=0)
+        B_desc = torch.cat([o_[0] for o_ in outB], dim=0)
+        B_mask = torch.cat([o_[1] for o_ in outB], dim=0)
+        B_base = torch.cat([o_[2] for o_ in outB], dim=0)
+        C_desc = torch.cat([o_[0] for o_ in outC], dim=0)
+        C_mask = torch.cat([o_[1] for o_ in outC], dim=0)
+        C_base = torch.cat([o_[2] for o_ in outC], dim=0)
+        D_desc = torch.cat([o_[0] for o_ in outD], dim=0)
+        D_mask = torch.cat([o_[1] for o_ in outD], dim=0)
+        D_base = torch.cat([o_[2] for o_ in outD], dim=0)
         return {
             "A_idx": A,
             "B_idx": B,
@@ -132,6 +194,7 @@ class ReplayBuffer:
             "D_desc": D_desc,
             "D_mask": D_mask,
             "D_base": D_base,
+            "domain": dom,
         }
 
     def sample_pairs(self, batch: int) -> Optional[Dict[str, torch.Tensor]]:
@@ -141,8 +204,15 @@ class ReplayBuffer:
         a = torch.tensor([self.pairs[i][0] for i in choice], device=self.gen.cfg.device)
         b = torch.tensor([self.pairs[i][1] for i in choice], device=self.gen.cfg.device)
         y = torch.tensor([self.pairs[i][2] for i in choice], device=self.gen.cfg.device)
-        a_desc, a_mask, a_base = self.gen._render_batch(a)
-        b_desc, b_mask, b_base = self.gen._render_batch(b)
+        dom = torch.tensor([self.pairs[i][3] for i in choice], device=self.gen.cfg.device)
+        outA = [self._render_one(int(ai), int(di)) for ai, di in zip(a.tolist(), dom.tolist())]
+        outB = [self._render_one(int(bi), int(di)) for bi, di in zip(b.tolist(), dom.tolist())]
+        a_desc = torch.cat([o_[0] for o_ in outA], dim=0)
+        a_mask = torch.cat([o_[1] for o_ in outA], dim=0)
+        a_base = torch.cat([o_[2] for o_ in outA], dim=0)
+        b_desc = torch.cat([o_[0] for o_ in outB], dim=0)
+        b_mask = torch.cat([o_[1] for o_ in outB], dim=0)
+        b_base = torch.cat([o_[2] for o_ in outB], dim=0)
         return {
             "a_idx": a,
             "b_idx": b,
@@ -153,6 +223,7 @@ class ReplayBuffer:
             "b_mask": b_mask,
             "b_base": b_base,
             "label": y.long(),
+            "domain": dom,
         }
 
 
@@ -166,6 +237,13 @@ class TrainConfig:
     max_len: int = 6
     num_codes: int = 32
     code_dim: int = 32
+    # Multi-domain settings
+    num_domains: int = 3
+    private_codes: int = 16
+    use_private_vq: bool = True
+    use_domain_token: bool = True
+    adapter_rank: int = 16
+    use_domain_rel_offsets: bool = True
     relations: int = 3
     batch: int = 128
     lr: float = 1e-3
@@ -187,19 +265,44 @@ class TrainConfig:
     loss_vq_usage: float = 0.2
     loss_codes: float = 0.2
     usage_temp: float = 2.0
+    # Multi-domain overlap regularizer
+    loss_cross_domain_align: float = 0.2
 
 
 class ConceptLearner(nn.Module):
     def __init__(self, cfg: TrainConfig):
         super().__init__()
         self.backbone = TinyBackbone(cfg.vocab_size, cfg.d_model, cfg.nhead, cfg.num_layers, cfg.max_len)
+        self.domain_adapter = DomainAdapter(cfg.num_domains, cfg.d_model, adapter_rank=cfg.adapter_rank)
+        self.use_domain_token = cfg.use_domain_token and cfg.num_domains > 0
+        if self.use_domain_token:
+            from concept_learner.model.domain import DomainToken
+
+            self.domain_token = DomainToken(cfg.num_domains, cfg.d_model)
+        else:
+            self.domain_token = None
         self.to_code = nn.Linear(cfg.d_model, cfg.code_dim)
-        self.vq = EmaVectorQuantizer(cfg.num_codes, cfg.code_dim, decay=0.995)
+        # Global (shared) VQ
+        self.vq_global = EmaVectorQuantizer(cfg.num_codes, cfg.code_dim, decay=0.995)
+        # Optional per-domain private residual VQs
+        self.use_private_vq = cfg.use_private_vq and cfg.num_domains > 0 and cfg.private_codes > 0
+        if self.use_private_vq:
+            self.vq_private = nn.ModuleList(
+                [EmaVectorQuantizer(cfg.private_codes, cfg.code_dim, decay=0.995) for _ in range(cfg.num_domains)]
+            )
+        else:
+            self.vq_private = None
         self.rel = DistMultHead(cfg.code_dim, cfg.relations)
+        self.use_domain_rel_offsets = cfg.use_domain_rel_offsets and cfg.num_domains > 1
+        if self.use_domain_rel_offsets:
+            self.rel_offsets = nn.Parameter(torch.zeros(cfg.num_domains, cfg.relations, cfg.code_dim))
+        else:
+            self.rel_offsets = None
         self.analogy = AnalogyProjector(cfg.code_dim, proj_dim=min(32, cfg.code_dim))
         self.same_head = nn.Sequential(
             nn.Linear(cfg.code_dim * 2, cfg.code_dim), nn.ReLU(), nn.Linear(cfg.code_dim, 2)
         )
+        # Expose global codebook meta for compatibility
         self.num_codes = cfg.num_codes
         # Projection heads for contrastive stability
         self.proj1 = nn.Sequential(
@@ -209,11 +312,44 @@ class ConceptLearner(nn.Module):
             nn.Linear(cfg.code_dim, cfg.code_dim), nn.ReLU(), nn.LayerNorm(cfg.code_dim)
         )
 
-    def encode(self, tokens: torch.Tensor, mask: torch.Tensor | None = None) -> Dict[str, torch.Tensor]:
+    def encode(self, tokens: torch.Tensor, mask: torch.Tensor | None = None, domain: torch.Tensor | int | None = None) -> Dict[str, torch.Tensor]:
         h = self.backbone(tokens, mask)
+        if self.use_domain_token and self.domain_token is not None:
+            h = self.domain_token(h, domain)
+        h = self.domain_adapter(h, domain)
         z = self.to_code(h)
-        z_q, indices, vq_loss = self.vq(z)
-        return {"h": h, "z": z, "z_q": z_q, "indices": indices, "vq_loss": vq_loss}
+        # Global quantization
+        z_g, idx_g, loss_g = self.vq_global(z)
+        if self.use_private_vq:
+            # Residual quantization per domain
+            if domain is None:
+                d = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
+            elif isinstance(domain, int):
+                d = torch.tensor([domain], dtype=torch.long, device=z.device).expand(z.size(0))
+            else:
+                d = domain
+            z_res = z - z_g.detach()
+            # Gather per-sample private VQ by looping in small batches; domains are tiny here
+            z_priv_list = []
+            loss_p_list = []
+            for dom_id in d.unique().tolist():
+                dom_id_int = int(dom_id)
+                sel = (d == dom_id_int)
+                if sel.any():
+                    z_chunk = z_res[sel]
+                    z_p, _idx_p, loss_p = self.vq_private[dom_id_int](z_chunk)
+                    z_priv_list.append((sel, z_p))
+                    loss_p_list.append(loss_p)
+            # Merge private chunks back
+            z_p_full = torch.zeros_like(z)
+            for sel, z_p in z_priv_list:
+                z_p_full[sel] = z_p
+            z_q = z_g + z_p_full
+            vq_loss = loss_g + (sum(loss_p_list) if len(loss_p_list) > 0 else 0.0)
+        else:
+            z_q, idx_g, loss_g = z_g, idx_g, loss_g
+            vq_loss = loss_g
+        return {"h": h, "z": z, "z_q": z_q, "indices": idx_g, "vq_loss": vq_loss}
 
 
 def run_step(
@@ -262,8 +398,9 @@ def run_step(
     v1m = views["view1_mask"].to(device)
     v2 = views["view2_desc"].to(device)
     v2m = views["view2_mask"].to(device)
-    e1 = model.encode(v1, v1m)
-    e2 = model.encode(v2, v2m)
+    dom_views = views.get("domain", torch.zeros(v1.size(0), dtype=torch.long, device=device)).to(device)
+    e1 = model.encode(v1, v1m, dom_views)
+    e2 = model.encode(v2, v2m, dom_views)
     # Anneal temperature over steps
     # Early stabilize contrastive
     if step_idx < 2000:
@@ -288,19 +425,24 @@ def run_step(
     loss_c21 = info_nce(z2.detach(), z1, temperature)
     losses["contrast_align"] = 0.5 * (loss_c12 + loss_c21)
     # Code-tying CE (match codes across views)
-    logits_codes = torch.matmul(e1["z_q"], model.vq.codebook.weight.t())
+    logits_codes = torch.matmul(e1["z_q"], model.vq_global.codebook.weight.t())
     losses["code_ce"] = nn.CrossEntropyLoss()(torch.log_softmax(logits_codes, dim=-1), e2["indices"])  # type: ignore
 
     # Relational & analogical
     triples = replay.sample_triples(cfg.batch) if (sleep and replay is not None) else None
     if triples is None:
         triples = gen.sample_triples(cfg.batch)
-    s = model.encode(triples["s_desc"].to(device), triples["s_mask"].to(device))["z_q"]
-    o = model.encode(triples["o_desc"].to(device), triples["o_mask"].to(device))["z_q"]
+    dom_tri = triples.get("domain", torch.zeros(cfg.batch, dtype=torch.long, device=device)).to(device)
+    s = model.encode(triples["s_desc"].to(device), triples["s_mask"].to(device), dom_tri)["z_q"]
+    o = model.encode(triples["o_desc"].to(device), triples["o_mask"].to(device), dom_tri)["z_q"]
     r = triples["r"].to(device)
     # In-batch multiclass relation loss (many negatives)
     # v_i = s_i * W_{r_i}; logits = v @ o^T
-    W_sel = model.rel.rel[r]  # (B, D)
+    if getattr(model, "use_domain_rel_offsets", False) and getattr(model, "rel_offsets", None) is not None:
+        dom_rel = dom_tri if 'dom_tri' in locals() else torch.zeros_like(r)
+        W_sel = model.rel.rel[r] + model.rel_offsets[dom_rel, r]
+    else:
+        W_sel = model.rel.rel[r]  # (B, D)
     v = s * W_sel
     logits_rel = torch.matmul(v, o.t())
     labels_rel = torch.arange(logits_rel.size(0), device=device)
@@ -312,10 +454,11 @@ def run_step(
     analog = replay.sample_analogies(cfg.batch) if (sleep and replay is not None) else None
     if analog is None:
         analog = gen.sample_analogies(cfg.batch, allowed_relations=allowed)
-    A = model.encode(analog["A_desc"].to(device), analog["A_mask"].to(device))["z_q"]
-    B = model.encode(analog["B_desc"].to(device), analog["B_mask"].to(device))["z_q"]
-    C = model.encode(analog["C_desc"].to(device), analog["C_mask"].to(device))["z_q"]
-    D = model.encode(analog["D_desc"].to(device), analog["D_mask"].to(device))["z_q"]
+    dom_an = analog.get("domain", torch.zeros(cfg.batch, dtype=torch.long, device=device)).to(device)
+    A = model.encode(analog["A_desc"].to(device), analog["A_mask"].to(device), dom_an)["z_q"]
+    B = model.encode(analog["B_desc"].to(device), analog["B_mask"].to(device), dom_an)["z_q"]
+    C = model.encode(analog["C_desc"].to(device), analog["C_mask"].to(device), dom_an)["z_q"]
+    D = model.encode(analog["D_desc"].to(device), analog["D_mask"].to(device), dom_an)["z_q"]
     # Analogy classification with scheduled temperature
     an_temp = 0.5 if step_idx < 8000 else 0.2
     loss_analogy = model.analogy.analogy_loss(A, B, C, D, temp=an_temp)
@@ -334,7 +477,7 @@ def run_step(
     losses["vq_ent"] = -ent
     # Differentiable usage loss via soft assignments
     with torch.no_grad():
-        codebook = model.vq.codebook.weight.detach()  # (K, D)
+        codebook = model.vq_global.codebook.weight.detach()  # (K, D)
     z_all = torch.cat([e1["z"], e2["z"]], dim=0)
     d = (
         torch.sum(z_all ** 2, dim=1, keepdim=True)
@@ -350,8 +493,9 @@ def run_step(
     pairs = replay.sample_pairs(cfg.batch) if (sleep and replay is not None) else None
     if pairs is None:
         pairs = gen.sample_posneg_pairs(cfg.batch)
-    a = F.normalize(model.encode(pairs["a_desc"].to(device), pairs["a_mask"].to(device))["z_q"], dim=-1)
-    b = F.normalize(model.encode(pairs["b_desc"].to(device), pairs["b_mask"].to(device))["z_q"], dim=-1)
+    dom_pairs = pairs.get("domain", torch.zeros(cfg.batch, dtype=torch.long, device=device)).to(device)
+    a = F.normalize(model.encode(pairs["a_desc"].to(device), pairs["a_mask"].to(device), dom_pairs)["z_q"], dim=-1)
+    b = F.normalize(model.encode(pairs["b_desc"].to(device), pairs["b_mask"].to(device), dom_pairs)["z_q"], dim=-1)
     y = pairs["label"].to(device)
     logits = model.same_head(torch.cat([a, b], dim=-1))
     loss_task = nn.CrossEntropyLoss()(logits, y)
@@ -359,6 +503,19 @@ def run_step(
 
     # VQ commitment/codebook
     losses["vq"] = e1["vq_loss"] + e2["vq_loss"]
+
+    # Cross-domain alignment regularizer on known equivalent pairs (if available)
+    if cfg.num_domains > 1 and getattr(cfg, "loss_cross_domain_align", 0.0) > 0.0:
+        if hasattr(gen, "sample_equivalent_pairs"):
+            eq = gen.sample_equivalent_pairs(max(8, cfg.batch // 4))  # small extra batch
+            X1 = model.encode(eq["x1_desc"].to(device), eq["x1_mask"].to(device), eq["x1_domain"].to(device))
+            X2 = model.encode(eq["x2_desc"].to(device), eq["x2_mask"].to(device), eq["x2_domain"].to(device))
+            zx1 = model.proj1(X1["z_q"])  # use quantized for tight alignment
+            zx2 = model.proj2(X2["z_q"])
+            # Symmetric InfoNCE across the two domains
+            loss_x12 = info_nce(zx1.detach(), zx2, temperature=0.5)
+            loss_x21 = info_nce(zx2.detach(), zx1, temperature=0.5)
+            losses["xdom_align"] = 0.5 * (loss_x12 + loss_x21)
 
     # Stability (EWC-style) during sleep, smaller during day
     pen = ewc.penalty()
@@ -390,6 +547,7 @@ def run_step(
         + cfg.loss_vq_entropy * losses["vq_ent"]
         + w_vq_usage * losses["vq_usage"]
         + cfg.loss_vq * losses["vq"]
+        + (getattr(cfg, "loss_cross_domain_align", 0.0) * losses.get("xdom_align", torch.tensor(0.0, device=device)))
     )
 
     optimizer.zero_grad()
@@ -438,13 +596,30 @@ def train_main():
 
     tcfg = TrainConfig(device=device, steps=args.steps, batch=args.batch)
     ecfg = EpisodeConfig(device=tcfg.device)
-    gen = EpisodeGenerator(ecfg)
+    if tcfg.num_domains > 1:
+        gens: List[EpisodeGenerator] = []
+        for d in range(tcfg.num_domains):
+            # Create slight domain variations to simulate distinct domains
+            cfg_d = EpisodeConfig(
+                device=tcfg.device,
+                max_number=ecfg.max_number,
+                max_len=ecfg.max_len,
+                min_base=5 + (d % 3),
+                max_base=10 - (d % 2),
+                canonicalize=(d % 2 == 0),
+            )
+            gens.append(EpisodeGenerator(cfg_d))
+        gen: EpisodeGenerator | MultiDomainEpisodeGenerator = MultiDomainEpisodeGenerator(gens, domain_batch_mix="uniform")
+    else:
+        gen = EpisodeGenerator(ecfg)
 
     model = ConceptLearner(tcfg).to(tcfg.device)
     # Optimizer with param groups
-    enc_params = list(model.backbone.parameters()) + list(model.to_code.parameters())
+    enc_params = list(model.backbone.parameters()) + list(model.to_code.parameters()) + list(model.domain_adapter.parameters())
     rel_params = list(model.rel.parameters()) + list(model.analogy.parameters()) + list(model.same_head.parameters())
-    vq_params = list(model.vq.parameters()) + list(model.proj1.parameters()) + list(model.proj2.parameters())
+    if getattr(model, "rel_offsets", None) is not None:
+        rel_params += [model.rel_offsets]
+    vq_params = list(model.vq_global.parameters()) + (list(model.vq_private.parameters()) if model.vq_private is not None else []) + list(model.proj1.parameters()) + list(model.proj2.parameters())
     opt = optim.AdamW(
         [
             {"params": enc_params, "lr": 1e-3},
@@ -524,9 +699,9 @@ def train_main():
             # Codebook stats (approximate, from a small batch)
             # For lightweight logging, recompute a small batch indices
             small = gen.sample_views(64)
-            e_small = model.encode(small["view1_desc"].to(tcfg.device), small["view1_mask"].to(tcfg.device))
+            e_small = model.encode(small["view1_desc"].to(tcfg.device), small["view1_mask"].to(tcfg.device), small.get("domain", None))
             with torch.no_grad():
-                cb = model.vq.codebook.weight.detach()
+                cb = model.vq_global.codebook.weight.detach()
                 z_s = e_small["z"]
                 d_s = (
                     torch.sum(z_s ** 2, dim=1, keepdim=True)
