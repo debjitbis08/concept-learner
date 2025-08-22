@@ -2,16 +2,24 @@ Concept Learner
 
 Lightweight PyTorch framework for learning discrete concept codes with invariances and simple relations/analogies over symbolic domains (e.g., toy numbers). Includes a tiny transformer encoder, a VQ bottleneck, relation/analogy heads, and utilities for training/eval/checkpointing.
 
+Update (curriculum + numbers)
+- Numeric relations added in the synthetic domain: successor/predecessor, add_2, makes_ten_with, has_tens/has_ones (toggle via EpisodeConfig.enable_numeric_relations).
+- Numeric “gold atoms” available via EpisodeGenerator.numeric_gold_atoms() to anchor training each epoch.
+- LLM teacher scaffold with generator/critic prompts and programmatic validators (numbers, taxonomy) in concept_learner/teacher/llm_teacher.py.
+- Phase helpers and per‑phase prompt builder in concept_learner/data/curriculum.py to synthesize per‑phase JSON.
+
 Repository layout
-- concept_learner/data/episode_gen.py — synthetic episodes over integers with hidden factors (parity/mod/magnitude), masking, curriculum knobs, hard negatives.
+- concept_learner/data/episode_gen.py — synthetic episodes over integers with hidden factors (parity/mod/magnitude), masking, curriculum knobs, hard negatives; extended numeric relations and gold atoms.
+- concept_learner/data/curriculum.py — compact phase specs and prompt builder for LLM data synthesis.
 - concept_learner/model/ — tiny backbone, VQ bottleneck (EMA), relation and analogy heads.
 - concept_learner/losses.py — InfoNCE, entropy regularizer, simple EWC proxy.
-- concept_learner/train.py — training loop with curriculum, EMA, checkpoints, and probes.
+- concept_learner/train.py — minimal learner definition (ConceptLearner, TrainConfig) and a tiny smoke‑test loop for triples.
 - concept_learner/eval.py — quick in-batch analogy probe; supports loading EMA checkpoints.
 - apps/playground.py — minimal Gradio playground (optional) to query analogies.
 - utils/checkpoints.py — CheckpointManager (save/load, GC).
 - utils/ema.py — simple EMA wrapper and serialization helpers.
 - PLANS_NEXT.md — extended plan and scaffolding for LLM teacher, playground/API, and long runs.
+ - docs/CURRICULUM.md — phase‑by‑phase curriculum with statuses and synthesis prompts.
 
 What's new (child-like grounding & overlap)
 - Context tokens: each domain can prepend a special token (e.g., <home>, <park>) to encourage shared codes across contexts. Enable via TrainConfig.use_context_tokens (default True).

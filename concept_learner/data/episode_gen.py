@@ -14,6 +14,7 @@ class EpisodeConfig:
     max_base: int = 10
     device: str = "cpu"
     canonicalize: bool = True
+    enable_numeric_relations: bool = True  # successor/pred/add_k/has_tens/has_ones/make10
 
 
 class EpisodeGenerator:
@@ -105,7 +106,12 @@ class EpisodeGenerator:
         """
         device = self.cfg.device
         s = torch.randint(0, self.n_items, (batch,), device=device)
-        r = torch.randint(0, 3, (batch,), device=device)
+        # Base relation set: 0 parity, 1 successor, 2 mod3
+        max_r = 3
+        # Optional numeric relations expand the set: 3 predecessor, 4 add_2, 5 has_tens, 6 has_ones, 7 makes_ten_with
+        if self.cfg.enable_numeric_relations:
+            max_r = 8
+        r = torch.randint(0, max_r, (batch,), device=device)
         o = torch.zeros_like(s)
         for i in range(batch):
             if r[i] == 0:
@@ -116,14 +122,38 @@ class EpisodeGenerator:
                         o[i] = choice
                         break
             elif r[i] == 1:
+                # successor (cyclic for the synthetic domain)
                 o[i] = (s[i] + 1) % self.n_items
             else:
-                cand = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[s[i]]]
-                while True:
-                    choice = cand[torch.randint(0, len(cand), (1,), device=device)]
-                    if choice != s[i]:
-                        o[i] = choice
-                        break
+                if (self.cfg.enable_numeric_relations) and r[i] >= 3:
+                    ri = int(r[i].item())
+                    si = int(s[i].item())
+                    if ri == 3:
+                        # predecessor
+                        o[i] = (s[i] - 1) % self.n_items
+                    elif ri == 4:
+                        # add_2 (cyclic)
+                        o[i] = (s[i] + 2) % self.n_items
+                    elif ri == 5:
+                        # has_tens: only valid for 0..99; map to tens digit
+                        tens = (si // 10) % 10
+                        o[i] = torch.tensor(tens, device=device)
+                    elif ri == 6:
+                        ones = si % 10
+                        o[i] = torch.tensor(ones, device=device)
+                    elif ri == 7:
+                        # makes_ten_with: choose o such that s+o=10 when possible; else wrap
+                        o_val = (10 - (si % 10)) % 10
+                        o[i] = torch.tensor(o_val, device=device)
+                    else:
+                        o[i] = s[i]
+                else:
+                    cand = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[s[i]]]
+                    while True:
+                        choice = cand[torch.randint(0, len(cand), (1,), device=device)]
+                        if choice != s[i]:
+                            o[i] = choice
+                            break
         # Hard negatives
         o_corrupt = torch.empty_like(o)
         for i in range(batch):
@@ -156,7 +186,8 @@ class EpisodeGenerator:
         device = self.cfg.device
         A = torch.randint(0, self.n_items, (batch,), device=device)
         if allowed_relations is None or len(allowed_relations) == 0:
-            r = torch.randint(0, 3, (batch,), device=device)
+            max_r = 3 + (5 if self.cfg.enable_numeric_relations else 0)
+            r = torch.randint(0, max_r, (batch,), device=device)
         else:
             choices = torch.tensor(allowed_relations, device=device)
             sel = torch.randint(0, len(choices), (batch,), device=device)
@@ -182,18 +213,45 @@ class EpisodeGenerator:
                 B[i] = (A[i] + 1) % self.n_items
                 D[i] = (C[i] + 1) % self.n_items
             else:
-                candA = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[A[i]]]
-                candC = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[C[i]]]
-                while True:
-                    Bcand = candA[torch.randint(0, len(candA), (1,), device=device)]
-                    if Bcand != A[i]:
-                        B[i] = Bcand
-                        break
-                while True:
-                    Dcand = candC[torch.randint(0, len(candC), (1,), device=device)]
-                    if Dcand != C[i]:
-                        D[i] = Dcand
-                        break
+                if self.cfg.enable_numeric_relations and r[i] >= 3:
+                    ri = int(r[i].item())
+                    if ri == 3:
+                        B[i] = (A[i] - 1) % self.n_items
+                        D[i] = (C[i] - 1) % self.n_items
+                    elif ri == 4:
+                        B[i] = (A[i] + 2) % self.n_items
+                        D[i] = (C[i] + 2) % self.n_items
+                    elif ri == 7:
+                        # make-ten analogy: A:10-A :: C:10-C
+                        B[i] = (10 - (A[i] % 10)) % 10
+                        D[i] = (10 - (C[i] % 10)) % 10
+                    else:
+                        # Fallback to mod3 grouping for analogy (structure-based)
+                        candA = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[A[i]]]
+                        candC = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[C[i]]]
+                        while True:
+                            Bcand = candA[torch.randint(0, len(candA), (1,), device=device)]
+                            if Bcand != A[i]:
+                                B[i] = Bcand
+                                break
+                        while True:
+                            Dcand = candC[torch.randint(0, len(candC), (1,), device=device)]
+                            if Dcand != C[i]:
+                                D[i] = Dcand
+                                break
+                else:
+                    candA = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[A[i]]]
+                    candC = torch.arange(0, self.n_items, device=device)[self.mod3 == self.mod3[C[i]]]
+                    while True:
+                        Bcand = candA[torch.randint(0, len(candA), (1,), device=device)]
+                        if Bcand != A[i]:
+                            B[i] = Bcand
+                            break
+                    while True:
+                        Dcand = candC[torch.randint(0, len(candC), (1,), device=device)]
+                        if Dcand != C[i]:
+                            D[i] = Dcand
+                            break
         A_desc, A_mask, A_base = self._render_batch(A)
         B_desc, B_mask, B_base = self._render_batch(B)
         C_desc, C_mask, C_base = self._render_batch(C)
@@ -322,6 +380,51 @@ class EpisodeGenerator:
             elif r == 2:
                 if self.parity[cand] == self.parity[s] and self.mod3[cand] != self.mod3[s] and cand != o_true:
                     return cand
+            elif r == 1:
+                if cand != (s + 1) % self.n_items and abs(cand - s) <= 3 and cand != o_true:
+                    return cand
+            elif r == 3:
+                if cand != (s - 1) % self.n_items and abs(cand - s) <= 3 and cand != o_true:
+                    return cand
+            elif r == 4:
+                if cand != (s + 2) % self.n_items and abs(cand - s) <= 4 and cand != o_true:
+                    return cand
+            elif r in (5, 6):
+                # wrong digit
+                if cand < 10 and cand != o_true:
+                    return cand
+            elif r == 7:
+                if cand < 10 and cand != ((10 - (s % 10)) % 10) and cand != o_true:
+                    return cand
             else:
                 if cand != (s + 1) % self.n_items and abs(cand - s) <= 3 and cand != o_true:
                     return cand
+
+    # ----- Numeric gold atoms -----
+    def numeric_gold_atoms(self) -> Dict[str, List]:
+        """
+        A tiny, fixed set of triples/analogies/equivalences used as anchors
+        each epoch. Mirrors the curriculum document. Returned as simple lists,
+        suitable for mixing into LLMTeacher payloads or unit tests.
+        """
+        gold = {
+            "triples": [
+                ["1", "successor_of", "0"],
+                ["2", "successor_of", "1"],
+                ["3", "predecessor_of", "4"],
+                ["5", "add_2", "7"],
+                ["10", "has_tens", "1"],
+                ["10", "has_ones", "0"],
+                ["7", "makes_ten_with", "3"],
+                ["3_apples", "count", "3"],
+                ["triangle", "has_sides", "3"],
+            ],
+            "analogies": [
+                [["2", "3"], ["5", "6"]],
+                [["2", "4"], ["3", "5"]],
+                [["7", "10"], ["6", "?"]],
+                [["1", "1st"], ["3", "3rd"]],
+            ],
+            "equivalences": [["three", "3"], ["ten", "10"], ["bike", "bicycle"]],
+        }
+        return gold
