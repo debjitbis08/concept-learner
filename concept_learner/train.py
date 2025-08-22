@@ -210,8 +210,10 @@ def train_main():  # pragma: no cover
             batch = triple_batch if triple_batch is not None else gen.sample_triples(args.batch)
         else:
             batch = gen.sample_triples(args.batch)
-        s = model.encode(batch["s_desc"].to(device), batch["s_mask"].to(device))["z_q"]
-        o = model.encode(batch["o_desc"].to(device), batch["o_mask"].to(device))["z_q"]
+        enc_s = model.encode(batch["s_desc"].to(device), batch["s_mask"].to(device))
+        enc_o = model.encode(batch["o_desc"].to(device), batch["o_mask"].to(device))
+        s = enc_s["z_q"]
+        o = enc_o["z_q"]
         r = batch["r"].to(device)
 
         # In-batch CE for triple scoring (DistMult via in-batch negatives)
@@ -219,11 +221,12 @@ def train_main():  # pragma: no cover
         v = s * w
         logits = torch.matmul(v, o.t())
         labels = torch.arange(logits.size(0), device=device)
-        loss = nn.CrossEntropyLoss()(logits, labels)
+        ce_loss = nn.CrossEntropyLoss()(logits, labels)
 
         # VQ commitment
-        loss = loss + 0.5 * (model.encode(batch["s_desc"].to(device), batch["s_mask"].to(device))["vq_loss"])
-        loss = loss + 0.5 * (model.encode(batch["o_desc"].to(device), batch["o_mask"].to(device))["vq_loss"])
+        vq_s = enc_s["vq_loss"]
+        vq_o = enc_o["vq_loss"]
+        loss = ce_loss + 0.5 * vq_s + 0.5 * vq_o
 
         opt.zero_grad()
         loss.backward()
@@ -231,7 +234,16 @@ def train_main():  # pragma: no cover
         opt.step()
 
         if step % 20 == 0:
-            print(f"step {step:05d} loss {loss.item():.4f}")
+            with torch.no_grad():
+                B = logits.size(0)
+                pred = logits.argmax(dim=-1)
+                acc = (pred == labels).float().mean().item()
+                import math
+                lnB = math.log(max(1, B))
+                print(
+                    f"step {step:05d} total {loss.item():.4f} | ce {ce_loss.item():.4f} (lnB~{lnB:.2f}) | "
+                    f"vq_s {float(vq_s):.4f} vq_o {float(vq_o):.4f} | acc {acc:.3f} B {B}"
+                )
 
     print("[train] done.")
 
