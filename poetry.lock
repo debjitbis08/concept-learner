@@ -496,6 +496,22 @@ typing-extensions = ">=4.0,<5.0"
 websockets = ">=10.0,<16.0"
 
 [[package]]
+name = "graphviz"
+version = "0.21"
+description = "Simple Python interface for Graphviz"
+optional = false
+python-versions = ">=3.9"
+files = [
+    {file = "graphviz-0.21-py3-none-any.whl", hash = "sha256:54f33de9f4f911d7e84e4191749cac8cc5653f815b06738c54db9a15ab8b1e42"},
+    {file = "graphviz-0.21.tar.gz", hash = "sha256:20743e7183be82aaaa8ad6c93f8893c923bd6658a04c32ee115edb3c8a835f78"},
+]
+
+[package.extras]
+dev = ["Flake8-pyproject", "build", "flake8", "pep8-naming", "tox (>=3)", "twine", "wheel"]
+docs = ["sphinx (>=5,<7)", "sphinx-autodoc-typehints", "sphinx-rtd-theme (>=0.2.5)"]
+test = ["coverage", "pytest (>=7,<8.1)", "pytest-cov", "pytest-mock (>=3)"]
+
+[[package]]
 name = "groovy"
 version = "0.1.2"
 description = "A small Python library created to help developers protect their applications from Server Side Request Forgery (SSRF) attacks."
@@ -1980,6 +1996,23 @@ optree = ["optree (>=0.13.0)"]
 pyyaml = ["pyyaml"]
 
 [[package]]
+name = "torchview"
+version = "0.2.7"
+description = "Visualization of Pytorch Models"
+optional = false
+python-versions = ">=3.8"
+files = [
+    {file = "torchview-0.2.7-py3-none-any.whl", hash = "sha256:c7f3a9d16138c20b606900ecbf46d01489f2b8c77ed97e71293883bc606c2be0"},
+    {file = "torchview-0.2.7.tar.gz", hash = "sha256:c5898fd03d256333c9827000c1f83e1052fbcfc1066032d86b30d429dd942f7c"},
+]
+
+[package.dependencies]
+graphviz = "*"
+
+[package.extras]
+dev = ["black", "codecov", "isort", "mdformat", "mdformat-mkdocs", "mkdocs", "mkdocs-gen-files", "mkdocs-material", "mkdocs-redirects", "mkdocstrings", "mkdocstrings-python", "mypy", "packaging", "pre-commit", "pycln", "pylint", "pytest", "pytest-cov", "ruff (==0.0.246)"]
+
+[[package]]
 name = "tqdm"
 version = "4.67.1"
 description = "Fast, Extensible Progress Meter"
@@ -2193,4 +2226,4 @@ files = [
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.10,<3.14"
-content-hash = "64ab3f23c6140115e8852219985acca71273f6930b569f3ab6927d3e60a9c529"
+content-hash = "dbd2d8f5388f67c5c787a200918756b606d0d33fa934dc61cdda0a9e2d2c40e9"

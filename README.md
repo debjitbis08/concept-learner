@@ -33,6 +33,7 @@ Requirements
 - Python 3.10+
 - PyTorch (CUDA build recommended for GPU)
 - Optional: gradio (for playground)
+ - Optional: torchview (to render the model architecture image)
 
 Install
 - Recommended: create a venv and install dependencies as needed.
@@ -41,10 +42,19 @@ Install
 Training
 - Auto device selection: --device auto chooses CUDA if available, else CPU.
 - Checkpoints: saved to --ckpt_dir (default checkpoints) every --save_every steps and at curriculum boundaries.
+- LLM data: you can pre-generate numeric knowledge JSON using the LLM teacher, then train against it deterministically with --llm_data_json.
+- Optimization knobs:
+  - --lr, --sched {none,cosine}, --warmup, --lr_min: basic LR and warmup+cosine annealing (default: cosine with warmup).
+  - --vq_weight/--vq_final_weight: weight per VQ commitment term (applied to both subject and object; anneals linearly from initial to final; defaults favor CE early).
+  - --ce_temp: temperature for the in-batch CE over triples. Lower is sharper (default 0.2). Training uses in-batch negatives plus one hard negative per row.
+  - --ce_mode {pair,inbatch}: pair trains a 2-class classifier (pos vs its hard-negative) per row; inbatch trains over all in-batch positives plus hard negatives (2B classes). Default pair for faster, more stable early learning.
+  - --log_every: logging period; prints EMA-smoothed metrics and VQ code usage diagnostics.
+  - --val_every: if >0, runs a small validation probe (fresh batch) every N steps and logs ce/acc.
 
 Examples
 - Train for 10k steps on GPU (auto):
-  python -m concept_learner.train --device auto --steps 10000 --batch 128 --ckpt_dir checkpoints --save_every 1000
+  python -m concept_learner.train --device auto --steps 10000 --batch 128 --ckpt_dir checkpoints --save_every 1000 \
+    --sched cosine --warmup 1000 --vq_weight 0.25 --val_every 200 --log_every 50
 
 - Resume from latest checkpoint in directory:
   python -m concept_learner.train --device auto --steps 2000 --batch 128 --ckpt_dir checkpoints --resume_latest
@@ -52,9 +62,22 @@ Examples
 - Resume from a specific checkpoint path:
   python -m concept_learner.train --device auto --steps 2000 --batch 128 --resume_path checkpoints/ckpt_0008000.pt
 
+- Pre-generate LLM data (offline synthetic or online if OPENAI_API_KEY is set):
+  python -m concept_learner.generate_data --out data/llm_numbers.json --count 4 --min_triples 512 --offline
+
+- Train using pre-generated LLM JSON (no API calls during training):
+  python -m concept_learner.train --use_llm_teacher --llm_data_json data/llm_numbers.json --steps 5000 --batch 128 --save_every 500
+
 Evaluation
 - Evaluate with a specific checkpoint (EMA applied if present):
   python -m concept_learner.eval --device auto --ckpt checkpoints/latest.pt
+
+Model architecture image
+- An architecture diagram is kept at docs/model_architecture.svg.
+- To (re)generate it using torchview:
+  - Install the optional dependency: poetry add --group dev torchview or pip install torchview graphviz
+  - Run: poetry run update-model-arch --out docs/model_architecture.svg
+  - If torchview/graphviz are unavailable, a placeholder SVG is written instead.
 
 Playground (optional)
 - See docs/PLAYGROUND.md for details.

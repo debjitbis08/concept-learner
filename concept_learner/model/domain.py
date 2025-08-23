@@ -14,10 +14,15 @@ class DomainAdapter(nn.Module):
         super().__init__()
         self.emb = nn.Embedding(num_domains, hidden_dim)
         r = max(1, int(adapter_rank))
+        l1 = nn.Linear(hidden_dim, r)
+        l2 = nn.Linear(r, 2 * hidden_dim)
+        # Initialize near-identity: final layer outputs ~0 so gamma≈0, beta≈0 at start
+        nn.init.zeros_(l2.weight)
+        nn.init.zeros_(l2.bias)
         self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, r),
+            l1,
             nn.ReLU(),
-            nn.Linear(r, 2 * hidden_dim),
+            l2,
         )
 
     def forward(self, h: torch.Tensor, domain: torch.Tensor | int | None) -> torch.Tensor:

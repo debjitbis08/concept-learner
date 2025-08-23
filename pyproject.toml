@@ -11,6 +11,12 @@ torch = "2.8"
 numpy = "2.2"
 gradio = "^5.43.1"
 openai = "^1.40.0"
+torchview = "^0.2.7"
+
+[tool.poetry.scripts]
+update-model-arch = "concept_learner.visualize_model:main"
+train-numbers-llm = "concept_learner.scripts:train_numbers_llm"
+train-baseline = "concept_learner.train_baseline:train_main"
 
 
 [build-system]

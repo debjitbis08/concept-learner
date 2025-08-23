@@ -32,14 +32,37 @@ class AnalogyProjector(nn.Module):
     def __init__(self, dim: int, proj_dim: int = 32):
         super().__init__()
         self.proj = nn.Linear(dim, proj_dim, bias=False)
+        # Learnable logit scale (temperature inverse)
+        self.scale = nn.Parameter(torch.tensor(5.0))
 
     def rel_vec(self, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return self.proj(a - b)
+        # Normalize inputs to stabilize differences
+        a_n = F.normalize(a, dim=-1)
+        b_n = F.normalize(b, dim=-1)
+        return self.proj(a_n - b_n)
 
-    def analogy_loss(self, A: torch.Tensor, B: torch.Tensor, C: torch.Tensor, D: torch.Tensor, temp: float = 0.1) -> torch.Tensor:
+    def analogy_loss(
+        self,
+        A: torch.Tensor,
+        B: torch.Tensor,
+        C: torch.Tensor,
+        D: torch.Tensor,
+        temp: float = 0.1,
+        w_rel: float = 0.7,
+        w_trans: float = 0.3,
+    ) -> torch.Tensor:
         # In-batch negatives: compute similarity of r_AB to r_CD for all D in batch
         r1 = self.rel_vec(A, B)  # (B, P)
         r2 = self.rel_vec(C, D)  # (B, P)
-        logits = torch.matmul(F.normalize(r1, dim=-1), F.normalize(r2, dim=-1).t()) / temp
+        sim = torch.matmul(F.normalize(r1, dim=-1), F.normalize(r2, dim=-1).t())
+        logits = (self.scale * sim) / temp
         labels = torch.arange(A.size(0), device=A.device)
-        return F.cross_entropy(logits, labels)
+        ce = F.cross_entropy(logits, labels)
+
+        # Translational consistency in concept space: D ≈ C + (B - A)
+        delta = B - A
+        target = F.normalize(C + delta, dim=-1)
+        pred = F.normalize(D, dim=-1)
+        # Use 1 - cosine similarity as loss
+        trans = 1.0 - torch.sum(target * pred, dim=-1).mean()
+        return w_rel * ce + w_trans * trans

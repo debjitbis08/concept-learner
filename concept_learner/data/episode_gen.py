@@ -219,8 +219,11 @@ class EpisodeGenerator:
                         B[i] = (A[i] - 1) % self.n_items
                         D[i] = (C[i] - 1) % self.n_items
                     elif ri == 4:
-                        B[i] = (A[i] + 2) % self.n_items
-                        D[i] = (C[i] + 2) % self.n_items
+                        # Randomize addition deltas to teach translational analogies beyond +2
+                        # Sample small integer delta in [-3,-2,-1,1,2,3]
+                        d = torch.tensor(random.choice([-3, -2, -1, 1, 2, 3]), device=device)
+                        B[i] = (A[i] + d) % self.n_items
+                        D[i] = (C[i] + d) % self.n_items
                     elif ri == 7:
                         # make-ten analogy: A:10-A :: C:10-C
                         B[i] = (10 - (A[i] % 10)) % 10

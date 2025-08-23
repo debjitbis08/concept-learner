@@ -4,6 +4,9 @@ import random
 from typing import Any, Dict, List, Optional
 import json
 import os
+import threading
+import queue
+import time
 
 try:
     from openai import OpenAI  # OpenAI Python SDK v1+
@@ -25,13 +28,18 @@ class LLMTeacher:
       not wired in yet.
     """
 
-    def __init__(self, client: Any | None, seed: int = 0, model: str = "gpt-4o-mini"):
+    def __init__(self, client: Any | None, seed: int = 0, model: str = "gpt-4o-mini", request_timeout_s: float = 6.0):
         # If client is None, try to construct from OPENAI_API_KEY
         if client is None and OpenAI is not None and os.environ.get("OPENAI_API_KEY"):
             client = OpenAI()
         self.client = client
         self.model = model
+        self.request_timeout_s = float(request_timeout_s)
         random.seed(seed)
+        # Background producer state
+        self._q: "queue.Queue[Dict[str, Any]]" = queue.Queue()
+        self._producer_thread: Optional[threading.Thread] = None
+        self._stop_flag = threading.Event()
 
     # ---------- Prompt builders ----------
     def build_generator_prompt(self, phase: str, rel_set: list[str], seeds: list[str]) -> str:
@@ -71,11 +79,128 @@ class LLMTeacher:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.3,
+                timeout=self.request_timeout_s,
             )
             text = resp.choices[0].message.content  # type: ignore[index]
             return json.loads(text) if text else None
         except Exception:
             return None
+
+    # ---------- Multi-pass numbers synthesis ----------
+    def _merge_payloads(self, base: Dict[str, Any], extra: Dict[str, Any], allowed: set[str]) -> Dict[str, Any]:
+        def uniq(seq: List[Any]) -> List[Any]:
+            seen = set()
+            out = []
+            for x in seq:
+                key = json.dumps(x, sort_keys=True) if not isinstance(x, str) else x
+                if key not in seen:
+                    seen.add(key)
+                    out.append(x)
+            return out
+
+        out: Dict[str, Any] = {}
+        out["concepts"] = uniq(list(base.get("concepts", [])) + list(extra.get("concepts", [])))
+        # Restrict relations to allowed
+        rels = list(base.get("relations", [])) + list(extra.get("relations", []))
+        out["relations"] = uniq([r for r in rels if r in allowed])
+        # Keep only well-formed triples and allowed relations
+        btri = [t for t in base.get("triples", []) if isinstance(t, list) and len(t) == 3 and t[1] in allowed]
+        etri = [t for t in extra.get("triples", []) if isinstance(t, list) and len(t) == 3 and t[1] in allowed]
+        out["triples"] = uniq(btri + etri)
+        out["analogies"] = uniq(list(base.get("analogies", [])) + list(extra.get("analogies", [])))
+        out["equivalences"] = uniq(list(base.get("equivalences", [])) + list(extra.get("equivalences", [])))
+        return out
+
+    def fetch_numbers_payload(self, min_triples: int = 256, max_calls: int = 4, sleep_s: float = 0.0) -> Optional[Dict[str, Any]]:
+        """
+        Call the LLM multiple times and merge JSON payloads until at least
+        min_triples valid numeric triples are collected. Returns a validated
+        payload or None if client is not configured or calls fail.
+        """
+        if self.client is None:
+            return None
+        try:
+            from concept_learner.data.curriculum import allowed_relations_for_phase, SEEDS
+
+            allowed = set(allowed_relations_for_phase(4)) | {"has_tens", "has_ones", "makes_ten_with"}
+            prompt = self.build_generator_prompt("Phase 4 — Numbers", list(allowed), SEEDS)
+        except Exception:
+            allowed = {"successor_of", "predecessor_of", "has_tens", "has_ones", "makes_ten_with"}
+            prompt = self.build_generator_prompt("Phase 4 — Numbers", list(allowed), ["1", "2", "3"])  # fallback
+
+        merged: Dict[str, Any] = {"concepts": [], "relations": list(allowed), "triples": [], "analogies": [], "equivalences": []}
+        calls = 0
+        while calls < max_calls and len(merged.get("triples", [])) < int(min_triples):
+            data = self._chat_json(prompt)
+            calls += 1
+            if isinstance(data, dict):
+                merged = self._merge_payloads(merged, data, allowed)
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+        # Force relations to allowed set subset
+        merged["relations"] = [r for r in merged.get("relations", []) if r in allowed]
+        ok, errs = self.validate_numbers(merged)
+        if not ok:
+            # If we have some triples but minor errors, drop offending triples by relation and re-validate
+            bad_rels = set()
+            for e in errs:
+                if e.startswith("relation not allowed:"):
+                    bad_rels.add(e.split(":", 1)[1].strip())
+            if bad_rels:
+                merged["triples"] = [t for t in merged.get("triples", []) if t[1] not in bad_rels]
+                merged["relations"] = [r for r in merged.get("relations", []) if r not in bad_rels]
+                ok, _ = self.validate_numbers(merged)
+        if ok and len(merged.get("triples", [])) >= 1:
+            return merged
+        return None
+
+    # ---------- Background producer/consumer ----------
+    def start_numbers_producer(self, min_triples: int = 512, buffer_size: int = 4, max_calls: int = 4, poll_sleep: float = 0.2) -> None:
+        """
+        Start a background thread that repeatedly fetches numbers payloads
+        from the LLM and enqueues them as episodes. Acts as a producer in
+        a producer-consumer setup for the training loop.
+        """
+        if self.client is None:
+            return
+        if self._producer_thread is not None and self._producer_thread.is_alive():
+            return
+        self._stop_flag.clear()
+
+        def _run():
+            while not self._stop_flag.is_set():
+                try:
+                    if self._q.qsize() >= buffer_size:
+                        time.sleep(poll_sleep)
+                        continue
+                    payload = self.fetch_numbers_payload(min_triples=min_triples, max_calls=max_calls)
+                    if payload is not None:
+                        ep = {"domain": "numbers", "type": "kg", "payload": payload, "answers": {}}
+                        self._q.put(ep)
+                    else:
+                        time.sleep(poll_sleep)
+                except Exception:
+                    time.sleep(poll_sleep)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        self._producer_thread = t
+
+    def stop_producer(self) -> None:
+        self._stop_flag.set()
+        if self._producer_thread is not None:
+            self._producer_thread.join(timeout=1.0)
+        self._producer_thread = None
+
+    def pop_numbers_episode(self, timeout: float = 0.0) -> Optional[Dict[str, Any]]:
+        try:
+            if timeout and timeout > 0:
+                return self._q.get(timeout=timeout)
+            if not self._q.empty():
+                return self._q.get_nowait()
+        except Exception:
+            return None
+        return None
 
     # ---------- Programmatic validators ----------
     def validate_numbers(self, payload: Dict[str, Any]) -> tuple[bool, List[str]]:
@@ -166,31 +291,9 @@ class LLMTeacher:
         episodes: List[Dict[str, Any]] = []
 
         if self.client is None:
-            # Provide a tiny numbers payload aligned with the curriculum doc
-            payload = {
-                "concepts": [str(i) for i in range(0, 13)] + ["one", "two", "three"],
-                "relations": [
-                    "successor_of",
-                    "predecessor_of",
-                    "has_tens",
-                    "has_ones",
-                    "makes_ten_with",
-                ],
-                "triples": [
-                    ["1", "successor_of", "0"],
-                    ["2", "successor_of", "1"],
-                    ["3", "predecessor_of", "4"],
-                    ["10", "has_tens", "1"],
-                    ["10", "has_ones", "0"],
-                    ["7", "makes_ten_with", "3"],
-                ],
-                "analogies": [
-                    [["2", "3"], ["5", "6"]],
-                    [["2", "4"], ["3", "5"]],
-                    [["7", "10"], ["6", "?"]],
-                ],
-                "equivalences": [["three", "3"]],
-            }
+            # Provide a sufficiently large, validated numeric payload so that
+            # downstream code can build batches of the requested size.
+            payload = self._make_synthetic_numbers_payload(min_triples=max(64, int(batch_size)))
             ok, errs = self.validate_numbers(payload)
             if ok:
                 episodes.append({
@@ -201,22 +304,105 @@ class LLMTeacher:
                 })
             return episodes
 
-        # Attempt to synthesize with the OpenAI SDK for Phase 4 (numbers) by default
-        try:
-            from concept_learner.data.curriculum import allowed_relations_for_phase, SEEDS
-
-            rel_set = allowed_relations_for_phase(4)
-            prompt = self.build_generator_prompt("Phase 4 — Numbers", rel_set, SEEDS)
-            data = self._chat_json(prompt)
-            if isinstance(data, dict):
-                ok, errs = self.validate_numbers(data)
-                if ok:
+        # Attempt to synthesize with the OpenAI SDK and collect enough data
+        if self.client is not None:
+            # Prefer consuming from background queue if started
+            ep = self.pop_numbers_episode(timeout=0.0)
+            if ep is None:
+                payload = self.fetch_numbers_payload(min_triples=max(4 * batch_size, 256))
+                if payload is not None:
                     episodes.append({
                         "domain": "numbers",
                         "type": "kg",
-                        "payload": data,
+                        "payload": payload,
                         "answers": {},
                     })
-        except Exception:
-            pass
+            else:
+                episodes.append(ep)
         return episodes
+
+    # ---------- Local synthetic fallback ----------
+    def _make_synthetic_numbers_payload(self, min_triples: int = 128) -> Dict[str, Any]:
+        """
+        Build a deterministic numeric knowledge payload with enough triples
+        to satisfy typical training batch sizes. Includes successor/
+        predecessor, place value, and make-ten facts over 0..99.
+        """
+        # Concepts: digits 0..99 plus a few number words for equivalences
+        concepts = [str(i) for i in range(0, 100)] + [
+            "zero",
+            "one",
+            "two",
+            "three",
+            "four",
+            "five",
+            "six",
+            "seven",
+            "eight",
+            "nine",
+            "ten",
+        ]
+        relations = [
+            "successor_of",
+            "predecessor_of",
+            "has_tens",
+            "has_ones",
+            "makes_ten_with",
+        ]
+        triples: List[List[str]] = []
+
+        # successor_of: 0..98 -> (i+1 successor_of i)
+        for i in range(0, 99):
+            triples.append([str(i + 1), "successor_of", str(i)])
+
+        # predecessor_of: 1..99 -> (i-1 predecessor_of i)
+        for i in range(1, 100):
+            triples.append([str(i - 1), "predecessor_of", str(i)])
+
+        # place value for 0..99
+        for i in range(0, 100):
+            tens = i // 10
+            ones = i % 10
+            triples.append([str(i), "has_tens", str(tens)])
+            triples.append([str(i), "has_ones", str(ones)])
+
+        # make-ten within 0..10 (covers all 0..9 pairs at least once)
+        for i in range(0, 11):
+            j = 10 - i
+            if 0 <= j <= 10:
+                triples.append([str(i), "makes_ten_with", str(j)])
+
+        # Analogies: a few simple templates
+        analogies: List[List[List[str]]] = []
+        # successor analogy: 2:3 :: 5:6, etc.
+        for a in [(2, 3, 5, 6), (2, 4, 3, 5), (7, 10, 6, 9)]:
+            analogies.append([[str(a[0]), str(a[1])], [str(a[2]), str(a[3])]])
+
+        # Equivalences: number words ↔ digits
+        eq = [
+            ["zero", "0"],
+            ["one", "1"],
+            ["two", "2"],
+            ["three", "3"],
+            ["four", "4"],
+            ["five", "5"],
+            ["six", "6"],
+            ["seven", "7"],
+            ["eight", "8"],
+            ["nine", "9"],
+            ["ten", "10"],
+        ]
+
+        # If, for some reason, trimming is requested (tests), keep at least min_triples
+        if len(triples) < int(min_triples):
+            # With 0..99 construction we typically have > 500 triples; this branch is
+            # defensive and should not trigger.
+            pass
+
+        return {
+            "concepts": concepts,
+            "relations": relations,
+            "triples": triples,
+            "analogies": analogies,
+            "equivalences": eq,
+        }
