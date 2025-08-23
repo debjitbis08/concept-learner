@@ -1,92 +1,326 @@
-Concept Learner
+# Subject-Aware Concept Learner
 
-Lightweight PyTorch framework for learning discrete concept codes with invariances and simple relations/analogies over symbolic domains (e.g., toy numbers). Includes a tiny transformer encoder, a VQ bottleneck, relation/analogy heads, and utilities for training/eval/checkpointing.
+A compact, grow‑able architecture that learns **discrete concepts** (VQ), applies **small reasoning steps**, and answers with a **single decoder**. Scales from **Kindergarten → Nursery → Professional** without changing the skeleton.
 
-Update (curriculum + numbers)
-- Numeric relations added in the synthetic domain: successor/predecessor, add_2, makes_ten_with, has_tens/has_ones (toggle via EpisodeConfig.enable_numeric_relations).
-- Numeric “gold atoms” available via EpisodeGenerator.numeric_gold_atoms() to anchor training each epoch.
-- LLM teacher scaffold with generator/critic prompts and programmatic validators (numbers, taxonomy) in concept_learner/teacher/llm_teacher.py.
-- Phase helpers and per‑phase prompt builder in concept_learner/data/curriculum.py to synthesize per‑phase JSON.
+---
 
-Repository layout
-- concept_learner/data/episode_gen.py — synthetic episodes over integers with hidden factors (parity/mod/magnitude), masking, curriculum knobs, hard negatives; extended numeric relations and gold atoms.
-- concept_learner/data/curriculum.py — compact phase specs and prompt builder for LLM data synthesis.
-- concept_learner/model/ — tiny backbone, VQ bottleneck (EMA), relation and analogy heads.
-- concept_learner/losses.py — InfoNCE, entropy regularizer, simple EWC proxy.
-- concept_learner/train.py — minimal learner definition (ConceptLearner, TrainConfig) and a tiny smoke‑test loop for triples.
-- concept_learner/eval.py — quick in-batch analogy probe; supports loading EMA checkpoints.
-- apps/playground.py — minimal Gradio playground (optional) to query analogies.
-- utils/checkpoints.py — CheckpointManager (save/load, GC).
-- utils/ema.py — simple EMA wrapper and serialization helpers.
-- PLANS_NEXT.md — extended plan and scaffolding for LLM teacher, playground/API, and long runs.
- - docs/CURRICULUM.md — phase‑by‑phase curriculum with statuses and synthesis prompts.
+## 0) Goals
 
-What's new (child-like grounding & overlap)
-- Context tokens: each domain can prepend a special token (e.g., <home>, <park>) to encourage shared codes across contexts. Enable via TrainConfig.use_context_tokens (default True).
-- Hierarchical codes: global shared VQ plus optional per-domain private residual VQs (TrainConfig.use_private_vq).
-- Instance permanence head: lightweight head that learns to predict whether two views are the same instance (TrainConfig.use_instance_head). Trained alongside contrastive and relation/analogy losses.
-- Sleep/consolidation: tiny replay buffer with periodic replay-only steps; stability regularizer (EWC-style) during sleep.
-- Cross-domain alignment: optional regularizer aligning equivalent pairs across domains.
-- Metrics: periodic reporting of codebook perplexity/usage, in-batch analogy accuracy, cross-context code sharing ratio, and nearest-neighbor domain diversity.
+- Learn **stable, reusable concepts** (e.g., successor, compare, attribute-of, color, shape, is-a).
+- Support **multiple subjects** (math, shapes, colors, animals, mixed) with **one model**.
+- Execute short **reasoning chains** (1–4 steps) over a typed working state.
+- Keep it **text-only**; plug in tiny lookup tools (tables) where needed.
 
-Requirements
-- Python 3.10+
-- PyTorch (CUDA build recommended for GPU)
-- Optional: gradio (for playground)
- - Optional: torchview (to render the model architecture image)
+---
 
-Install
-- Recommended: create a venv and install dependencies as needed.
-- If you plan to run the playground: pip install gradio
+## 1) High-Level Architecture
 
-Training
-- Auto device selection: --device auto chooses CUDA if available, else CPU.
-- Checkpoints: saved to --ckpt_dir (default checkpoints) every --save_every steps and at curriculum boundaries.
-- LLM data: you can pre-generate numeric knowledge JSON using the LLM teacher, then train against it deterministically with --llm_data_json.
-- Optimization knobs:
-  - --lr, --sched {none,cosine}, --warmup, --lr_min: basic LR and warmup+cosine annealing (default: cosine with warmup).
-  - --vq_weight/--vq_final_weight: weight per VQ commitment term (applied to both subject and object; anneals linearly from initial to final; defaults favor CE early).
-  - --ce_temp: temperature for the in-batch CE over triples. Lower is sharper (default 0.2). Training uses in-batch negatives plus one hard negative per row.
-  - --ce_mode {pair,inbatch}: pair trains a 2-class classifier (pos vs its hard-negative) per row; inbatch trains over all in-batch positives plus hard negatives (2B classes). Default pair for faster, more stable early learning.
-  - --log_every: logging period; prints EMA-smoothed metrics and VQ code usage diagnostics.
-  - --val_every: if >0, runs a small validation probe (fresh batch) every N steps and logs ce/acc.
+### Visual Pipeline (ASCII)
 
-Examples
-- Train for 10k steps on GPU (auto):
-  python -m concept_learner.train --device auto --steps 10000 --batch 128 --ckpt_dir checkpoints --save_every 1000 \
-    --sched cosine --warmup 1000 --vq_weight 0.25 --val_every 200 --log_every 50
+```
+[ TEXT PROMPT ]
+  e.g., "8 + 2 = ?", "color of banana?", "Is number of red fruits > 4?"
 
-- Resume from latest checkpoint in directory:
-  python -m concept_learner.train --device auto --steps 2000 --batch 128 --ckpt_dir checkpoints --resume_latest
+        |
+        v
++--------------------------------------+
+| Tiny Transformer Encoder (2 layers)  |
+|  - tokens: numbers/words/symbols     |
+|  - outputs: pooled h and sequence H  |
++--------------------------------------+
+        |
+        | (pooled h)
+        v
++-------------------------------+
+| VQ_subject (K≈8–12, unsup.)   |
+| -> subject index s            |
+| -> subject emb e_s            |
++-------------------------------+
+        |
+        |  (conditioning: bias / FiLM / CLN)
+        v
++--------------------------------------+
+| Subject Conditioning                 |
+|  - modulate h/H with e_s             |
+|  - optionally bias/mask concepts     |
++--------------------------------------+
+        |
+        | (conditioned h~)
+        v
+     +--------------------+       +--------------------+
+     | VQ_type (K≈24)     |       | VQ_param (K≈48)    |
+     | -> e_type          |       | -> e_param         |
+     +--------------------+       +--------------------+
+              \                         /
+               \                       /
+                \                     /
+                 v                   v
+                +-----------------------+
+                |  z = [e_type; e_param]|
+                +-----------------------+
+                         |
+                         |   (plus h~, e_s)
+                         v
+              +-------------------------------+
+              | Reasoning Cells (1–4 steps)   |
+              |  s_{t+1} = s_t + g⊙EXEC(...)  |
+              +-------------------------------+
+                         |
+                         v
+              +-------------------------------+
+              | Unified Decoder               |
+              |  - one vocab (numbers/words)  |
+              |  - can score MCQ options too  |
+              +-------------------------------+
+                         |
+                         v
+                      ANSWER
+```
 
-- Resume from a specific checkpoint path:
-  python -m concept_learner.train --device auto --steps 2000 --batch 128 --resume_path checkpoints/ckpt_0008000.pt
+### Typed Working State (internal)
 
-- Pre-generate LLM data (offline synthetic or online if OPENAI_API_KEY is set):
-  python -m concept_learner.generate_data --out data/llm_numbers.json --count 4 --min_triples 512 --offline
+```
+STATE = {
+  ITEMS:  list of candidate objects (from text or lookup),
+  MASK:   boolean mask over ITEMS,
+  VAL:    scalar slot (e.g., a count / numeric value),
+  BOOL:   boolean slot (yes/no),
+}
+```
 
-- Train using pre-generated LLM JSON (no API calls during training):
-  python -m concept_learner.train --use_llm_teacher --llm_data_json data/llm_numbers.json --steps 5000 --batch 128 --save_every 500
+---
 
-Evaluation
-- Evaluate with a specific checkpoint (EMA applied if present):
-  python -m concept_learner.eval --device auto --ckpt checkpoints/latest.pt
+## 2) Components
 
-Model architecture image
-- An architecture diagram is kept at docs/model_architecture.svg.
-- To (re)generate it using torchview:
-  - Install the optional dependency: poetry add --group dev torchview or pip install torchview graphviz
-  - Run: poetry run update-model-arch --out docs/model_architecture.svg
-  - If torchview/graphviz are unavailable, a placeholder SVG is written instead.
+### 2.1 Tokenizer / Vocab
 
-Playground (optional)
-- See docs/PLAYGROUND.md for details.
-- Quick start (after training and checkpoint creation):
-  pip install gradio
-  python apps/playground.py --ckpt checkpoints/latest.pt --device auto
+- Integers 0–100 (extendable), symbols `+ − × ÷ < > = :: ?`, words: `next, before, between, odd, even, count, number, color, shape, sides, is, has, of, which, bigger, smaller, more, fewer, yes, no`, subject nouns (`banana, apple, cat, dog, triangle, square, red, blue, ...`).
 
-Notes
-- The integer toy domain uses masked sequences with PAD distinct from digits; views curriculum and hard negatives are implemented.
-- EMA VQ with dead code reinit and usage entropy is used to stabilize the bottleneck.
-- Relation loss uses in-batch multiclass CE; analogy loss mixes a temperature-controlled classifier with an offset penalty.
-- Checkpoints include model, optimizer, EMA, step, and metrics (including an EMA-based analogy accuracy probe).
+### 2.2 Encoder (Tiny Transformer)
+
+- 2 layers, d≈128, 4 heads; pooled vector `h` and sequence states `H`.
+
+### 2.3 VQ_subject (Unsupervised Routing)
+
+- Codebook K≈8–12, dim≈32, EMA updates; commitment loss β≈0.25.
+- Regularizers: code-usage entropy; paraphrase-stability (InfoNCE) across rewordings.
+- Conditioning: start with **bias** (add transformed `e_s` to hidden), upgrade to FiLM/CLN if needed.
+
+### 2.4 Concept Bottleneck (Factored VQs)
+
+- **VQ_type (K≈24, dim≈64):** operator family (e.g., `successor, predecessor, add, subtract, multiply, compare, attribute-of, is-a, has-a, filter, count, groupby, argmax`).
+- **VQ_param (K≈48, dim≈64):** small integers (−5…+10), tokens like `{even, odd, <, >, =, red, blue, circle, square, fruit, animal, sides, color}`.
+- Outputs concatenated: `z = [e_type; e_param]`.
+- Losses: commitment + EMA + mild code-usage entropy.
+
+### 2.5 Reasoning Cells (Concept Application)
+
+- Controlled operator application (not an RNN):
+
+  - Inputs: working state `s`, concepts `e_type, e_param`, subject `e_s`.
+  - Gate: `g = σ(W_g · [s; e_type; e_param; e_s])`.
+  - Micro-execution: `u = EXEC(e_type, e_param, s)`.
+  - Residual update: `s_next = s + g ⊙ u`.
+
+- Start with **1 step**; later allow **2–4 steps** + optional **STOP** concept.
+
+#### EXEC Registry (initial operators)
+
+- `Filter(category=X)` → update `MASK` by `is_a(item, X)`.
+- `Filter(attr=A, value=B)` → `MASK ∧= (attr(item,A)==B)`.
+- `Count()` → `VAL = sum(MASK)`.
+- `Compare(op, k)` → `BOOL = op(VAL, k)`.
+- `AttributeOf(name)` → map item to attribute (e.g., sides(shape)).
+- `Successor/Predecessor` / `Add(k)` / `Sub(k)` / `Mul(k)`.
+- `IsA`, `HasA`, simple `Map`.
+- **Tool hooks (later):** calculator, table lookup, code runner.
+
+### 2.6 Unified Decoder
+
+- **Single classifier** over a shared vocab (numbers + words + `yes/no`).
+- Input: projection of `[s_final ; z ; e_s]`.
+- If multi-token answers later, replace with a tiny **1-layer autoregressive decoder** (same input conditioning) — MCQ scoring uses log-probs from the same decoder.
+
+---
+
+## 3) Data & Knowledge
+
+### 3.1 Mini Knowledge Tables (text-only tools)
+
+- `color(noun)` table: `banana→yellow, apple→red/green, cherry→red, ...`
+- `sides(shape)` table: `triangle→3, square→4, ...`
+- `is_a(noun, category)` table: `apple→fruit, cow→animal, ...`
+
+### 3.2 Exercise Format (JSONL)
+
+```json
+{
+  "id": "ex-001",
+  "prompt": "Is number of red fruits greater than 4?",
+  "options": ["yes", "no"], // optional; omit for open answer
+  "answer": "yes",
+  "subject": null, // optional; can be null for unsup
+  "tags": ["mixed", "filter", "count", "compare", ">"],
+  "facts": { "basket": ["apple", "banana", "cherry", "strawberry", "apple"] }
+}
+```
+
+- Paraphrase pairs for invariance: tie via contrastive loss.
+
+---
+
+## 4) Training Objectives
+
+- **Main:** cross-entropy on decoder output.
+- **VQ:** commitment + EMA; mild code-usage entropy.
+- **Subject stability:** contrastive (same meaning → same subject code).
+- **Equivalence:** pull together prompts that are equivalent (`8+2` ↔ `next next of 8`).
+- **Sparsity (optional):** small penalty on number of reasoning steps used.
+
+---
+
+## 5) Curriculum (Grow Up)
+
+- **Phase KG (starter):** successor/predecessor, compare `< = >`, parity, add/sub small k, color-of, shape-of (sides), simple is-a.
+- **Phase Nursery:** animals, mixed prompts (filters + count + compare), group-by/argmax, attribute chains.
+- **Replay:** keep a small rehearsal buffer to avoid forgetting.
+
+---
+
+## 6) Minimal Hyperparameters
+
+- Encoder: 2-layer Transformer, d=128, heads=4.
+- VQ_subject: K=8–12, dim=32, β=0.25, EMA=0.99.
+- VQ_type: K=24, dim=64; VQ_param: K=48, dim=64.
+- Reasoning: 1 step (start), hidden d=128 for gates/MLP.
+- Decoder: MLP 128→(|vocab|).
+- Optim: AdamW, lr=3e-4, batch=256, label smoothing=0.05.
+
+---
+
+## 7) Evaluation
+
+- Accuracy per task family (math, shapes, colors, animals, mixed).
+- **Concept purity:** mutual info between VQ indices and human labels (e.g., `+1`, `red`, `>`, `sides`).
+- **Code utilization:** % active codes; entropy.
+- **Length generalization:** train on short steps, test on longer compositions.
+- **Cross-subject analogies:** e.g., `triangle:square :: 3:?` → `4`; `banana:yellow :: apple:?` → `red/green`.
+- Ablations: no-VQ, single-VQ, no-reasoning, AR decoder vs classifier.
+
+---
+
+## 8) Implementation Sketch (PyTorch-style pseudocode)
+
+### 8.1 Modules (interfaces)
+
+```python
+class TinyEncoder(nn.Module):
+    def forward(self, tokens) -> tuple[h, H]:
+        # pooled h (B,d), sequence H (B,T,d)
+        ...
+
+class VQ(nn.Module):
+    # EMA codebook quantizer
+    def forward(self, x) -> tuple[e, idx, vq_loss]:
+        ...
+
+class SubjectCondition(nn.Module):
+    # start with bias; can switch to FiLM/CLN later
+    def forward(self, H, e_s) -> tuple[h_tilde, H_tilde]:
+        ...
+
+class ExecRegistry(nn.Module):
+    def forward(self, e_type, e_param, state) -> delta_state:
+        # switch on e_type; use e_param; may call lookup/calculator
+        ...
+
+class ReasoningCell(nn.Module):
+    def __init__(self, exec_registry): ...
+    def forward(self, state, e_type, e_param, e_s):
+        x = torch.cat([state.to_vec(), e_type, e_param, e_s], dim=-1)
+        g = torch.sigmoid(self.gate(x))
+        u = self.exec_registry(e_type, e_param, state).to_vec()
+        return state.from_vec(state.to_vec() + g * u)
+
+class UnifiedDecoder(nn.Module):
+    def forward(self, state, z, e_s) -> logits:
+        x = proj(torch.cat([state.to_vec(), z, e_s], dim=-1))
+        return head(x)  # logits over shared vocab
+```
+
+### 8.2 Forward Pass
+
+```python
+def forward(prompt_tokens, kb=None):
+    h, H = encoder(prompt_tokens)
+
+    e_s, s_idx, vq_s_loss = vq_subject(h)
+    h_tilde, H_tilde = subject_condition(H, e_s)
+
+    e_type, t_idx, vq_t_loss = vq_type(h_tilde)
+    e_param, p_idx, vq_p_loss = vq_param(h_tilde)
+    z = torch.cat([e_type, e_param], dim=-1)
+
+    state = init_state_from_text(prompt_tokens, kb)  # ITEMS/MASK/VAL/BOOL
+    for t in range(NUM_STEPS):  # start with 1
+        state = reasoning_cell(state, e_type, e_param, e_s)
+
+    logits = decoder(state, z, e_s)
+    return logits, (vq_s_loss + vq_t_loss + vq_p_loss)
+```
+
+---
+
+## 9) Example Walk-Throughs
+
+### 9.1 "Is number of red fruits > 4?"
+
+- Subject ≈ mixed; Type/Param → `Filter(is_a, fruit)`, `Filter(color, red)`, `Count`, `Compare(>, 4)` (may be composed over 1–2 steps by EXEC).
+- STATE updates: `MASK` by filters → `VAL = sum(MASK)` → `BOOL = (VAL>4)` → decoder → `yes/no`.
+
+### 9.2 "2 : 3 :: 5 : ?"
+
+- Type `Successor`, Param `+1`; apply to `5` → `6`.
+
+### 9.3 "Which has 3 sides?"
+
+- Type `AttributeOf('sides')`; compare equals `3` over candidates; decoder emits the correct noun (or scores the given options).
+
+---
+
+## 10) Scaling to Professional
+
+- Deeper/wider encoder; retrieval-augmented context.
+- Hierarchical VQ (coarse→fine) or residual VQ if concepts tangle.
+- More reasoning steps (2–4), learned STOP.
+- Tool hooks: calculator, code runner, SQL, search.
+- Adapters/LoRA per domain; shared codebooks keep concepts transferable.
+
+---
+
+## 11) Build Order (Checklist)
+
+1. Tokenizer + datasets (JSONL + tiny knowledge tables).
+2. Encoder + VQ_subject (bias conditioning) + VQ_type/VQ_param.
+3. Minimal EXEC with: `Filter(is_a)`, `Filter(color)`, `Count`, `Compare`, `Add/Sub/Successor`, `AttributeOf('sides')`.
+4. One reasoning step; unified decoder (classifier over shared vocab).
+5. Losses: CE + VQ commitment/EMA + simple contrastive (paraphrase pairs).
+6. Curriculum: KG basics → mixed → nursery; add replay.
+7. Eval + ablations; then add 2nd reasoning step or AR decoder if needed.
+
+---
+
+## 12) Visual: Internal Reasoning Flow (ASCII)
+
+```
+[h, H] --VQ_s--> e_s --> condition --> h~
+                      \
+                       +--VQ_type--> e_type --+           +--> logits → answer
+                       +--VQ_param-> e_param -+--> z ---->
+                                             |
+                STATE_init (ITEMS,MASK,VAL,BOOL) --Reasoning Cell(s)--> STATE_final
+```
+
+---
+
+**This document is meant to be the starting blueprint.** You can keep the skeleton fixed and iterate on (a) concept codebooks, (b) EXEC catalog, (c) reasoning step count, and (d) decoder style as the curriculum grows.

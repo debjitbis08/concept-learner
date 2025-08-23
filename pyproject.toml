@@ -1,24 +1,62 @@
-[tool.poetry]
+[tool.hatch.build.targets.sdist]
+include = ["src/*"]
+exclude = ["tests/*"] # on this later
+
+[tool.hatch.build.targets.wheel]
+include = ["src/*"]
+exclude = ["tests/*"] # on this later
+
+[tool.hatch.build.targets.wheel.sources]
+"src/concept_learner" = "concept_learner"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
 name = "concept-learner"
 version = "0.1.0"
 description = ""
-authors = ["Debjit Biswas <debjit@fastmail.fm>"]
+requires-python = ">=3.13"
+authors = [{ name = "Debjit Biswas" }]
+license = "BSD-3-Clause"
 readme = "README.md"
+dependencies = [
+    "pyrootutils",
+    "loguru",
+    "torch>=2.8.0",
+    "tokenizers>=0.21.4",
+    "transformers>=4.55.4",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<3.14"
-torch = "2.8"
-numpy = "2.2"
-gradio = "^5.43.1"
-openai = "^1.40.0"
-torchview = "^0.2.7"
+[dependency-groups]
+dev = [
+    "mypy",
+    "ruff",
+    "pytest",
+    "pytest-cov",
+    "pytest-mock",
+    "pytest-pylint",
+    "pytest-mypy",
+    "pytest-testmon",
+    "pytest-xdist",
+    "nbmake",
+]
 
-[tool.poetry.scripts]
-update-model-arch = "concept_learner.visualize_model:main"
-train-numbers-llm = "concept_learner.scripts:train_numbers_llm"
-train-baseline = "concept_learner.train_baseline:train_main"
+[tool.uv]
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
 
-[build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch", marker = "sys_platform == 'linux'" },
+    { index = "pypi", marker = "sys_platform == 'darwin'" },
+]
