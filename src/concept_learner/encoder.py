@@ -1,9 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Tuple, Optional
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 @dataclass
@@ -14,6 +15,8 @@ class TinyEncoderConfig:
     num_layers: int = 2
     max_len: int = 128
     dropout: float = 0.0  # keep 0.0 for deterministic tests
+    cls_id: int = 1  # reserve an explicit [CLS]
+    pad_id: int = 0  # reserve PAD=0 by convention
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -29,23 +32,22 @@ class SinusoidalPositionalEncoding(nn.Module):
         self.register_buffer("pe", pe)  # (max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B,T,d)
         T = x.size(1)
-        return x + self.pe[:T].unsqueeze(0)
+        assert T <= self.pe.size(0), f"Sequence length {T} > max_len {self.pe.size(0)}"
+        return x + self.pe[:T].to(dtype=x.dtype, device=x.device).unsqueeze(0)
 
 
 class TinyEncoder(nn.Module):
     """
     Returns:
-      h: (B, d) pooled (we use [CLS] vector)
+      h: (B, d) pooled ([CLS] vector or masked-mean fallback)
       H: (B, T, d) sequence states
-    Matches the spec: 2 layers, d≈128, 4 heads; pooled h and sequence H. :contentReference[oaicite:3]{index=3}
     """
 
     def __init__(self, cfg: TinyEncoderConfig):
         super().__init__()
         self.cfg = cfg
-        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model)
+        self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model, padding_idx=cfg.pad_id)
         self.pos = SinusoidalPositionalEncoding(cfg.d_model, cfg.max_len)
         enc_layer = nn.TransformerEncoderLayer(
             d_model=cfg.d_model,
@@ -59,18 +61,28 @@ class TinyEncoder(nn.Module):
         self.out_ln = nn.LayerNorm(cfg.d_model)
 
     def forward(
-        self, token_ids: torch.Tensor, attn_mask: torch.Tensor
+        self,
+        token_ids: torch.Tensor,  # (B,T) int64
+        attn_mask: Optional[torch.Tensor] = None,  # (B,T) 1 for real tokens, 0 for pad
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        token_ids: (B,T) int64
-        attn_mask: (B,T) 1 for real tokens, 0 for pad
-        """
-        x = self.tok_emb(token_ids)  # (B,T,d)
-        x = self.pos(x)  # (B,T,d)
+        cfg = self.cfg
+        # build mask if not provided
+        if attn_mask is None:
+            attn_mask = (token_ids != cfg.pad_id).to(torch.uint8)  # 1/0
+
+        x = self.tok_emb(token_ids) * math.sqrt(cfg.d_model)  # scale embeddings
+        x = self.pos(x)  # add sin/cos PE
+
         key_padding_mask = attn_mask == 0  # True where pad
         H = self.encoder(x, src_key_padding_mask=key_padding_mask)  # (B,T,d)
         H = self.out_ln(H)
 
-        # pooled h = [CLS] position (assume [CLS] is at index 0)
-        h = H[:, 0, :]
+        # pooled h: prefer [CLS] position if present, else masked mean
+        if (token_ids[:, 0] == cfg.cls_id).all():
+            h = H[:, 0, :]
+        else:
+            # masked mean over non-pad tokens
+            lengths = attn_mask.sum(dim=1).clamp_min(1).unsqueeze(-1)  # (B,1)
+            h = (H * attn_mask.unsqueeze(-1)).sum(dim=1) / lengths
+
         return h, H

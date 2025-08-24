@@ -1,4 +1,4 @@
-# Subject-Aware Concept Learner
+# Subject-Aware Concept Learner (Text-Only)
 
 A compact, grow‑able architecture that learns **discrete concepts** (VQ), applies **small reasoning steps**, and answers with a **single decoder**. Scales from **Kindergarten → Nursery → Professional** without changing the skeleton.
 
@@ -25,56 +25,39 @@ A compact, grow‑able architecture that learns **discrete concepts** (VQ), appl
         v
 +--------------------------------------+
 | Tiny Transformer Encoder (2 layers)  |
-|  - tokens: numbers/words/symbols     |
-|  - outputs: pooled h and sequence H  |
 +--------------------------------------+
         |
-        | (pooled h)
         v
-+-------------------------------+
-| VQ_subject (K≈8–12, unsup.)   |
-| -> subject index s            |
-| -> subject emb e_s            |
-+-------------------------------+
++---------------------------+
+| VQ-L1 : REGION / SUBJECT  |  (unsupervised)
++---------------------------+
         |
-        |  (conditioning: bias / FiLM / CLN)
         v
-+--------------------------------------+
-| Subject Conditioning                 |
-|  - modulate h/H with e_s             |
-|  - optionally bias/mask concepts     |
-+--------------------------------------+
++---------------------------+
+| VQ-L2 : DOMAIN / SUBAREA  |
++---------------------------+
         |
-        | (conditioned h~)
         v
-     +--------------------+       +--------------------+
-     | VQ_type (K≈24)     |       | VQ_param (K≈48)    |
-     | -> e_type          |       | -> e_param         |
-     +--------------------+       +--------------------+
-              \                         /
-               \                       /
-                \                     /
-                 v                   v
-                +-----------------------+
-                |  z = [e_type; e_param]|
-                +-----------------------+
-                         |
-                         |   (plus h~, e_s)
-                         v
-              +-------------------------------+
-              | Reasoning Cells (1–4 steps)   |
-              |  s_{t+1} = s_t + g⊙EXEC(...)  |
-              +-------------------------------+
-                         |
-                         v
-              +-------------------------------+
-              | Unified Decoder               |
-              |  - one vocab (numbers/words)  |
-              |  - can score MCQ options too  |
-              +-------------------------------+
-                         |
-                         v
-                      ANSWER
++---------------------------+
+| VQ-L3 : OPERATOR FAMILY   |
++---------------------------+
+        |
+        v
++---------------------------+
+| VQ-L4 : ARGUMENT / VALUE  |
++---------------------------+
+        |
+        v
+      [e1;e2;e3;e4]  →  Reasoning Core (Schema + MoE Experts)
+                            • schema ← f(e3)  (S->S, S->R, R->R, (R,R)->B/R)
+                            • gate 1–2 experts per schema with [e1,e2,e3]
+                            • apply 1–4 steps with learned STOP
+        |
+        v
+         Unified Decoder (single vocab)
+        |
+        v
+          ANSWER
 ```
 
 ### Typed Working State (internal)
@@ -88,9 +71,7 @@ STATE = {
 }
 ```
 
----
-
-## 2) Components
+## 2) Components Components
 
 ### 2.1 Tokenizer / Vocab
 
@@ -106,36 +87,147 @@ STATE = {
 - Regularizers: code-usage entropy; paraphrase-stability (InfoNCE) across rewordings.
 - Conditioning: start with **bias** (add transformed `e_s` to hidden), upgrade to FiLM/CLN if needed.
 
-### 2.4 Concept Bottleneck (Factored VQs)
+### 2.4 Concept Bottleneck (Hierarchical VQs: L1→L4)
 
-- **VQ_type (K≈24, dim≈64):** operator family (e.g., `successor, predecessor, add, subtract, multiply, compare, attribute-of, is-a, has-a, filter, count, groupby, argmax`).
-- **VQ_param (K≈48, dim≈64):** small integers (−5…+10), tokens like `{even, odd, <, >, =, red, blue, circle, square, fruit, animal, sides, color}`.
-- Outputs concatenated: `z = [e_type; e_param]`.
-- Losses: commitment + EMA + mild code-usage entropy.
+Implement a **brain-style hierarchy** with four VQ levels; each level sees the encoder state **and** the parent codes (top‑down conditioning).
 
-### 2.5 Reasoning Cells (Concept Application)
+**Top‑down quantization:**
 
-- Controlled operator application (not an RNN):
+```
+h1 = Proj1(h)                           → VQ‑L1 (Region/Subject) → e1
+h2 = Proj2([h, e1])                    → VQ‑L2 (Domain/Subarea)  → e2
+h3 = Proj3([h, e1, e2])                → VQ‑L3 (Operator family) → e3
+h4 = Proj4([h, e1, e2, e3])            → VQ‑L4 (Argument/Value)  → e4
+z = [e1; e2; e3; e4]
+```
 
-  - Inputs: working state `s`, concepts `e_type, e_param`, subject `e_s`.
-  - Gate: `g = σ(W_g · [s; e_type; e_param; e_s])`.
-  - Micro-execution: `u = EXEC(e_type, e_param, s)`.
-  - Residual update: `s_next = s + g ⊙ u`.
+- Each level uses EMA VQ with commitment loss and mild code‑usage entropy.
+- Conditioning biases children to specialize without brittle hard masks.
+- Optional **ResidualVQ within a level** (later) if that level saturates.
 
-- Start with **1 step**; later allow **2–4 steps** + optional **STOP** concept.
+**Starter codebook sizes (tunable):**
 
-#### EXEC Registry (initial operators)
+- L1 (Region): K=8–12, dim=32
+- L2 (Domain): K=16–24, dim=48
+- L3 (Operator family): K=24–32, dim=64
+- L4 (Argument/Value): K=48–96, dim=64
 
-- `Filter(category=X)` → update `MASK` by `is_a(item, X)`.
-- `Filter(attr=A, value=B)` → `MASK ∧= (attr(item,A)==B)`.
-- `Count()` → `VAL = sum(MASK)`.
-- `Compare(op, k)` → `BOOL = op(VAL, k)`.
-- `AttributeOf(name)` → map item to attribute (e.g., sides(shape)).
-- `Successor/Predecessor` / `Add(k)` / `Sub(k)` / `Mul(k)`.
-- `IsA`, `HasA`, simple `Map`.
-- **Tool hooks (later):** calculator, table lookup, code runner.
+**Routing:** straight‑through (STE) or Gumbel‑Softmax w/ annealing. Add per‑level load‑balancing to avoid dead branches.### 2.4b VQ Architecture (Detailed)
+A brain‑style hierarchical quantizer with **top‑down conditioning**, combining **TSVQ‑like** routing at upper levels with **Residual / Product VQ** where the space fans out.
 
-### 2.6 Unified Decoder
+#### Summary table
+
+| Level  | Role             | Quantization style                                                | K (start) |     Dim |
+| ------ | ---------------- | ----------------------------------------------------------------- | --------: | ------: |
+| **L1** | Region / Subject | TSVQ‑like (flat VQ with top‑down prior)                           |      8–12 |      32 |
+| **L2** | Domain / Subarea | TSVQ‑like (conditioned on L1)                                     |     16–24 |      48 |
+| **L3** | Operator family  | **Flat VQ**, add **Residual VQ** if crowded                       |     24–32 |      64 |
+| **L4** | Argument / Value | **Grouped / Product VQ** (e.g., numeric / attr‑type / attr‑value) | 3×(16–32) | 3×32–64 |
+
+#### Top‑down conditioning (end‑to‑end trainable)
+
+```
+h1 = Proj1(h)                             → VQ_L1 → e1, idx1, Lvq1
+h2 = Proj2([h, e1])                      → VQ_L2 → e2, idx2, Lvq2
+h3 = Proj3([h, e1, e2])                  → VQ_L3 → e3, idx3, Lvq3   # + optional Residual3
+# Grouped / Product VQ at L4
+u4_num, u4_attr, u4_val = Split4( Proj4([h, e1, e2, e3]) )
+e4_num, i4n, Lvq4n = VQ_L4_num(u4_num)
+e4_attr, i4a, Lvq4a = VQ_L4_attr(u4_attr)
+e4_val,  i4v, Lvq4v = VQ_L4_val(u4_val)
+
+e4 = concat(e4_num, e4_attr, e4_val)
+path = [e1, e2, e3, e4]
+```
+
+- **TSVQ‑like**: we keep levels **separate** but condition children on parent embeddings; we learn soft **P(Lk|Lk‑1)** priors (no hard masks) to bias routing.
+- **Residual\@L3 (optional):** if operator families saturate:
+
+```
+e3c, idx3c = VQ3_coarse(h3)
+r3 = h3 - e3c
+e3f, idx3f = VQ3_fine(r3)
+e3 = concat(e3c, e3f)
+```
+
+#### Routing and robustness
+
+- **STE or Gumbel‑Softmax** at each level; anneal temperature if using Gumbel.
+- **Load‑balancing / entropy** per level to avoid dead branches.
+- **Top‑2 late binding (optional):** at one chosen level, keep the best **two** codes and evaluate both downstream; pick the better via decoder score. Cuts error propagation from early splits.
+
+#### Losses (per level + global)
+
+- **Task**: `L_task = CE(decoder(...), y)`
+- **VQ per level**: `Σ λ_vq^k · L_vq_k` (commitment + EMA updates)
+- **Usage / balance**: `Σ λ_ent^k · H(idx_k)` and small **load‑balance** term
+- **Hierarchy priors**: `λ_h · [ CE(idx2 | idx1) + CE(idx3 | idx2) + CE(idx4 | idx3) ]` (learned soft priors)
+- **Equivalence / counterfactuals / step‑sparsity**: as defined earlier
+- **Anchors** when expanding codebooks (keep old centroids stable)
+
+#### Monitoring (by level)
+
+- Utilization (% active), perplexity of code usage
+- Purity (MI with human tags: region/domain/family/arg)
+- Drift vs previous release (centroid L2 distance; top‑k agreement)
+- Prior calibration (quality of P(Lk|Lk‑1))
+
+#### Library wiring (`vector-quantize-pytorch`)
+
+```python
+from vector_quantize_pytorch import VectorQuantize
+
+VQ_L1 = VectorQuantize(dim=32, codebook_size=12, decay=0.99,
+                       commitment_weight=0.25, kmeans_init=True,
+                       use_cosine_sim=True, codebook_dim=32,
+                       threshold_ema_dead_code=2)
+# Repeat with sizes for L2/L3 and three grouped VQs for L4.
+# Feed Proj_k([...]) as (B, 1, dim) to get (z_q, indices, vq_loss).
+```
+
+#### ASCII: hierarchy sketch
+
+```
+L1: REGION      ──┬─ math
+                  ├─ shapes
+                  ├─ colors
+                  └─ animals / mixed
+                      |
+L2: DOMAIN        ───┬─ numbers / relations / ops (for math)
+                      ├─ geometry / attributes (for shapes)
+                      └─ taxonomy / attributes (for animals/colors)
+                          |
+L3: OP FAMILY      ──── { compare | attribute-of | filter | group | count | add | mul | ... }
+                          |
+L4: ARG / VALUE    ──── (grouped) [ numeric | attr-type | attr-value ]
+```
+
+---
+
+### 2.5 Reasoning Core (Schema + MoE Experts)
+
+A scalable executor that operates over a **typed state** and is **driven by the hierarchical path**.
+
+**Typed State (unchanged):** `STATE = { ITEMS, MASK, VAL, BOOL }`
+
+**Schema binding:**
+
+- **Schema** is determined by **L3 (operator family)**:
+  L3→`S→S` (filter/map), `S→R` (reductions), `R→R` (arithmetic), `(R,R)→B/R` (compare/arith).
+- **Expert gating (MoE)** within the chosen schema uses `[e1,e2,e3]` so areas/subareas learn style without forking the model.
+- **Parameters** come from **L4 (e4)**; retrieval/tools can enrich arguments.
+
+**One reasoning step:**
+
+```
+x = concat(state.to_vec(), e1, e2, e3, e4)
+expert = gate_schema(e3, context=[e1,e2,e3])
+Δ = expert.apply(state, param=e4, context=[e1,e2,e3])   # Deep Sets for sets; MLP/tool for scalars
+g = σ(Wg x)
+state_next = state.from_vec(state.to_vec() + g ⊙ Δ)
+```
+
+Run **1–4 steps** with a learned **STOP** token. Optional early consistency to simple hard ops (e.g., Count) on synthetic data.### 2.6 Unified Decoder
 
 - **Single classifier** over a shared vocab (numbers + words + `yes/no`).
 - Input: projection of `[s_final ; z ; e_s]`.
@@ -169,13 +261,61 @@ STATE = {
 
 ---
 
+### 2.7 Minimal Operator Basis (logic‑derived)
+
+A principled, minimal set of operators chosen from **finite model theory** and **Presburger arithmetic**. They align with your typed state and scale cleanly.
+
+**Typed state:** `STATE = { ITEMS, MASK, VAL, BOOL }`
+
+#### Core operators (Tier‑0)
+
+- **Filter(p)** — _S→S_: select items satisfying predicate `p`.
+
+  - `p` built from **atoms** (e.g., `attr=item[color]==red`, `is_a(item, fruit)`) and **connectives** {AND, NOT}.
+  - **Update:** `MASK ← min(MASK, score_p(items))` (idempotent, commutative, monotone).
+  - Implement as per‑item MLP scorer + `min` with current mask (or `softmin_τ`).
+
+- **Count()** — _S→R_: number of selected items.
+
+  - Deep‑Sets form: `VAL ← Σ_i φ(item_i)·MASK_i` (φ can be 1 or a tiny MLP).
+  - Gives **Exists** (`VAL>0`) and **ForAll** (`VAL == |S|`) for free.
+
+- **Compare(op, k)** — _(R,R)→B_: numeric comparison with `op ∈ {<, =, >}`.
+
+  - Monotone comparator: `BOOL ← σ( a · (VAL − k) )` with `a≥0`.
+
+- **Add(k)** — _R→R_: arithmetic on a scalar with small integer `k`.
+
+  - Linear update: `VAL ← VAL + α·k` (α≈1), yielding **Successor** for `k=+1`; **Sub** via negative `k`.
+
+#### Why these 4 suffice
+
+- **Filter**/**Count** capture **FO logic with counting** over finite structures (selection + counting quantifiers).
+- **Add**/**Compare** capture **Presburger arithmetic** (numbers with 0,1,+,<,=).
+- **Deep Sets** justifies a single invariant aggregator (sum) for set→scalar reasoning.
+
+#### Derived/macros (no new primitives)
+
+- **OR** from De Morgan: `p ∨ q ≡ ¬(¬p ∧ ¬q)` (still only AND, NOT inside `Filter`).
+- **Exists/ForAll** from `Count` + `Compare`.
+- **Range tests**: `(a ≤ x ≤ b)` via two `Compare`s.
+- **ArgMax/ArgMin**: fold using `Compare` (or keep as a macro on S→S + S→R).
+- **Make‑ten / complements**: arithmetic with `Add`.
+- **GroupBy/Sum(attr)**: macros built from repeated `Filter` and `Count` (and `Sum` if you expose a numeric attribute aggregator later).
+
+---
+
 ## 4) Training Objectives
 
-- **Main:** cross-entropy on decoder output.
-- **VQ:** commitment + EMA; mild code-usage entropy.
+- **Main:** cross-entropy on unified decoder output.
+- **VQ:** commitment + EMA; mild code-usage entropy; anchors when expanding codebooks.
 - **Subject stability:** contrastive (same meaning → same subject code).
-- **Equivalence:** pull together prompts that are equivalent (`8+2` ↔ `next next of 8`).
-- **Sparsity (optional):** small penalty on number of reasoning steps used.
+- **Equivalence / invariance:** tie paraphrases and equivalent forms (e.g., `8+2` ≡ `next next of 8`).
+- **Counterfactuals:** edit attributes/values; enforce correct deltas.
+- **Schema regularizer:** encourage consistent **Type→schema** mapping (CE); prevent schema drift.
+- **MoE regularizers:** load balancing + sparsity on expert selection (top-1/top-2 gate).
+- **Re-exec consistency (optional early):** align neural expert outputs with simple hard ops on synthetic cases.
+- **Sparsity on steps:** small penalty to keep reasoning short; learned **STOP**.
 
 ---
 
@@ -190,10 +330,12 @@ STATE = {
 ## 6) Minimal Hyperparameters
 
 - Encoder: 2-layer Transformer, d=128, heads=4.
-- VQ_subject: K=8–12, dim=32, β=0.25, EMA=0.99.
-- VQ_type: K=24, dim=64; VQ_param: K=48, dim=64.
-- Reasoning: 1 step (start), hidden d=128 for gates/MLP.
-- Decoder: MLP 128→(|vocab|).
+- **VQ‑L1 (Region):** K=8–12, dim=32, decay=0.99, commitment=0.25, cosine sim, kmeans init, dead‑code threshold=2.
+- **VQ‑L2 (Domain):** K=16–24, dim=48, same settings.
+- **VQ‑L3 (Operator family):** K=24–32, dim=64, same settings.
+- **VQ‑L4 (Argument/Value):** K=48–96, dim=64, same settings.
+- Reasoning: start with 1 step (hidden d=128); add STOP when moving to 2–4 steps.
+- Decoder: MLP 128→(|vocab|) (swap to 1-layer AR decoder if multi-token answers needed).
 - Optim: AdamW, lr=3e-4, batch=256, label smoothing=0.05.
 
 ---
@@ -290,37 +432,66 @@ def forward(prompt_tokens, kb=None):
 
 ## 10) Scaling to Professional
 
-- Deeper/wider encoder; retrieval-augmented context.
-- Hierarchical VQ (coarse→fine) or residual VQ if concepts tangle.
-- More reasoning steps (2–4), learned STOP.
-- Tool hooks: calculator, code runner, SQL, search.
-- Adapters/LoRA per domain; shared codebooks keep concepts transferable.
+- Deepen/widen encoder; retrieval-augmented context.
+- **Grow hierarchy:** add codes per level when utilization >\~80% and purity drops; optionally add **ResidualVQ within crowded levels**.
+- **Reasoning:** expand to 2–4 steps with learned STOP; schema-based MoE experts per signature; grow experts gradually (top‑1/top‑2 gating + load balance).
+- **Tools:** plug calculator, lookup, SQL/search as specialized experts behind schema APIs.
+- **Continuity:** anchor centroids per level; lineage map when splitting codes; replay + distill from prior version to preserve “self”.
+
+### Growth Protocol & Pitfalls
+
+- **Protocol:** warmup L1 → add L2 (anchor L1) → add L3 (anchor L1–L2) → add L4; promote codes only when utilization high. Keep soft priors P(Lk|Lk−1) learnable, not hard.
+- **Dead branches:** per‑level entropy + dead‑code refresh; periodic k‑means reinit for inactive codes.
+- **Misrouting:** avoid hard masks early; use teacher forcing on shallow synthetic labels for a few epochs, then relax.
+- **Drift:** centroid anchoring (L2‑SP), KD on a frozen probe set; do not recycle indices within a major version.
 
 ---
 
 ## 11) Build Order (Checklist)
 
-1. Tokenizer + datasets (JSONL + tiny knowledge tables).
+1. Tokenizer + datasets (JSONL + tiny knowledge tables or retrieval stubs).
 2. Encoder + VQ_subject (bias conditioning) + VQ_type/VQ_param.
-3. Minimal EXEC with: `Filter(is_a)`, `Filter(color)`, `Count`, `Compare`, `Add/Sub/Successor`, `AttributeOf('sides')`.
-4. One reasoning step; unified decoder (classifier over shared vocab).
-5. Losses: CE + VQ commitment/EMA + simple contrastive (paraphrase pairs).
-6. Curriculum: KG basics → mixed → nursery; add replay.
-7. Eval + ablations; then add 2nd reasoning step or AR decoder if needed.
+3. **Schema executors (learned):**
+
+   - Implement **S→S** and **S→R** with Deep Sets; **R→R** and **(R,R)→B/R** with tiny MLPs.
+   - One reasoning step; no STOP yet.
+
+4. Unified decoder (classifier over shared vocab). Train end-to-end on KG tasks.
+5. Add **STOP** + 2nd step; enable **equivalence/counterfactual** objectives.
+6. Add **MoE** per schema (start with 2 experts); enable load-balancing.
+7. Add retrieval/tool hooks behind schema APIs (lookup `color`, `sides`, calculator).
+8. Replay + anchors for continuity; evaluate code utilization, schema mapping stability.
 
 ---
+
+## References (selected)
+
+- **Sheffer, H. M.** (1913). _A set of five independent postulates for Boolean algebras, with applications to logical constants._ Transactions of the AMS.
+- **Post, E. L.** (1921). _Introduction to a general theory of elementary propositions._ American Journal of Mathematics.
+- **Codd, E. F.** (1970). _A relational model of data for large shared data banks._ Communications of the ACM.
+- **Presburger, M.** (1929 / 1991 English trans.). _On the completeness of a certain system of arithmetic of whole numbers with addition._
+- **Immerman, N.** (1999). _Descriptive Complexity._ Springer.
+- **Grädel, E.; Otto, M.; Rosen, E.** (1997). _Two–variable logic with counting is decidable._ Bulletin of Symbolic Logic.
+- **Zaheer, M. et al.** (2017). _Deep Sets._ NeurIPS.
+- **Andreas, J. et al.** (2016). _Neural Module Networks._ CVPR.
+- **Johnson, J. et al.** (2017). _CLEVR: A Diagnostic Dataset for Compositional Language and Elementary Visual Reasoning._ CVPR.
+- **Kozen, D.** (1997). _Kleene Algebra with Tests._ ACM Transactions on Programming Languages and Systems.
 
 ## 12) Visual: Internal Reasoning Flow (ASCII)
 
 ```
-[h, H] --VQ_s--> e_s --> condition --> h~
-                      \
-                       +--VQ_type--> e_type --+           +--> logits → answer
-                       +--VQ_param-> e_param -+--> z ---->
-                                             |
-                STATE_init (ITEMS,MASK,VAL,BOOL) --Reasoning Cell(s)--> STATE_final
+[h, H] → VQ‑L1 → e1
+   └──→ VQ‑L2([h,e1]) → e2
+         └─→ VQ‑L3([h,e1,e2]) → e3
+               └→ VQ‑L4([h,e1,e2,e3]) → e4
+
+path = [e1,e2,e3,e4]
+schema = map_family(e3)
+expert = moe[schema](context=[e1,e2,e3])
+
+STATE_init ── step: Δ=expert.apply(STATE, param=e4) ──> STATE_1 ── ... (STOP) ──> STATE_final
+                               │
+                               └─ gate g = σ(Wg[STATE,e1..e4]) and residual update
+
+logits = decoder(STATE_final, path)
 ```
-
----
-
-**This document is meant to be the starting blueprint.** You can keep the skeleton fixed and iterate on (a) concept codebooks, (b) EXEC catalog, (c) reasoning step count, and (d) decoder style as the curriculum grows.
