@@ -138,3 +138,82 @@ class OpCompare(OpBase):
             score = -diff.abs()
         boolean = torch.sigmoid(a * score)
         return state.mask, state.val, boolean
+
+
+# ------------------------------ GENERIC ADD -------------------------------
+
+
+class OpAdd(OpBase):
+    """
+    Generic add that subsumes OpAddConst and allows optional conditioning on z.
+
+    VAL' = beta * VAL + alpha * k, with beta>=0, alpha>=0.
+    - If use_z=True, k is predicted per-sample from z via a small linear head.
+    - Otherwise, k is a single learned scalar parameter.
+    """
+
+    def __init__(self, d_model: int, use_z: bool = False):
+        super().__init__()
+        self.name = "add"
+        self.use_z = use_z
+        # scale factors kept positive via softplus, initialized near 0 -> softplus ~ 0
+        # add tiny epsilon to avoid exact zeros
+        self.beta_raw = nn.Parameter(torch.tensor(0.0))
+        self.alpha_raw = nn.Parameter(torch.tensor(0.0))
+        if use_z:
+            self.k_head = nn.Linear(d_model, 1)
+            nn.init.zeros_(self.k_head.weight)
+            nn.init.zeros_(self.k_head.bias)
+        else:
+            self.k = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, state: TypedState, z: torch.Tensor):
+        beta = F.softplus(self.beta_raw) + 1e-6
+        alpha = F.softplus(self.alpha_raw) + 1e-6
+        if self.use_z:
+            k = self.k_head(z)  # (B,1)
+        else:
+            # broadcast scalar parameter to (B,1)
+            B = state.val.size(0)
+            k = self.k.expand(B, 1)
+        val = beta * state.val + alpha * k
+        return state.mask, val, state.boolean
+
+
+# ------------------------------ GENERIC COMPARE --------------------------
+
+
+class OpCompareGeneric(OpBase):
+    """
+    Generic comparator unifying gt/lt/eq via a small non-negative feature basis.
+
+    BOOL' = σ( w1*(VAL-k) + w2*(-(VAL-k)) + w3*(-|VAL-k|) + b ), with w_i >= 0.
+    - If use_z=True, k is predicted from z; else it's a single learned scalar.
+    """
+
+    def __init__(self, d_model: int, use_z: bool = False):
+        super().__init__()
+        self.name = "cmp_generic"
+        self.use_z = use_z
+        self.w_raw = nn.Parameter(torch.zeros(3))
+        self.b = nn.Parameter(torch.zeros(1))
+        if use_z:
+            self.k_head = nn.Linear(d_model, 1)
+            nn.init.zeros_(self.k_head.weight)
+            nn.init.zeros_(self.k_head.bias)
+        else:
+            self.k = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, state: TypedState, z: torch.Tensor):
+        if self.use_z:
+            k = self.k_head(z)  # (B,1)
+        else:
+            B = state.val.size(0)
+            k = self.k.expand(B, 1)
+        diff = state.val - k  # (B,1)
+        # features: [diff, -diff, -|diff|]
+        feats = torch.stack([diff, -diff, -diff.abs()], dim=-1)  # (B,1,3)
+        w = F.softplus(self.w_raw) + 1e-6  # (3,)
+        score = (feats * w).sum(dim=-1) + self.b  # (B,1)
+        boolean = torch.sigmoid(score)
+        return state.mask, state.val, boolean

@@ -6,9 +6,9 @@ from concept_learner.reasoning_ops import (
     TypedState,
     OpBase,
     OpFilterMLP,
-    OpCompare,
+    OpCompareGeneric,
     OpCount,
-    OpAddConst,
+    OpAdd,
 )
 
 
@@ -31,8 +31,8 @@ class ReasonerV2(nn.Module):
         ops = [
             OpFilterMLP(d_model),  # Filter(p)
             OpCount(d_model, learn_phi=False),  # Count()
-            OpAddConst(+1),  # Add(+1)
-            OpCompare(k=1.0, op="gt"),  # Compare(>, 1)
+            OpAdd(d_model, use_z=True),  # Generic Add, k from z
+            OpCompareGeneric(d_model, use_z=True),  # Unified Compare
         ]
         assert len(ops) >= 1, "Need at least one operator"
         self.d = d_model

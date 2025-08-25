@@ -57,6 +57,8 @@ class ResidualVQLayer(nn.Module):
         **rvq_kwargs,  # decay, commitment_weight, etc.
     ):
         super().__init__()
+        self.codebook_size = int(codebook_size)
+        self.num_quantizers = int(num_quantizers)
         self.proj_in = (
             nn.Linear(in_dim, rvq_dim) if in_dim != rvq_dim else nn.Identity()
         )

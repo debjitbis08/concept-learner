@@ -3,3 +3,4 @@ checkpoints/
 chk_tmp/
 chk_guard/
 data/
+runs/

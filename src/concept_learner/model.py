@@ -8,10 +8,24 @@ from concept_learner.decoder import UnifiedDecoder
 
 
 class CLModel(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int = 128, num_classes: int = 4):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int = 128,
+        num_classes: int = 4,
+        pad_id: int = 0,
+        cls_id: int = 1,
+        max_len: int = 128,
+    ):
         super().__init__()
         self.enc = TinyEncoder(
-            TinyEncoderConfig(vocab_size=vocab_size, d_model=d_model)
+            TinyEncoderConfig(
+                vocab_size=vocab_size,
+                d_model=d_model,
+                max_len=max_len,
+                pad_id=pad_id,
+                cls_id=cls_id,
+            )
         )
         self.rvq = ResidualVQLayer(
             in_dim=d_model,

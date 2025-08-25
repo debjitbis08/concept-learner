@@ -495,3 +495,17 @@ STATE_init ── step: Δ=expert.apply(STATE, param=e4) ──> STATE_1 ── 
 
 logits = decoder(STATE_final, path)
 ```
+
+---
+
+Quickstart (uv)
+
+- Run a tiny synthetic training loop with text prompts:
+  - uv run python scripts/train.py
+- Run a tiny synthetic training loop with the numeric episode generator (digits in random bases):
+  - uv run python scripts/train_episodes.py
+
+Episode generator
+
+- See concept_learner/episodes.py. It produces digit sequences with attention masks and supports views, pos/neg pairs, triples, and analogies.
+- The model consumes these ids/masks directly (no HF tokenizer required). Set pad_id=0 and choose vocab_size >= max_base+2.
