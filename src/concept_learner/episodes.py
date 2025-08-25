@@ -543,3 +543,36 @@ class EpisodeGenerator:
             "equivalences": [["three", "3"], ["ten", "10"], ["bike", "bicycle"]],
         }
         return gold
+
+    # ----- Counting tasks (next / previous / between) -----
+    def sample_counting(self, batch: int) -> Dict[str, torch.Tensor]:
+        """
+        Returns counting questions with numeric targets (classification over 0..max_number-1):
+          kind=0 successor/next:      input=a,          target=(a+1)%N
+          kind=1 predecessor/previous: input=a,         target=(a-1)%N
+          kind=2 between:             input=(a,c=a+2),  target=a+1
+        """
+        device = self.cfg.device
+        N = self.n_items
+        kind = torch.randint(0, 3, (batch,), device=device)
+        a = torch.randint(0, N, (batch,), device=device)
+        c = torch.full_like(a, -1)
+        y = torch.zeros_like(a)
+        for i in range(batch):
+            k = int(kind[i].item())
+            ai = int(a[i].item())
+            if k == 0:  # successor
+                y[i] = (ai + 1) % N
+            elif k == 1:  # predecessor
+                y[i] = (ai - 1) % N
+            else:  # between
+                # choose c = a + 2 within range; wrap if needed
+                ci = (ai + 2) % N
+                c[i] = ci
+                y[i] = (ai + 1) % N
+        return {
+            "kind": kind,  # 0 succ, 1 pred, 2 between
+            "a": a,
+            "c": c,  # valid only for between
+            "target": y,
+        }

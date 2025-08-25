@@ -1,8 +1,10 @@
 import argparse
 import os
 import torch
+from typing import List
 from concept_learner.episodes import EpisodeConfig, EpisodeGenerator
 from concept_learner.model import CLModel
+from concept_learner.tokenizer import HFTokenizerWrapper
 
 
 def _pack_pairs(a_desc, a_mask, b_desc, b_mask, device):
@@ -32,46 +34,195 @@ def _pack_pairs(a_desc, a_mask, b_desc, b_mask, device):
     return ids, mask
 
 
-def save_checkpoint(path, model, opt, step):
+def save_checkpoint(path, model, opt, step, best_acc: float | None = None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "step": step}, path)
+    payload = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step}
+    if best_acc is not None:
+        payload["best_acc"] = float(best_acc)
+    torch.save(payload, path)
 
 
 def load_checkpoint(path, model, opt, map_location=None):
     ckpt = torch.load(path, map_location=map_location)
-    model.load_state_dict(ckpt["model"])
+    sd = ckpt["model"]
+    # expose best_acc to callers for resume logic
+    load_checkpoint.last_best_acc = ckpt.get("best_acc", None)
+    try:
+        model.load_state_dict(sd)
+    except RuntimeError as e:
+        msg = str(e)
+        # Backward-compat: expand/trim embedding and classifier heads
+        def _resize_like(key: str, ref_param: torch.nn.Parameter):
+            old = sd.get(key)
+            if old is None:
+                return
+            new = ref_param.data
+            if tuple(old.shape) == tuple(new.shape):
+                return
+            # handle linear weight [out, in] and bias [out]
+            if old.ndim == 2 and new.ndim == 2 and old.shape[1] == new.shape[1]:
+                out = new.detach().clone()
+                out.zero_()
+                rows = min(old.shape[0], new.shape[0])
+                out[:rows].copy_(old[:rows])
+                sd[key] = out
+            elif old.ndim == 1 and new.ndim == 1:
+                out = new.detach().clone()
+                out.zero_()
+                rows = min(old.shape[0], new.shape[0])
+                out[:rows].copy_(old[:rows])
+                sd[key] = out
+
+        if "enc.tok_emb.weight" in msg:
+            _resize_like("enc.tok_emb.weight", model.enc.tok_emb.weight)
+        if any(s in msg for s in ["head.weight", "decoder.token_head.weight", "decoder.seq_head.weight"]):
+            # adjust all known heads to current shapes
+            _resize_like("head.weight", model.head.weight)
+            _resize_like("head.bias", model.head.bias)
+            _resize_like("decoder.token_head.weight", model.decoder.token_head.weight)
+            _resize_like("decoder.token_head.bias", model.decoder.token_head.bias)
+            _resize_like("decoder.seq_head.weight", model.decoder.seq_head.weight)
+            _resize_like("decoder.seq_head.bias", model.decoder.seq_head.bias)
+        # try loading with relaxed strictness after adjustments
+        model.load_state_dict(sd, strict=False)
     if opt is not None and "opt" in ckpt:
-        opt.load_state_dict(ckpt["opt"])
+        try:
+            opt.load_state_dict(ckpt["opt"])
+            # repair optimizer state if embedding size changed
+            try:
+                tok_param = model.enc.tok_emb.weight
+                st = opt.state.get(tok_param, None)
+                if isinstance(st, dict):
+                    for k in ("exp_avg", "exp_avg_sq"):
+                        if k in st:
+                            buf = st[k]
+                            if isinstance(buf, torch.Tensor) and buf.shape != tok_param.data.shape:
+                                new_buf = torch.zeros_like(tok_param.data)
+                                rows = min(buf.shape[0], new_buf.shape[0])
+                                new_buf[:rows].copy_(buf[:rows])
+                                st[k] = new_buf
+                # also repair classifier head states if shapes changed
+                for p in [model.head.weight, model.head.bias, model.decoder.token_head.weight, model.decoder.token_head.bias, model.decoder.seq_head.weight, model.decoder.seq_head.bias]:
+                    stp = opt.state.get(p, None)
+                    if isinstance(stp, dict):
+                        for k in ("exp_avg", "exp_avg_sq"):
+                            if k in stp and isinstance(stp[k], torch.Tensor) and stp[k].shape != p.data.shape:
+                                newb = torch.zeros_like(p.data)
+                                rows = min(stp[k].shape[0], newb.shape[0])
+                                if stp[k].ndim == 2 and newb.ndim == 2:
+                                    cols = min(stp[k].shape[1], newb.shape[1])
+                                    newb[:rows, :cols].copy_(stp[k][:rows, :cols])
+                                else:
+                                    newb[:rows].copy_(stp[k][:rows])
+                                stp[k] = newb
+            except Exception:
+                # if anything goes wrong, we proceed without repairing
+                pass
+        except Exception:
+            pass
     return int(ckpt.get("step", 0))
 
 
 @torch.no_grad()
-def _quick_eval(model: CLModel, gen: EpisodeGenerator, device: str, batch_size: int, eval_batches: int, same_base: bool) -> float:
+def _quick_eval(model: CLModel, gen: EpisodeGenerator, tok: HFTokenizerWrapper, device: str, batch_size: int, eval_batches: int, max_len: int, num_numbers: int) -> float:
     model.eval()
     total, correct = 0, 0
     for _ in range(eval_batches):
         batch = gen.sample_posneg_pairs(batch=batch_size)
-        a_desc, a_mask, b_desc, b_mask = _maybe_same_base(gen, batch, device, same_base)
-        ids, mask = _pack_pairs(a_desc, a_mask, b_desc, b_mask, device)
+        ids, mask = _pack_pair_questions_text(batch, tok, max_len)
         y = batch["label"].to(device)
         _, logits_seq, _, _, _, _ = model(ids, mask)
-        pred = logits_seq.argmax(dim=-1)
-        correct += (pred == y).sum().item()
+        NO_IDX = num_numbers + 1
+        YES_IDX = num_numbers
+        pred_bin = logits_seq[:, [NO_IDX, YES_IDX]].argmax(dim=-1)
+        correct += (pred_bin == y).sum().item()
         total += y.numel()
     model.train()
     return correct / max(1, total)
 
 
-def _maybe_same_base(gen, batch, device, same_base: bool):
-    if not same_base:
-        return batch["a_desc"], batch["a_mask"], batch["b_desc"], batch["b_mask"]
-    # re-render B with A's base so A and B share the same base per pair
-    a_desc, a_mask, a_base = batch["a_desc"], batch["a_mask"], batch["a_base"]
-    b_desc, b_mask, b_base = batch["b_desc"], batch["b_mask"], batch["b_base"]
-    # also re-render A to ensure consistency
-    a_desc2, a_mask2, _ = gen._render_batch_with_fixed_base(batch["a_idx"], a_base)
-    b_desc2, b_mask2, _ = gen._render_batch_with_fixed_base(batch["b_idx"], a_base)
-    return a_desc2, a_mask2, b_desc2, b_mask2
+
+
+def _pack_text_batch(texts: List[str], tok: HFTokenizerWrapper, max_len: int, device: str):
+    B = len(texts)
+    ids = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+    for i, t in enumerate(texts):
+        enc = tok.encode(t, max_len=max_len)
+        ids[i] = torch.tensor(enc.ids[:max_len], dtype=torch.long, device=device)
+        mask[i] = torch.tensor(enc.mask[:max_len], dtype=torch.long, device=device)
+    return ids, mask
+
+
+def _pair_templates(a: int, b: int, r: int) -> List[str]:
+    # Simple natural templates; tokenizer handles subwords; we don't hardcode tokens.
+    if r == 0:
+        return [f"Do {a} and {b} have the same parity?"]
+    if r == 1:
+        return [f"Is {b} the successor of {a}?", f"Is {b} equal to {a} + 1?"]
+    if r == 2:
+        return [f"Is {b} the predecessor of {a}?", f"Is {b} equal to {a} - 1?"]
+    if r == 3:
+        return [f"Is {b} equal to {a} + 2?"]
+    if r == 4:
+        return [f"Do {a} and {b} have the same tens digit?"]
+    if r == 5:
+        return [f"Do {a} and {b} have the same ones digit?"]
+    if r == 6:
+        return [f"Do the ones digits of {a} and {b} make ten?"]
+    if r == 7:
+        return [f"Is {a} greater than {b}?"]
+    if r == 8:
+        return [f"Is {a} smaller than {b}?"]
+    return [f"Do {a} and {b} satisfy the relation?"]
+
+
+def _pack_pair_questions_text(batch, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    a = batch["a_idx"].tolist()
+    b = batch["b_idx"].tolist()
+    r = batch["rel"].tolist()
+    texts = []
+    for ai, bi, ri in zip(a, b, r):
+        tpls = _pair_templates(ai, bi, ri)
+        texts.append(random.choice(tpls))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_count_examples_text(kind, a, c, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    kind_l = kind.tolist(); a_l = a.tolist(); c_l = c.tolist()
+    texts = []
+    for k, ai, ci in zip(kind_l, a_l, c_l):
+        if k == 0:
+            texts.append(random.choice([f"What comes after {ai}?", f"What is the successor of {ai}?", f"Next number after {ai}?"]))
+        elif k == 1:
+            texts.append(random.choice([f"What comes before {ai}?", f"What is the predecessor of {ai}?", f"Previous number before {ai}?",
+            ]))
+        else:
+            texts.append(random.choice([f"What number comes between {ai} and {ci}?", f"Between {ai} and {ci}, which number comes in between?"]))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_equality_examples_text(a: torch.Tensor, kind: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    a_l = a.tolist(); k_l = kind.tolist()
+    texts = []
+    for ai, ki in zip(a_l, k_l):
+        if ki == 0:
+            rhs = ai + 1
+            texts.append(random.choice([f"Is the successor of {ai} equal to {rhs}?", f"Is next of {ai} = {ai} + 1?", f"Does {ai} + 1 equal the successor of {ai}?",
+            ]))
+        else:
+            rhs = ai - 1
+            texts.append(random.choice([f"Is the predecessor of {ai} equal to {rhs}?", f"Is previous of {ai} = {ai} - 1?", f"Does {ai} - 1 equal the predecessor of {ai}?",
+            ]))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ids, mask = _pack_text_batch(texts, tok, max_len, device)
+    y = torch.ones(len(texts), dtype=torch.long, device=device)  # all true
+    return ids, mask, y
 
 
 def train(args):
@@ -87,14 +238,19 @@ def train(args):
     )
     gen = EpisodeGenerator(ecfg)
 
-    vocab_size = ecfg.max_base + 3  # 0 PAD, 1 CLS, 2 SEP, digits 3..(base+2)
+    tok = HFTokenizerWrapper("bert-base-cased")
+    vocab_size = tok.vocab_size
+    # unified head: numbers (0..N-1) + {YES, NO}
+    num_numbers = ecfg.max_number
+    YES_IDX = num_numbers
+    NO_IDX = num_numbers + 1
     model = CLModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
-        num_classes=2,  # pos/neg pairs
+        num_classes=num_numbers + 2,
         pad_id=0,
         cls_id=1,
-        max_len=(1 + ecfg.max_len + 1 + ecfg.max_len),
+        max_len=args.max_len,
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
@@ -102,16 +258,59 @@ def train(args):
     if args.resume and os.path.isfile(args.resume):
         start_step = load_checkpoint(args.resume, model, opt, map_location=device)
         print(f"Resumed from {args.resume} at step {start_step}")
+        # initialize best_acc from checkpoint if present; else from a quick eval
+        ckpt_best = getattr(load_checkpoint, "last_best_acc", None)
+        if ckpt_best is not None:
+            best_acc = float(ckpt_best)
+            print(f"Loaded best_acc from checkpoint: {best_acc:.3f}")
+        else:
+            best_acc = _quick_eval(
+                model,
+                gen,
+                tok,
+                device,
+                batch_size=min(args.batch_size, 128),
+                eval_batches=10,
+                max_len=args.max_len,
+                num_numbers=num_numbers,
+            )
+            print(f"Computed baseline val_acc after resume: {best_acc:.3f}")
 
-    best_acc = -1.0
+    best_acc = -1.0 if not (args.resume and os.path.isfile(args.resume)) else best_acc
     model.train()
+    seq_len = args.max_len
     for step in range(start_step, args.steps):
         if args.overfit_batch is not None and step == start_step:
             cached = gen.sample_posneg_pairs(batch=args.overfit_batch)
         batch = cached if args.overfit_batch is not None else gen.sample_posneg_pairs(batch=args.batch_size)
-        a_desc, a_mask, b_desc, b_mask = _maybe_same_base(gen, batch, device, args.same_base)
-        ids, mask = _pack_pairs(a_desc, a_mask, b_desc, b_mask, device)
-        y = batch["label"].to(device)
+        # natural-language pair questions
+        ids_pairs, mask_pairs = _pack_pair_questions_text(batch, tok, max_len=seq_len)
+        y_pairs_bin = batch["label"].to(device)
+        y_pairs = torch.where(
+            y_pairs_bin > 0,
+            torch.full_like(y_pairs_bin, YES_IDX),
+            torch.full_like(y_pairs_bin, NO_IDX),
+        )
+        # mix in equality statements (succ/pred == a±1)
+        eq_bsz = max(1, args.batch_size // 4)
+        a_eq = torch.randint(0, gen.n_items, (eq_bsz,), device=device)
+        kind_eq = torch.randint(0, 2, (eq_bsz,), device=device)
+        ids_eq, mask_eq, _y_eq_bin = _pack_equality_examples_text(
+            a_eq, kind_eq, tok, max_len=seq_len
+        )
+        y_eq = torch.full((eq_bsz,), YES_IDX, dtype=torch.long, device=device)
+
+        # counting batch
+        cnt_bsz = args.batch_size
+        data_cnt = gen.sample_counting(batch=cnt_bsz)
+        ids_cnt, mask_cnt = _pack_count_examples_text(
+            data_cnt["kind"], data_cnt["a"], data_cnt["c"], tok, max_len=seq_len
+        )
+        y_cnt = data_cnt["target"].to(device)  # 0..N-1
+
+        ids = torch.cat([ids_pairs, ids_eq, ids_cnt], dim=0)
+        mask = torch.cat([mask_pairs, mask_eq, mask_cnt], dim=0)
+        y = torch.cat([y_pairs, y_eq, y_cnt], dim=0)
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
 
         loss_seq = torch.nn.functional.cross_entropy(logits_seq, y)
@@ -127,7 +326,8 @@ def train(args):
 
         if (step + 1) % args.log_every == 0:
             with torch.no_grad():
-                probs = torch.softmax(logits_seq, dim=-1)[:, 1].mean().item()
+                lp = logits_seq[:, [NO_IDX, YES_IDX]]
+                probs = torch.softmax(lp, dim=-1)[:, 1].mean().item()
             # quick validation for best checkpoint tracking
             # VQ usage (unique codes per quantizer / codebook_size)
             vq_util = None
@@ -140,25 +340,49 @@ def train(args):
             except Exception:
                 vq_util = None
 
-            val_acc = _quick_eval(
-                model, gen, device, batch_size=min(args.batch_size, 128), eval_batches=10, same_base=args.same_base
+            val_acc_pair = _quick_eval(
+                model,
+                gen,
+                tok,
+                device,
+                batch_size=min(args.batch_size, 128),
+                eval_batches=10,
+                max_len=seq_len,
+                num_numbers=num_numbers,
             )
+            # quick counting eval
+            model.eval()
+            tot, hit = 0, 0
+            with torch.no_grad():
+                for _ in range(5):
+                    d2 = gen.sample_counting(batch=min(args.batch_size, 128))
+                    i2, m2 = _pack_count_examples_text(
+                        d2["kind"], d2["a"], d2["c"], tok, max_len=seq_len
+                    )
+                    y2 = d2["target"].to(device)
+                    _, ls2, _, _, _, _ = model(i2, m2)
+                    pred2 = ls2[:, :num_numbers].argmax(dim=-1)
+                    hit += (pred2 == y2).sum().item()
+                    tot += y2.numel()
+            model.train()
+            val_acc_cnt = hit / max(1, tot)
+            val_acc = 0.5 * (val_acc_pair + val_acc_cnt)
             extra = f" vq_util={vq_util:.3f}" if vq_util is not None else ""
             print(
                 f"step {step+1}/{args.steps} loss={loss.item():.4f} seq={loss_seq.item():.4f} "
-                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(pos)~{probs:.3f} val_acc={val_acc:.3f}{extra}"
+                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f}{extra}"
             )
             if args.save_dir and val_acc > best_acc:
                 best_acc = val_acc
                 best_path = os.path.join(args.save_dir, "best.pt")
-                save_checkpoint(best_path, model, opt, step + 1)
+                save_checkpoint(best_path, model, opt, step + 1, best_acc=val_acc)
                 print(f"  Saved best checkpoint: {best_path} (val_acc={val_acc:.3f})")
 
         if args.save_dir and (step + 1) % args.ckpt_every == 0:
             ckpt_path = os.path.join(args.save_dir, f"ckpt_step_{step+1}.pt")
             save_checkpoint(ckpt_path, model, opt, step + 1)
             latest = os.path.join(args.save_dir, "latest.pt")
-            save_checkpoint(latest, model, opt, step + 1)
+            save_checkpoint(latest, model, opt, step + 1, best_acc=best_acc if best_acc >= 0 else None)
 
 
 @torch.no_grad()
@@ -174,14 +398,18 @@ def evaluate(args):
         device=device,
     )
     gen = EpisodeGenerator(ecfg)
-    vocab_size = ecfg.max_base + 3
+    tok = HFTokenizerWrapper("bert-base-cased")
+    vocab_size = tok.vocab_size
+    num_numbers = ecfg.max_number
+    YES_IDX = num_numbers
+    NO_IDX = num_numbers + 1
     model = CLModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
-        num_classes=2,
+        num_classes=num_numbers + 2,
         pad_id=0,
         cls_id=1,
-        max_len=(1 + ecfg.max_len + 1 + ecfg.max_len),
+        max_len=args.max_len,
     ).to(device)
 
     assert args.checkpoint and os.path.isfile(args.checkpoint), "--checkpoint required"
@@ -199,15 +427,15 @@ def evaluate(args):
     all_rel = []
     for _ in range(args.eval_batches):
         batch = gen.sample_posneg_pairs(batch=args.batch_size)
-        a_desc, a_mask, b_desc, b_mask = _maybe_same_base(gen, batch, device, args.same_base)
-        ids, mask = _pack_pairs(a_desc, a_mask, b_desc, b_mask, device)
+        ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len)
         y = batch["label"].to(device)
         rel = batch.get("rel").to(device)
         a_idx = batch["a_idx"].to(device)
         b_idx = batch["b_idx"].to(device)
         _, logits_seq, _, _, _, _ = model(ids, mask)
-        pred = logits_seq.argmax(dim=-1)
-        probs = torch.softmax(logits_seq, dim=-1)[:, 1]
+        logits_pair = logits_seq[:, [NO_IDX, YES_IDX]]
+        pred = logits_pair.argmax(dim=-1)
+        probs = torch.softmax(logits_pair, dim=-1)[:, 1]
         correct += (pred == y).sum().item()
         total += y.numel()
         # accumulate per-relation
@@ -282,15 +510,14 @@ def evaluate(args):
 
     # Print a few sample predictions with questions and answers
     batch = gen.sample_posneg_pairs(batch=4)
-    a_desc, a_mask, b_desc, b_mask = _maybe_same_base(gen, batch, device, args.same_base)
-    ids, mask = _pack_pairs(a_desc, a_mask, b_desc, b_mask, device)
+    ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len)
     y = batch["label"].tolist()
     a_idx = batch["a_idx"].tolist()
     b_idx = batch["b_idx"].tolist()
     rel = batch.get("rel")
     rel = rel.tolist() if rel is not None else [None] * len(y)
     _, logits_seq, _, _, _, _ = model(ids, mask)
-    probs = torch.softmax(logits_seq, dim=-1)[:, 1].tolist()
+    probs = torch.softmax(logits_seq[:, [NO_IDX, YES_IDX]], dim=-1)[:, 1].tolist()
 
     def rel_name(r):
         names = [
@@ -337,6 +564,78 @@ def evaluate(args):
         pred = "yes" if p >= 0.5 else "no"
         print(f"  Q: {q}\n     gold={gold} pred={pred} p(yes)={p:.3f} rel={rel_name(rel[i])}")
 
+    # Also show a few equality reformulations using different language
+    print("\nSample equality QA (varied phrasing):")
+    import random as _r
+    with torch.no_grad():
+        a_eq = torch.randint(0, gen.n_items, (4,), device=device)
+        kind_eq = torch.randint(0, 2, (4,), device=device)
+        ids_eq, mask_eq, y_eq = _pack_equality_examples_text(a_eq, kind_eq, tok, max_len=args.max_len)
+        # use two-class slice {NO, YES}
+        num_numbers = ecfg.max_number
+        NO_IDX = num_numbers + 1
+        YES_IDX = num_numbers
+        _, logits_seq_eq, _, _, _, _ = model(ids_eq, mask_eq)
+        probs_eq = torch.softmax(logits_seq_eq[:, [NO_IDX, YES_IDX]], dim=-1)[:, 1].tolist()
+        y_eq = y_eq.tolist()
+        a_eq_l = a_eq.tolist()
+        k_eq_l = kind_eq.tolist()
+        for i in range(len(y_eq)):
+            ai = a_eq_l[i]
+            if k_eq_l[i] == 0:
+                # successor phrasing variety
+                phr = [
+                    f"Is the successor of {ai} equal to {ai} + 1?",
+                    f"Is next of {ai} = {ai} + 1?",
+                    f"Does {ai} + 1 equal the successor of {ai}?",
+                    f"Is the successor of {ai} = {(ai+1)%1000}?",
+                    f"Is next of {ai} equal to {(ai+1)%1000}?",
+                ]
+            else:
+                phr = [
+                    f"Is the predecessor of {ai} equal to {ai} - 1?",
+                    f"Is previous of {ai} = {ai} - 1?",
+                    f"Does {ai} - 1 equal the predecessor of {ai}?",
+                    f"Is the predecessor of {ai} = {(ai-1)%1000}?",
+                    f"Is previous of {ai} equal to {(ai-1)%1000}?",
+                ]
+            qtext = phr[_r.randrange(len(phr))]
+            gold = "yes" if y_eq[i] == 1 else "no"
+            pred = "yes" if probs_eq[i] >= 0.5 else "no"
+            print(f"  Q: {qtext}\n     gold={gold} pred={pred} p(yes)={probs_eq[i]:.3f}")
+
+    # Counting diagnostics combined in eval
+    print("\nCounting evaluation:")
+    tot, hit = 0, 0
+    with torch.no_grad():
+        for _ in range(args.eval_batches):
+            dc = gen.sample_counting(batch=min(args.batch_size, 128))
+            ic, mc = _pack_count_examples_text(dc["kind"], dc["a"], dc["c"], tok, max_len=args.max_len)
+            yc = dc["target"].to(device)
+            _, lsc, _, _, _, _ = model(ic, mc)
+            predc = lsc[:, :ecfg.max_number].argmax(dim=-1)
+            hit += (predc == yc).sum().item()
+            tot += yc.numel()
+    print(f"Counting eval accuracy: {hit/max(1,tot):.3f}")
+    # sample counting QA with variety
+    import random as _r
+    with torch.no_grad():
+        dshow = gen.sample_counting(batch=4)
+        ic, mc = _pack_count_examples_text(dshow["kind"], dshow["a"], dshow["c"], tok, max_len=args.max_len)
+        yshow = dshow["target"].tolist()
+        _, lss, _, _, _, _ = model(ic, mc)
+        predshow = lss[:, :ecfg.max_number].argmax(dim=-1).tolist()
+        kind = dshow["kind"].tolist(); a = dshow["a"].tolist(); c = dshow["c"].tolist()
+        for i in range(len(kind)):
+            if kind[i] == 0:
+                phr = [f"What is the successor of {a[i]}?", f"What comes after {a[i]}?", f"What number comes after {a[i]}?"]
+            elif kind[i] == 1:
+                phr = [f"What is the predecessor of {a[i]}?", f"What comes before {a[i]}?", f"What number comes before {a[i]}?"]
+            else:
+                phr = [f"What number comes between {a[i]} and {c[i]}?", f"Between {a[i]} and {c[i]}, which number comes in between?"]
+            q = phr[_r.randrange(len(phr))]
+            print(f"  Q: {q}\n     gold={yshow[i]} pred={predshow[i]}")
+
 
 def main():
     p = argparse.ArgumentParser(description="Train/Eval on numeric episode pairs")
@@ -373,12 +672,134 @@ def main():
     pe.add_argument("--same_base", action="store_true")
     pe.add_argument("--base10", action="store_true", help="Force base-10 rendering only (min_base=max_base=10)")
 
+    # Counting subcommands (unified CLI)
+    ct = sub.add_parser("count-train", help="Train counting tasks (successor/pred/between)")
+    ct.add_argument("--device", type=str, default=None)
+    ct.add_argument("--d_model", type=int, default=128)
+    ct.add_argument("--steps", type=int, default=5000)
+    ct.add_argument("--lr", type=float, default=3e-4)
+    ct.add_argument("--batch_size", type=int, default=128)
+    ct.add_argument("--max_number", type=int, default=100)
+    ct.add_argument("--save_dir", type=str, default="runs/counting")
+    ct.add_argument("--ckpt_every", type=int, default=500)
+    ct.add_argument("--log_every", type=int, default=100)
+    ct.add_argument("--resume", type=str, default=None)
+    ct.add_argument("--max_len", type=int, default=18)
+    ct.add_argument("--eval_batches", type=int, default=50)
+
+    ce = sub.add_parser("count-eval", help="Evaluate a counting checkpoint")
+    ce.add_argument("--device", type=str, default=None)
+    ce.add_argument("--d_model", type=int, default=128)
+    ce.add_argument("--max_number", type=int, default=100)
+    ce.add_argument("--checkpoint", type=str, required=True)
+    ce.add_argument("--max_len", type=int, default=18)
+    ce.add_argument("--eval_batches", type=int, default=100)
+
     args = p.parse_args()
     if args.cmd == "eval":
         evaluate(args)
-    else:
-        # default to train when no subcommand is provided for convenience
-        train(args if args.cmd == "train" else p.parse_args(["train"]))
+        return
+    if args.cmd == "count-train":
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        ecfg = EpisodeConfig(max_number=args.max_number, device=device, max_len=6, min_base=10, max_base=10)
+        gen = EpisodeGenerator(ecfg)
+        tok = HFTokenizerWrapper("bert-base-cased")
+        model = CLModel(vocab_size=tok.vocab_size, d_model=args.d_model, num_classes=ecfg.max_number, pad_id=0, cls_id=1, max_len=args.max_len).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        start = 0
+        if args.resume and os.path.isfile(args.resume):
+            start = load_checkpoint(args.resume, model, opt, map_location=device)
+            print(f"Resumed from {args.resume} at step {start}")
+        best = -1.0
+        for step in range(start, args.steps):
+            data = gen.sample_counting(batch=args.batch_size)
+            ids, mask = _pack_count_examples_text(data["kind"], data["a"], data["c"], tok, max_len=args.max_len)
+            y = data["target"].to(device)
+            _, logits_seq, vq_loss, _, stop_logits, _ = model(ids, mask)
+            loss = torch.nn.functional.cross_entropy(logits_seq, y)
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            if (step + 1) % args.log_every == 0:
+                # quick eval
+                model.eval()
+                tot, hit = 0, 0
+                with torch.no_grad():
+                    for _ in range(args.eval_batches):
+                        data2 = gen.sample_counting(batch=min(args.batch_size, 128))
+                        ids2, mask2 = _pack_count_examples_text(data2["kind"], data2["a"], data2["c"], tok, max_len=args.max_len)
+                        y2 = data2["target"].to(device)
+                        _, logits_seq2, _, _, _, _ = model(ids2, mask2)
+                        pred2 = logits_seq2.argmax(dim=-1)
+                        hit += (pred2 == y2).sum().item()
+                        tot += y2.numel()
+                model.train()
+                val_acc = hit / max(1, tot)
+                print(f"step {step+1}/{args.steps} loss={loss.item():.4f} val_acc={val_acc:.3f}")
+                if val_acc > best and args.save_dir:
+                    best = val_acc
+                    os.makedirs(args.save_dir, exist_ok=True)
+                    save_checkpoint(os.path.join(args.save_dir, "best.pt"), model, opt, step + 1)
+                    print(f"  Saved best checkpoint: {os.path.join(args.save_dir, 'best.pt')} (val_acc={val_acc:.3f})")
+            if args.save_dir and (step + 1) % args.ckpt_every == 0:
+                save_checkpoint(os.path.join(args.save_dir, f"ckpt_step_{step+1}.pt"), model, opt, step + 1)
+                save_checkpoint(os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1)
+        return
+    if args.cmd == "count-eval":
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        ecfg = EpisodeConfig(max_number=args.max_number, device=device, max_len=6, min_base=10, max_base=10)
+        gen = EpisodeGenerator(ecfg)
+        tok = HFTokenizerWrapper("bert-base-cased")
+        model = CLModel(vocab_size=tok.vocab_size, d_model=args.d_model, num_classes=ecfg.max_number, pad_id=0, cls_id=1, max_len=args.max_len).to(device)
+        load_checkpoint(args.checkpoint, model, opt=None, map_location=device)
+        model.eval()
+        # eval
+        tot, hit = 0, 0
+        with torch.no_grad():
+            for _ in range(args.eval_batches):
+                data2 = gen.sample_counting(batch=min(256, 128))
+                ids2, mask2 = _pack_count_examples_text(data2["kind"], data2["a"], data2["c"], tok, max_len=args.max_len)
+                y2 = data2["target"].to(device)
+                _, logits_seq2, _, _, _, _ = model(ids2, mask2)
+                pred2 = logits_seq2.argmax(dim=-1)
+                hit += (pred2 == y2).sum().item()
+                tot += y2.numel()
+        print(f"Counting eval accuracy: {hit/max(1,tot):.3f}")
+        # sample questions
+        import random as _r
+        with torch.no_grad():
+            data = gen.sample_counting(batch=6)
+            ids, mask = _pack_count_examples_text(data["kind"], data["a"], data["c"], tok, max_len=args.max_len)
+            y = data["target"].tolist()
+            _, logits_seq, _, _, _, _ = model(ids, mask)
+            pred = logits_seq.argmax(dim=-1).tolist()
+            kind = data["kind"].tolist()
+            a = data["a"].tolist()
+            c = data["c"].tolist()
+            for i in range(len(kind)):
+                if kind[i] == 0:
+                    phr = [
+                        f"What is the successor of {a[i]}?",
+                        f"What comes after {a[i]}?",
+                        f"What number comes after {a[i]}?",
+                    ]
+                elif kind[i] == 1:
+                    phr = [
+                        f"What is the predecessor of {a[i]}?",
+                        f"What comes before {a[i]}?",
+                        f"What number comes before {a[i]}?",
+                    ]
+                else:
+                    phr = [
+                        f"What number comes between {a[i]} and {c[i]}?",
+                        f"Between {a[i]} and {c[i]}, which number comes in between?",
+                    ]
+                q = phr[_r.randrange(len(phr))]
+                print(f"Q: {q}\n   gold={y[i]} pred={pred[i]}")
+        return
+    # default to pair training when no subcommand is provided
+    train(args if args.cmd == "train" else p.parse_args(["train"]))
 
 
 if __name__ == "__main__":
