@@ -2,7 +2,7 @@
 
 Concept Learner is an experimental project to build a model that learns concepts directly, starting with Grade 1 mathematics. The aim is to progress through school-level math one grade at a time, exploring how a model can acquire and apply concepts rather than just memorize patterns.
 
-This is not an LLM and not a wrapper around existing LLMs, it's a ground-up attempt to rethink how AI learns reasoning.
+This is not a LLM and not a wrapper around existing LLMs, it's a ground-up attempt to rethink how AI learns reasoning.
 
 This project is also an experiment in vibe-coding. Many developers today use LLMs to vibe-code apps; here, the twist is to see if we can vibe-code an AI model itself, in other words, use AI (with human guidance) to help design and build another AI.
 
