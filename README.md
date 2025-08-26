@@ -1,123 +1,106 @@
-Subject-Aware Concept Learner (text-only)
+# Subject-Aware Concept Learner
 
-Short version: a tiny Transformer encoder, a small residual VQ bottleneck, a few typed reasoning ops, and a simple unified decoder. It’s all text-only and comes with tests and minimal training scripts.
+Concept Learner is an experimental project to build a model that learns concepts directly, starting with Grade 1 mathematics. The aim is to progress through school-level math one grade at a time, exploring how a model can acquire and apply concepts rather than just memorize patterns.
 
-This README focuses on how to use and extend the code. The original research sketch was broader; the shipped code intentionally keeps the surface area small and practical.
+This is not an LLM and not a wrapper around existing LLMs, it's a ground-up attempt to rethink how AI learns reasoning.
 
-What’s inside (implemented)
+This project is also an experiment in vibe-coding. Many developers today use LLMs to vibe-code apps; here, the twist is to see if we can vibe-code an AI model itself, in other words, use AI (with human guidance) to help design and build another AI.
 
-- Tokenizer wrapper with offline fallback
-  - Uses a Hugging Face tokenizer when available (bert-base-cased)
-  - Falls back to a tiny whitespace tokenizer with [CLS]/[SEP]/[PAD] when downloads aren’t possible
-- TinyEncoder: 2-layer Transformer encoder that returns
-  - h: pooled vector (prefers [CLS] if present)
-  - H: per-token states
-- ResidualVQLayer: single residual vector-quantization bottleneck
-  - Uses vector-quantize-pytorch if installed; otherwise a lightweight pass-through fallback keeps shapes/losses consistent for tests
-- ReasonerV2: multi-step reasoning over a typed state with a STOP head
-  - Typed state: mask (selection over tokens), val (scalar), boolean (scalar)
-  - Operators: Filter (per-token scorer), Count (DeepSets), Add (generic), Compare (generic)
-  - Soft mixture over operators per step + broadcast of the final state back to tokens
-- UnifiedDecoder: two simple heads
-  - token_head for per-token logits (used in tests/demo)
-  - seq_head for pooled sequence classification (used by training scripts)
-- Training helpers and toy tasks
-  - scripts/train.py: quick smoke training on synthetic batches
-  - scripts/train_count.py: trains successor / predecessor / between with a tiny hand-rolled vocab
-  - scripts/train_episodes.py: natural-language pairs + counting using a Hugging Face tokenizer
-- Tests: tokenizer, encoder, VQ layer, model wiring, and a minimal train step
+Architecture in short: a tiny Transformer encoder, a multi-VQ bottleneck (parallel + sequential), a few typed reasoning ops, and a simple unified decoder.
 
-What’s not included (by design for now)
+## Install
 
-- No hierarchical 4-level VQ; there’s one ResidualVQ bottleneck
-- No explicit subject/domain/operator hierarchy or schema-based MoE registry
-- No external tools or retrieval plugins
-- Decoder is single-token classification (no autoregressive decoder)
+### Prereqs: Python 3.13+
 
-Install
-
-Prereqs: Python 3.13+
-
-Option A — pip
-
-- python -m venv .venv && source .venv/bin/activate
-- pip install -e .
-
-Option B — uv (optional)
+#### uv (optional)
 
 - uv sync
 
-Notes
-
-- vector-quantize-pytorch is listed as a dependency, but the code has a safe fallback if it’s not importable at runtime (useful for CI/offline).
-- transformers is optional; we fall back to a tiny whitespace tokenizer when HF downloads aren’t available.
-
-Quickstart
+## Quickstart
 
 - Run tests
 
   - uv run pytest -q
 
-- Minimal training smoke test
+- Training from scratch
 
-  - python scripts/train.py
+  - `python scripts/train_episodes.py train \
+--steps 12000 --base10 --batch_size 512 --d_model 256 \
+--save_dir runs/episodes_b10 \
+--ckpt_every 500 --log_every 100 \
+--lr 8e-5 --sched cosine --warmup_ratio 0.03 --min_lr 1e-6 \
+--ema_decay 0.995 --weight_decay 0.003 --label_smoothing 0.03 \
+--lambda_vq 0.25 --lambda_stop 0.3`
 
-- Counting tasks (successor / predecessor / between)
+- Resume Training
 
-  - python scripts/train_count.py --steps 1000
-  - Uses a tiny fixed vocab (digits + a few relation tokens) and the pooled seq_head to predict the numeric answer.
+  - `python scripts/train_episodes.py train \
+--steps 12000 --base10 --batch_size 512 --d_model 256 \
+--save_dir runs/episodes_b10 \
+--ckpt_every 500 --log_every 100 \
+--lr 8e-5 --sched cosine --warmup_ratio 0.03 --min_lr 1e-6 \
+--ema_decay 0.995 --weight_decay 0.003 --label_smoothing 0.03 \
+--lambda_vq 0.25 --lambda_stop 0.3 \
+--resume runs/episodes_b10/best.pt`
 
-- Natural-language pairs + counting (HF tokenizer)
-  - python scripts/train_episodes.py train --steps 1000
-  - You can resume/evaluate with the same script (see --help).
+- Evaluation
 
-Basic usage (from Python)
+  - `python scripts/train_episodes.py eval --checkpoint runs/episodes_b10/best.pt --d_model 256 --eval_batches 100 --base10`
 
-- Build a tokenizer and model, then run a forward pass
+## Sample Evaluation Output
 
-  - from concept_learner.tokenizer import HFTokenizerWrapper
-  - from concept_learner.model import CLModel
-  - tok = HFTokenizerWrapper("bert-base-cased")
-  - enc = tok.encode("2 : 3 :: 5 : ?", max_len=24)
-  - ids = torch.tensor([enc.ids])
-  - mask = torch.tensor([enc.mask])
-  - model = CLModel(vocab_size=tok.vocab_size, d_model=128, num_classes=3)
-  - logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits = model(ids, mask)
+```
+Eval accuracy over 6400 examples: 0.7180
+Per-relation accuracy:
+  same_parity : 330/690 = 0.478
+  successor   : 705/727 = 0.970
+  predecessor : 664/674 = 0.985
+  add_2       : 420/705 = 0.596
+  same_tens   : 378/727 = 0.520
+  same_ones   : 350/725 = 0.483
+  makes_ten   : 373/729 = 0.512
+  greater     : 690/716 = 0.964
+  smaller     : 685/707 = 0.969
+Acc@thr=0.4: 0.707
+Acc@thr=0.5: 0.718
+Acc@thr=0.6: 0.725
+Best fixed-threshold acc in [0.35,0.65]: 0.732 at thr=0.52
+greater close (|a-b|<=1): 396 ex, acc=0.977
+greater far   (|a-b|>1):  320 ex, acc=0.947
+smaller close (|a-b|<=1): 361 ex, acc=0.978
+smaller far   (|a-b|>1):  346 ex, acc=0.960
+Sample QA predictions:
+  Q: Do 11 and 12 have the same parity?
+     gold=no pred=no p(yes)=0.469 rel=same_parity
+  Q: Is 28 the predecessor of 29?
+     gold=yes pred=yes p(yes)=0.992 rel=predecessor
+  Q: Is 7 greater than 6?
+     gold=yes pred=yes p(yes)=1.000 rel=greater
+  Q: Do 69 and 79 have the same tens digit?
+     gold=no pred=yes p(yes)=0.528 rel=same_tens
 
-Repo layout
+Sample equality QA (varied phrasing):
+  Q: Is the successor of 93 equal to 93 + 1?
+     gold=yes pred=yes p(yes)=1.000
+  Q: Is next of 33 = 33 + 1?
+     gold=yes pred=yes p(yes)=1.000
+  Q: Is previous of 27 = 27 - 1?
+     gold=yes pred=yes p(yes)=1.000
+  Q: Is the successor of 44 = 45?
+     gold=yes pred=yes p(yes)=0.999
 
-- src/concept_learner
-  - tokenizer.py — HF wrapper with a fallback
-  - encoder.py — 2-layer Transformer + pooled vector
-  - vq_layer.py — ResidualVQLayer wrapper with a safe fallback
-  - reasoning_ops.py — typed-state operators (Filter, Count, Add, Compare)
-  - reasoning_v2.py — multi-step controller with STOP and operator mixing
-  - decoder.py — token and pooled (sequence) heads
-  - model.py — end-to-end wiring (Encoder → RVQ → FiLM → ReasonerV2 → Decoder)
-  - trainer.py — tiny training utilities (losses, step, synthetic batches)
-  - episodes.py — toy episode/number generators for curriculum-like tasks
-- scripts — runnable demos (see Quickstart)
-- tests — shape checks, smoke training, determinism
+Counting evaluation:
+Counting eval accuracy: 1.000
+  Q: What number comes between 34 and 36?
+     gold=35 pred=35
+  Q: What is the predecessor of 65?
+     gold=64 pred=64
+  Q: What number comes before 36?
+     gold=35 pred=35
+  Q: What number comes after 43?
+     gold=44 pred=44
+```
 
-Design notes that match the code
-
-- Text-only: everything is token sequences; no images or external tools
-- Typed state: mask/val/boolean are maintained explicitly and updated by operators
-- Multi-step: ReasonerV2 runs up to max_steps with a STOP head; action logits expose which operator the model leans on
-- VQ bottleneck: a single residual VQ sits between encoder and reasoning; if vector-quantize-pytorch is missing, a small differentiable fallback keeps training/tests working
-- Unified outputs: decoder exposes token-level and pooled sequence logits; training scripts primarily use the pooled head
-
-Contributing / extending
-
-- Add operators:
-  - See reasoning_ops.py for patterns. Each op reads the typed state and returns updated (mask, val, boolean).
-- Swap or deepen the encoder:
-  - TinyEncoder is purposefully small; you can replace it with a larger Transformer.
-- Replace the VQ:
-  - ResidualVQLayer is wrapped behind a tiny interface; you can plug a different VQ.
-- Multi-token decoding:
-  - decoder.py is minimal; replace seq_head with an AR decoder if you need multi-token outputs.
-
-License
+## License
 
 BSD-3-Clause (see LICENSE.md)
