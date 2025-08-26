@@ -35,7 +35,9 @@ def _pack_pairs(a_desc, a_mask, b_desc, b_mask, device):
     return ids, mask
 
 
-def save_checkpoint(path, model, opt, step, best_acc: float | None = None, ema_state: dict | None = None):
+def save_checkpoint(
+    path, model, opt, step, best_acc: float | None = None, ema_state: dict | None = None
+):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step}
     if best_acc is not None:
@@ -55,6 +57,7 @@ def load_checkpoint(path, model, opt, map_location=None, ema=None):
         model.load_state_dict(sd)
     except RuntimeError as e:
         msg = str(e)
+
         # Backward-compat: expand/trim embedding and classifier heads
         def _resize_like(key: str, ref_param: torch.nn.Parameter):
             old = sd.get(key)
@@ -79,7 +82,14 @@ def load_checkpoint(path, model, opt, map_location=None, ema=None):
 
         if "enc.tok_emb.weight" in msg:
             _resize_like("enc.tok_emb.weight", model.enc.tok_emb.weight)
-        if any(s in msg for s in ["head.weight", "decoder.token_head.weight", "decoder.seq_head.weight"]):
+        if any(
+            s in msg
+            for s in [
+                "head.weight",
+                "decoder.token_head.weight",
+                "decoder.seq_head.weight",
+            ]
+        ):
             # adjust all known heads to current shapes
             _resize_like("head.weight", model.head.weight)
             _resize_like("head.bias", model.head.bias)
@@ -100,17 +110,31 @@ def load_checkpoint(path, model, opt, map_location=None, ema=None):
                     for k in ("exp_avg", "exp_avg_sq"):
                         if k in st:
                             buf = st[k]
-                            if isinstance(buf, torch.Tensor) and buf.shape != tok_param.data.shape:
+                            if (
+                                isinstance(buf, torch.Tensor)
+                                and buf.shape != tok_param.data.shape
+                            ):
                                 new_buf = torch.zeros_like(tok_param.data)
                                 rows = min(buf.shape[0], new_buf.shape[0])
                                 new_buf[:rows].copy_(buf[:rows])
                                 st[k] = new_buf
                 # also repair classifier head states if shapes changed
-                for p in [model.head.weight, model.head.bias, model.decoder.token_head.weight, model.decoder.token_head.bias, model.decoder.seq_head.weight, model.decoder.seq_head.bias]:
+                for p in [
+                    model.head.weight,
+                    model.head.bias,
+                    model.decoder.token_head.weight,
+                    model.decoder.token_head.bias,
+                    model.decoder.seq_head.weight,
+                    model.decoder.seq_head.bias,
+                ]:
                     stp = opt.state.get(p, None)
                     if isinstance(stp, dict):
                         for k in ("exp_avg", "exp_avg_sq"):
-                            if k in stp and isinstance(stp[k], torch.Tensor) and stp[k].shape != p.data.shape:
+                            if (
+                                k in stp
+                                and isinstance(stp[k], torch.Tensor)
+                                and stp[k].shape != p.data.shape
+                            ):
                                 newb = torch.zeros_like(p.data)
                                 rows = min(stp[k].shape[0], newb.shape[0])
                                 if stp[k].ndim == 2 and newb.ndim == 2:
@@ -135,7 +159,16 @@ def load_checkpoint(path, model, opt, map_location=None, ema=None):
 
 
 @torch.no_grad()
-def _quick_eval(model: CLModel, gen: EpisodeGenerator, tok: HFTokenizerWrapper, device: str, batch_size: int, eval_batches: int, max_len: int, num_numbers: int) -> float:
+def _quick_eval(
+    model: CLModel,
+    gen: EpisodeGenerator,
+    tok: HFTokenizerWrapper,
+    device: str,
+    batch_size: int,
+    eval_batches: int,
+    max_len: int,
+    num_numbers: int,
+) -> float:
     model.eval()
     total, correct = 0, 0
     for _ in range(eval_batches):
@@ -152,9 +185,9 @@ def _quick_eval(model: CLModel, gen: EpisodeGenerator, tok: HFTokenizerWrapper, 
     return correct / max(1, total)
 
 
-
-
-def _pack_text_batch(texts: List[str], tok: HFTokenizerWrapper, max_len: int, device: str):
+def _pack_text_batch(
+    texts: List[str], tok: HFTokenizerWrapper, max_len: int, device: str
+):
     B = len(texts)
     ids = torch.zeros(B, max_len, dtype=torch.long, device=device)
     mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
@@ -190,6 +223,7 @@ def _pair_templates(a: int, b: int, r: int) -> List[str]:
 
 def _pack_pair_questions_text(batch, tok: HFTokenizerWrapper, max_len: int):
     import random
+
     a = batch["a_idx"].tolist()
     b = batch["b_idx"].tolist()
     r = batch["rel"].tolist()
@@ -203,33 +237,76 @@ def _pack_pair_questions_text(batch, tok: HFTokenizerWrapper, max_len: int):
 
 def _pack_count_examples_text(kind, a, c, tok: HFTokenizerWrapper, max_len: int):
     import random
-    kind_l = kind.tolist(); a_l = a.tolist(); c_l = c.tolist()
+
+    kind_l = kind.tolist()
+    a_l = a.tolist()
+    c_l = c.tolist()
     texts = []
     for k, ai, ci in zip(kind_l, a_l, c_l):
         if k == 0:
-            texts.append(random.choice([f"What comes after {ai}?", f"What is the successor of {ai}?", f"Next number after {ai}?"]))
+            texts.append(
+                random.choice(
+                    [
+                        f"What comes after {ai}?",
+                        f"What is the successor of {ai}?",
+                        f"Next number after {ai}?",
+                    ]
+                )
+            )
         elif k == 1:
-            texts.append(random.choice([f"What comes before {ai}?", f"What is the predecessor of {ai}?", f"Previous number before {ai}?",
-            ]))
+            texts.append(
+                random.choice(
+                    [
+                        f"What comes before {ai}?",
+                        f"What is the predecessor of {ai}?",
+                        f"Previous number before {ai}?",
+                    ]
+                )
+            )
         else:
-            texts.append(random.choice([f"What number comes between {ai} and {ci}?", f"Between {ai} and {ci}, which number comes in between?"]))
+            texts.append(
+                random.choice(
+                    [
+                        f"What number comes between {ai} and {ci}?",
+                        f"Between {ai} and {ci}, which number comes in between?",
+                    ]
+                )
+            )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return _pack_text_batch(texts, tok, max_len, device)
 
 
-def _pack_equality_examples_text(a: torch.Tensor, kind: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
+def _pack_equality_examples_text(
+    a: torch.Tensor, kind: torch.Tensor, tok: HFTokenizerWrapper, max_len: int
+):
     import random
-    a_l = a.tolist(); k_l = kind.tolist()
+
+    a_l = a.tolist()
+    k_l = kind.tolist()
     texts = []
     for ai, ki in zip(a_l, k_l):
         if ki == 0:
             rhs = ai + 1
-            texts.append(random.choice([f"Is the successor of {ai} equal to {rhs}?", f"Is next of {ai} = {ai} + 1?", f"Does {ai} + 1 equal the successor of {ai}?",
-            ]))
+            texts.append(
+                random.choice(
+                    [
+                        f"Is the successor of {ai} equal to {rhs}?",
+                        f"Is next of {ai} = {ai} + 1?",
+                        f"Does {ai} + 1 equal the successor of {ai}?",
+                    ]
+                )
+            )
         else:
             rhs = ai - 1
-            texts.append(random.choice([f"Is the predecessor of {ai} equal to {rhs}?", f"Is previous of {ai} = {ai} - 1?", f"Does {ai} - 1 equal the predecessor of {ai}?",
-            ]))
+            texts.append(
+                random.choice(
+                    [
+                        f"Is the predecessor of {ai} equal to {rhs}?",
+                        f"Is previous of {ai} = {ai} - 1?",
+                        f"Does {ai} - 1 equal the predecessor of {ai}?",
+                    ]
+                )
+            )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     ids, mask = _pack_text_batch(texts, tok, max_len, device)
     y = torch.ones(len(texts), dtype=torch.long, device=device)  # all true
@@ -276,7 +353,10 @@ class ExponentialMovingAverage:
         self.backup = {}
 
     def state_dict(self) -> dict:
-        return {"decay": self.decay, "shadow": {k: v.clone().cpu() for k, v in self.shadow.items()}}
+        return {
+            "decay": self.decay,
+            "shadow": {k: v.clone().cpu() for k, v in self.shadow.items()},
+        }
 
     def load_state_dict(self, state: dict):
         self.decay = float(state.get("decay", self.decay))
@@ -316,12 +396,41 @@ def train(args):
         pad_id=0,
         cls_id=1,
         max_len=args.max_len,
+        vq_dim=args.vq_dim,
+        vq_codebook_size=args.vq_codebook_size,
+        vq_num_quantizers=(args.parallel_heads + args.serial_heads),
+        vq_num_parallel_heads=args.parallel_heads,
+        vq_serial_codebook_size=args.serial_codebook_size,
+        vq_commitment_weight=args.vq_commitment_weight,
+        vq_pre_vq_noise_std=args.pre_vq_noise_std,
+        vq_orth_weight=args.vq_orth_weight,
+        vq_entropy_weight=args.vq_entropy_weight,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # opt = torch.optim.AdamW(
+    #     model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    # )
+
+    decay, no_decay = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if n.endswith(".bias") or "norm" in n.lower() or "codebook" in n.lower():
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    opt = torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": args.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=args.lr,
+    )
 
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
-        start_step = load_checkpoint(args.resume, model, opt, map_location=device, ema=None)
+        start_step = load_checkpoint(
+            args.resume, model, opt, map_location=device, ema=None
+        )
         print(f"Resumed from {args.resume} at step {start_step}")
         # initialize best_acc from checkpoint if present; else from a quick eval
         ckpt_best = getattr(load_checkpoint, "last_best_acc", None)
@@ -371,7 +480,12 @@ def train(args):
     plateau_scheduler = None
     if args.sched == "plateau":
         plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            opt, mode="max", factor=args.plateau_factor, patience=args.plateau_patience, min_lr=args.min_lr, threshold=1e-4
+            opt,
+            mode="max",
+            factor=args.plateau_factor,
+            patience=args.plateau_patience,
+            min_lr=args.min_lr,
+            threshold=1e-4,
         )
 
     best_acc = -1.0 if not (args.resume and os.path.isfile(args.resume)) else best_acc
@@ -382,7 +496,11 @@ def train(args):
             set_cosine_lr(step)
         if args.overfit_batch is not None and step == start_step:
             cached = gen.sample_posneg_pairs(batch=args.overfit_batch)
-        batch = cached if args.overfit_batch is not None else gen.sample_posneg_pairs(batch=args.batch_size)
+        batch = (
+            cached
+            if args.overfit_batch is not None
+            else gen.sample_posneg_pairs(batch=args.batch_size)
+        )
         # natural-language pair questions
         ids_pairs, mask_pairs = _pack_pair_questions_text(batch, tok, max_len=seq_len)
         y_pairs_bin = batch["label"].to(device)
@@ -413,10 +531,66 @@ def train(args):
         y = torch.cat([y_pairs, y_eq, y_cnt], dim=0)
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
 
-        loss_seq = torch.nn.functional.cross_entropy(logits_seq, y, label_smoothing=args.label_smoothing)
-        stop_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-            stop_logits, torch.zeros_like(stop_logits)
+        loss_seq = torch.nn.functional.cross_entropy(
+            logits_seq, y, label_smoothing=args.label_smoothing
         )
+
+        # Build stop targets per-example using simple heuristics from episode metadata
+        max_steps = getattr(model.reasoner, "max_steps", 1)
+        Btot = ids.size(0)
+        stop_targets = torch.zeros(Btot, max_steps, device=device)
+        stop_mask = torch.zeros(Btot, max_steps, device=device)
+
+        # mapping for relations (pairs)
+        rel_steps_map = {
+            0: 2,  # same_parity -> compare parity of two numbers
+            1: 1,  # successor
+            2: 1,  # predecessor
+            3: 1,  # add_2
+            4: 2,  # same_tens
+            5: 2,  # same_ones
+            6: 2,  # makes_ten
+            7: 2,  # greater
+            8: 2,  # smaller
+        }
+        rel = batch.get("rel")
+        if rel is not None:
+            steps_pairs = torch.tensor([rel_steps_map[int(r.item())] for r in rel], device=device)
+        else:
+            steps_pairs = torch.ones(ids_pairs.size(0), dtype=torch.long, device=device)
+        # equality statements -> 1 step
+        steps_eq = torch.ones(ids_eq.size(0), dtype=torch.long, device=device)
+        # counting mapping: successor/pred=1, between=2
+        steps_cnt = torch.ones(ids_cnt.size(0), dtype=torch.long, device=device)
+        if "kind" in data_cnt:
+            steps_cnt = torch.where(
+                data_cnt["kind"].to(device) == 2,
+                torch.tensor(2, device=device),
+                torch.tensor(1, device=device),
+            )
+
+        # assign into targets/mask for concatenated batch
+        off_pairs = 0
+        off_eq = ids_pairs.size(0)
+        off_cnt = ids_pairs.size(0) + ids_eq.size(0)
+        for i, s in enumerate(steps_pairs.tolist()):
+            s = int(max(1, min(s, max_steps)))
+            stop_targets[off_pairs + i, s - 1] = 1.0
+            stop_mask[off_pairs + i, :s] = 1.0
+        for i, s in enumerate(steps_eq.tolist()):
+            s = int(max(1, min(s, max_steps)))
+            stop_targets[off_eq + i, s - 1] = 1.0
+            stop_mask[off_eq + i, :s] = 1.0
+        for i, s in enumerate(steps_cnt.tolist()):
+            s = int(max(1, min(s, max_steps)))
+            stop_targets[off_cnt + i, s - 1] = 1.0
+            stop_mask[off_cnt + i, :s] = 1.0
+
+        # masked BCE across valid steps only
+        stop_per = torch.nn.functional.binary_cross_entropy_with_logits(
+            stop_logits, stop_targets, reduction="none"
+        )
+        stop_loss = (stop_per * stop_mask).sum() / stop_mask.sum().clamp_min(1.0)
         loss = loss_seq + args.lambda_vq * vq_loss + args.lambda_stop * stop_loss
 
         opt.zero_grad(set_to_none=True)
@@ -434,11 +608,15 @@ def train(args):
             # VQ usage (unique codes per quantizer / codebook_size)
             vq_util = None
             try:
-                used = []
-                for idx_t in indices:
-                    used.append(len(torch.unique(idx_t)))
-                used_avg = sum(used) / max(1, len(used))
-                vq_util = used_avg / max(1, getattr(model.rvq, "codebook_size", used_avg))
+                ks = [model.rvq.codebook_size] * int(args.parallel_heads) + [
+                    model.rvq.serial_codebook_size
+                ] * int(args.serial_heads)
+                utils = []
+                for idx_t, K in zip(indices, ks):
+                    u = len(torch.unique(idx_t)) / max(1, K)
+                    utils.append(float(u))
+                if len(utils) > 0:
+                    vq_util = float(sum(utils) / len(utils))
             except Exception:
                 vq_util = None
 
@@ -481,22 +659,36 @@ def train(args):
             cur_lr = opt.param_groups[0]["lr"]
             extra = f" vq_util={vq_util:.3f}" if vq_util is not None else ""
             print(
-                f"step {step+1}/{args.steps} loss={loss.item():.4f} seq={loss_seq.item():.4f} "
+                f"step {step + 1}/{args.steps} loss={loss.item():.4f} seq={loss_seq.item():.4f} "
                 f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}{extra}"
             )
             if args.save_dir and val_acc > best_acc:
                 best_acc = val_acc
                 best_path = os.path.join(args.save_dir, "best.pt")
                 ema_state = ema.state_dict() if ema is not None else None
-                save_checkpoint(best_path, model, opt, step + 1, best_acc=val_acc, ema_state=ema_state)
+                save_checkpoint(
+                    best_path,
+                    model,
+                    opt,
+                    step + 1,
+                    best_acc=val_acc,
+                    ema_state=ema_state,
+                )
                 print(f"  Saved best checkpoint: {best_path} (val_acc={val_acc:.3f})")
 
         if args.save_dir and (step + 1) % args.ckpt_every == 0:
-            ckpt_path = os.path.join(args.save_dir, f"ckpt_step_{step+1}.pt")
+            ckpt_path = os.path.join(args.save_dir, f"ckpt_step_{step + 1}.pt")
             ema_state = ema.state_dict() if ema is not None else None
             save_checkpoint(ckpt_path, model, opt, step + 1, ema_state=ema_state)
             latest = os.path.join(args.save_dir, "latest.pt")
-            save_checkpoint(latest, model, opt, step + 1, best_acc=best_acc if best_acc >= 0 else None, ema_state=ema_state)
+            save_checkpoint(
+                latest,
+                model,
+                opt,
+                step + 1,
+                best_acc=best_acc if best_acc >= 0 else None,
+                ema_state=ema_state,
+            )
 
 
 @torch.no_grad()
@@ -554,7 +746,7 @@ def evaluate(args):
         total += y.numel()
         # accumulate per-relation
         for r in range(9):
-            sel = (rel == r)
+            sel = rel == r
             if sel.any():
                 rel_tot[r] += int(sel.sum().item())
                 rel_hit[r] += int((pred[sel] == y[sel]).sum().item())
@@ -584,12 +776,13 @@ def evaluate(args):
     for r, name in enumerate(names):
         tot, hit = rel_tot[r], rel_hit[r]
         if tot > 0:
-            print(f"  {name:12s}: {hit}/{tot} = {hit/max(1,tot):.3f}")
+            print(f"  {name:12s}: {hit}/{tot} = {hit / max(1, tot):.3f}")
         else:
             print(f"  {name:12s}: (no samples)")
 
     # Calibration / threshold sweep
     import torch as _t
+
     probs_all = _t.cat(all_probs)
     labels_all = _t.cat(all_labels)
     for thr in [0.4, 0.5, 0.6]:
@@ -602,7 +795,9 @@ def evaluate(args):
         acc_thr = ((probs_all >= thr).long() == labels_all).float().mean().item()
         if acc_thr > best_acc:
             best_acc, best_thr = acc_thr, thr
-    print(f"Best fixed-threshold acc in [0.35,0.65]: {best_acc:.3f} at thr={best_thr:.2f}")
+    print(
+        f"Best fixed-threshold acc in [0.35,0.65]: {best_acc:.3f} at thr={best_thr:.2f}"
+    )
 
     # Error slices near boundary for greater/smaller (|a-b| <= 1)
     a_all = _t.cat(all_a)
@@ -611,16 +806,20 @@ def evaluate(args):
     pred_all = (probs_all >= 0.5).long()
     eq_diff = (a_all - b_all).abs()
     for r, name in [(7, "greater"), (8, "smaller")]:
-        sel = (rel_all == r)
+        sel = rel_all == r
         if sel.any():
             close = sel & (eq_diff <= 1)
             far = sel & (eq_diff > 1)
             if close.any():
                 acc_close = (pred_all[close] == labels_all[close]).float().mean().item()
-                print(f"{name} close (|a-b|<=1): {int(close.sum())} ex, acc={acc_close:.3f}")
+                print(
+                    f"{name} close (|a-b|<=1): {int(close.sum())} ex, acc={acc_close:.3f}"
+                )
             if far.any():
                 acc_far = (pred_all[far] == labels_all[far]).float().mean().item()
-                print(f"{name} far   (|a-b|>1):  {int(far.sum())} ex, acc={acc_far:.3f}")
+                print(
+                    f"{name} far   (|a-b|>1):  {int(far.sum())} ex, acc={acc_far:.3f}"
+                )
 
     # Print a few sample predictions with questions and answers
     batch = gen.sample_posneg_pairs(batch=4)
@@ -676,21 +875,28 @@ def evaluate(args):
         q = make_question(a_idx[i], b_idx[i], rel[i])
         gold = "yes" if y[i] == 1 else "no"
         pred = "yes" if p >= 0.5 else "no"
-        print(f"  Q: {q}\n     gold={gold} pred={pred} p(yes)={p:.3f} rel={rel_name(rel[i])}")
+        print(
+            f"  Q: {q}\n     gold={gold} pred={pred} p(yes)={p:.3f} rel={rel_name(rel[i])}"
+        )
 
     # Also show a few equality reformulations using different language
     print("\nSample equality QA (varied phrasing):")
     import random as _r
+
     with torch.no_grad():
         a_eq = torch.randint(0, gen.n_items, (4,), device=device)
         kind_eq = torch.randint(0, 2, (4,), device=device)
-        ids_eq, mask_eq, y_eq = _pack_equality_examples_text(a_eq, kind_eq, tok, max_len=args.max_len)
+        ids_eq, mask_eq, y_eq = _pack_equality_examples_text(
+            a_eq, kind_eq, tok, max_len=args.max_len
+        )
         # use two-class slice {NO, YES}
         num_numbers = ecfg.max_number
         NO_IDX = num_numbers + 1
         YES_IDX = num_numbers
         _, logits_seq_eq, _, _, _, _ = model(ids_eq, mask_eq)
-        probs_eq = torch.softmax(logits_seq_eq[:, [NO_IDX, YES_IDX]], dim=-1)[:, 1].tolist()
+        probs_eq = torch.softmax(logits_seq_eq[:, [NO_IDX, YES_IDX]], dim=-1)[
+            :, 1
+        ].tolist()
         y_eq = y_eq.tolist()
         a_eq_l = a_eq.tolist()
         k_eq_l = kind_eq.tolist()
@@ -702,21 +908,23 @@ def evaluate(args):
                     f"Is the successor of {ai} equal to {ai} + 1?",
                     f"Is next of {ai} = {ai} + 1?",
                     f"Does {ai} + 1 equal the successor of {ai}?",
-                    f"Is the successor of {ai} = {(ai+1)%1000}?",
-                    f"Is next of {ai} equal to {(ai+1)%1000}?",
+                    f"Is the successor of {ai} = {(ai + 1) % 1000}?",
+                    f"Is next of {ai} equal to {(ai + 1) % 1000}?",
                 ]
             else:
                 phr = [
                     f"Is the predecessor of {ai} equal to {ai} - 1?",
                     f"Is previous of {ai} = {ai} - 1?",
                     f"Does {ai} - 1 equal the predecessor of {ai}?",
-                    f"Is the predecessor of {ai} = {(ai-1)%1000}?",
-                    f"Is previous of {ai} equal to {(ai-1)%1000}?",
+                    f"Is the predecessor of {ai} = {(ai - 1) % 1000}?",
+                    f"Is previous of {ai} equal to {(ai - 1) % 1000}?",
                 ]
             qtext = phr[_r.randrange(len(phr))]
             gold = "yes" if y_eq[i] == 1 else "no"
             pred = "yes" if probs_eq[i] >= 0.5 else "no"
-            print(f"  Q: {qtext}\n     gold={gold} pred={pred} p(yes)={probs_eq[i]:.3f}")
+            print(
+                f"  Q: {qtext}\n     gold={gold} pred={pred} p(yes)={probs_eq[i]:.3f}"
+            )
 
     # Counting diagnostics combined in eval
     print("\nCounting evaluation:")
@@ -724,29 +932,47 @@ def evaluate(args):
     with torch.no_grad():
         for _ in range(args.eval_batches):
             dc = gen.sample_counting(batch=min(args.batch_size, 128))
-            ic, mc = _pack_count_examples_text(dc["kind"], dc["a"], dc["c"], tok, max_len=args.max_len)
+            ic, mc = _pack_count_examples_text(
+                dc["kind"], dc["a"], dc["c"], tok, max_len=args.max_len
+            )
             yc = dc["target"].to(device)
             _, lsc, _, _, _, _ = model(ic, mc)
-            predc = lsc[:, :ecfg.max_number].argmax(dim=-1)
+            predc = lsc[:, : ecfg.max_number].argmax(dim=-1)
             hit += (predc == yc).sum().item()
             tot += yc.numel()
-    print(f"Counting eval accuracy: {hit/max(1,tot):.3f}")
+    print(f"Counting eval accuracy: {hit / max(1, tot):.3f}")
     # sample counting QA with variety
     import random as _r
+
     with torch.no_grad():
         dshow = gen.sample_counting(batch=4)
-        ic, mc = _pack_count_examples_text(dshow["kind"], dshow["a"], dshow["c"], tok, max_len=args.max_len)
+        ic, mc = _pack_count_examples_text(
+            dshow["kind"], dshow["a"], dshow["c"], tok, max_len=args.max_len
+        )
         yshow = dshow["target"].tolist()
         _, lss, _, _, _, _ = model(ic, mc)
-        predshow = lss[:, :ecfg.max_number].argmax(dim=-1).tolist()
-        kind = dshow["kind"].tolist(); a = dshow["a"].tolist(); c = dshow["c"].tolist()
+        predshow = lss[:, : ecfg.max_number].argmax(dim=-1).tolist()
+        kind = dshow["kind"].tolist()
+        a = dshow["a"].tolist()
+        c = dshow["c"].tolist()
         for i in range(len(kind)):
             if kind[i] == 0:
-                phr = [f"What is the successor of {a[i]}?", f"What comes after {a[i]}?", f"What number comes after {a[i]}?"]
+                phr = [
+                    f"What is the successor of {a[i]}?",
+                    f"What comes after {a[i]}?",
+                    f"What number comes after {a[i]}?",
+                ]
             elif kind[i] == 1:
-                phr = [f"What is the predecessor of {a[i]}?", f"What comes before {a[i]}?", f"What number comes before {a[i]}?"]
+                phr = [
+                    f"What is the predecessor of {a[i]}?",
+                    f"What comes before {a[i]}?",
+                    f"What number comes before {a[i]}?",
+                ]
             else:
-                phr = [f"What number comes between {a[i]} and {c[i]}?", f"Between {a[i]} and {c[i]}, which number comes in between?"]
+                phr = [
+                    f"What number comes between {a[i]} and {c[i]}?",
+                    f"Between {a[i]} and {c[i]}, which number comes in between?",
+                ]
             q = phr[_r.randrange(len(phr))]
             print(f"  Q: {q}\n     gold={yshow[i]} pred={predshow[i]}")
 
@@ -760,8 +986,8 @@ def main():
         sp.add_argument("--device", type=str, default=None)
         sp.add_argument("--d_model", type=int, default=128)
         sp.add_argument("--max_number", type=int, default=100)
-        sp.add_argument("--max_len", type=int, default=6)
-        sp.add_argument("--min_base", type=int, default=5)
+        sp.add_argument("--max_len", type=int, default=32)
+        sp.add_argument("--min_base", type=int, default=10)
         sp.add_argument("--max_base", type=int, default=10)
         sp.add_argument("--batch_size", type=int, default=64)
 
@@ -771,31 +997,73 @@ def main():
     pt.add_argument("--lr", type=float, default=3e-4)
     pt.add_argument("--weight_decay", type=float, default=0.0)
     pt.add_argument("--label_smoothing", type=float, default=0.0)
-    pt.add_argument("--sched", type=str, default="none", choices=["none", "plateau", "cosine"], help="LR scheduler to use")
+    pt.add_argument(
+        "--sched",
+        type=str,
+        default="none",
+        choices=["none", "plateau", "cosine"],
+        help="LR scheduler to use",
+    )
     pt.add_argument("--min_lr", type=float, default=1e-6)
-    pt.add_argument("--warmup_ratio", type=float, default=0.03, help="Warmup ratio for cosine schedule")
+    pt.add_argument(
+        "--warmup_ratio",
+        type=float,
+        default=0.03,
+        help="Warmup ratio for cosine schedule",
+    )
     pt.add_argument("--plateau_factor", type=float, default=0.5)
     pt.add_argument("--plateau_patience", type=int, default=800)
-    pt.add_argument("--ema_decay", type=float, default=0.0, help="EMA decay (0 to disable)")
+    pt.add_argument(
+        "--ema_decay", type=float, default=0.0, help="EMA decay (0 to disable)"
+    )
+    # VQ architecture knobs
+    pt.add_argument("--parallel_heads", type=int, default=2)
+    pt.add_argument("--serial_heads", type=int, default=1)
+    pt.add_argument("--vq_dim", type=int, default=None)
+    pt.add_argument("--vq_codebook_size", type=int, default=None)
+    pt.add_argument("--serial_codebook_size", type=int, default=None)
+    pt.add_argument("--vq_commitment_weight", type=float, default=None)
+    pt.add_argument("--pre_vq_noise_std", type=float, default=None)
+    pt.add_argument("--vq_orth_weight", type=float, default=None)
+    pt.add_argument("--vq_entropy_weight", type=float, default=None)
     pt.add_argument("--lambda_vq", type=float, default=0.1)
     pt.add_argument("--lambda_stop", type=float, default=0.1)
     pt.add_argument("--save_dir", type=str, default="runs/episodes")
     pt.add_argument("--ckpt_every", type=int, default=200)
     pt.add_argument("--log_every", type=int, default=50)
     pt.add_argument("--resume", type=str, default=None)
-    pt.add_argument("--same_base", action="store_true", help="Render both items with the same base per pair (easier task)")
-    pt.add_argument("--overfit_batch", type=int, default=None, help="Overfit a single cached batch of this size for sanity")
-    pt.add_argument("--base10", action="store_true", help="Force base-10 rendering only (min_base=max_base=10)")
+    pt.add_argument(
+        "--same_base",
+        action="store_true",
+        help="Render both items with the same base per pair (easier task)",
+    )
+    pt.add_argument(
+        "--overfit_batch",
+        type=int,
+        default=None,
+        help="Overfit a single cached batch of this size for sanity",
+    )
+    pt.add_argument(
+        "--base10",
+        action="store_true",
+        help="Force base-10 rendering only (min_base=max_base=10)",
+    )
 
     pe = sub.add_parser("eval", help="Evaluate from a checkpoint")
     add_shared(pe)
     pe.add_argument("--checkpoint", type=str, required=True)
     pe.add_argument("--eval_batches", type=int, default=50)
     pe.add_argument("--same_base", action="store_true")
-    pe.add_argument("--base10", action="store_true", help="Force base-10 rendering only (min_base=max_base=10)")
+    pe.add_argument(
+        "--base10",
+        action="store_true",
+        help="Force base-10 rendering only (min_base=max_base=10)",
+    )
 
     # Counting subcommands (unified CLI)
-    ct = sub.add_parser("count-train", help="Train counting tasks (successor/pred/between)")
+    ct = sub.add_parser(
+        "count-train", help="Train counting tasks (successor/pred/between)"
+    )
     ct.add_argument("--device", type=str, default=None)
     ct.add_argument("--d_model", type=int, default=128)
     ct.add_argument("--steps", type=int, default=5000)
@@ -808,6 +1076,7 @@ def main():
     ct.add_argument("--resume", type=str, default=None)
     ct.add_argument("--max_len", type=int, default=18)
     ct.add_argument("--eval_batches", type=int, default=50)
+    ct.add_argument("--weight_decay", type=float, default=0.0)
 
     ce = sub.add_parser("count-eval", help="Evaluate a counting checkpoint")
     ce.add_argument("--device", type=str, default=None)
@@ -823,11 +1092,39 @@ def main():
         return
     if args.cmd == "count-train":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        ecfg = EpisodeConfig(max_number=args.max_number, device=device, max_len=6, min_base=10, max_base=10)
+        ecfg = EpisodeConfig(
+            max_number=args.max_number,
+            device=device,
+            max_len=6,
+            min_base=10,
+            max_base=10,
+        )
         gen = EpisodeGenerator(ecfg)
         tok = HFTokenizerWrapper("bert-base-cased")
-        model = CLModel(vocab_size=tok.vocab_size, d_model=args.d_model, num_classes=ecfg.max_number, pad_id=0, cls_id=1, max_len=args.max_len).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        model = CLModel(
+            vocab_size=tok.vocab_size,
+            d_model=args.d_model,
+            num_classes=ecfg.max_number,
+            pad_id=0,
+            cls_id=1,
+            max_len=args.max_len,
+        ).to(device)
+        # opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+        decay, no_decay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.endswith(".bias") or "norm" in n.lower() or "codebook" in n.lower():
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        opt = torch.optim.AdamW(
+            [
+                {"params": decay, "weight_decay": args.weight_decay},
+                {"params": no_decay, "weight_decay": 0.0},
+            ],
+            lr=args.lr,
+        )
         start = 0
         if args.resume and os.path.isfile(args.resume):
             start = load_checkpoint(args.resume, model, opt, map_location=device)
@@ -835,7 +1132,9 @@ def main():
         best = -1.0
         for step in range(start, args.steps):
             data = gen.sample_counting(batch=args.batch_size)
-            ids, mask = _pack_count_examples_text(data["kind"], data["a"], data["c"], tok, max_len=args.max_len)
+            ids, mask = _pack_count_examples_text(
+                data["kind"], data["a"], data["c"], tok, max_len=args.max_len
+            )
             y = data["target"].to(device)
             _, logits_seq, vq_loss, _, stop_logits, _ = model(ids, mask)
             loss = torch.nn.functional.cross_entropy(logits_seq, y)
@@ -850,7 +1149,13 @@ def main():
                 with torch.no_grad():
                     for _ in range(args.eval_batches):
                         data2 = gen.sample_counting(batch=min(args.batch_size, 128))
-                        ids2, mask2 = _pack_count_examples_text(data2["kind"], data2["a"], data2["c"], tok, max_len=args.max_len)
+                        ids2, mask2 = _pack_count_examples_text(
+                            data2["kind"],
+                            data2["a"],
+                            data2["c"],
+                            tok,
+                            max_len=args.max_len,
+                        )
                         y2 = data2["target"].to(device)
                         _, logits_seq2, _, _, _, _ = model(ids2, mask2)
                         pred2 = logits_seq2.argmax(dim=-1)
@@ -858,22 +1163,48 @@ def main():
                         tot += y2.numel()
                 model.train()
                 val_acc = hit / max(1, tot)
-                print(f"step {step+1}/{args.steps} loss={loss.item():.4f} val_acc={val_acc:.3f}")
+                print(
+                    f"step {step + 1}/{args.steps} loss={loss.item():.4f} val_acc={val_acc:.3f}"
+                )
                 if val_acc > best and args.save_dir:
                     best = val_acc
                     os.makedirs(args.save_dir, exist_ok=True)
-                    save_checkpoint(os.path.join(args.save_dir, "best.pt"), model, opt, step + 1)
-                    print(f"  Saved best checkpoint: {os.path.join(args.save_dir, 'best.pt')} (val_acc={val_acc:.3f})")
+                    save_checkpoint(
+                        os.path.join(args.save_dir, "best.pt"), model, opt, step + 1
+                    )
+                    print(
+                        f"  Saved best checkpoint: {os.path.join(args.save_dir, 'best.pt')} (val_acc={val_acc:.3f})"
+                    )
             if args.save_dir and (step + 1) % args.ckpt_every == 0:
-                save_checkpoint(os.path.join(args.save_dir, f"ckpt_step_{step+1}.pt"), model, opt, step + 1)
-                save_checkpoint(os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1)
+                save_checkpoint(
+                    os.path.join(args.save_dir, f"ckpt_step_{step + 1}.pt"),
+                    model,
+                    opt,
+                    step + 1,
+                )
+                save_checkpoint(
+                    os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1
+                )
         return
     if args.cmd == "count-eval":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-        ecfg = EpisodeConfig(max_number=args.max_number, device=device, max_len=6, min_base=10, max_base=10)
+        ecfg = EpisodeConfig(
+            max_number=args.max_number,
+            device=device,
+            max_len=6,
+            min_base=10,
+            max_base=10,
+        )
         gen = EpisodeGenerator(ecfg)
         tok = HFTokenizerWrapper("bert-base-cased")
-        model = CLModel(vocab_size=tok.vocab_size, d_model=args.d_model, num_classes=ecfg.max_number, pad_id=0, cls_id=1, max_len=args.max_len).to(device)
+        model = CLModel(
+            vocab_size=tok.vocab_size,
+            d_model=args.d_model,
+            num_classes=ecfg.max_number,
+            pad_id=0,
+            cls_id=1,
+            max_len=args.max_len,
+        ).to(device)
         load_checkpoint(args.checkpoint, model, opt=None, map_location=device)
         model.eval()
         # eval
@@ -881,18 +1212,23 @@ def main():
         with torch.no_grad():
             for _ in range(args.eval_batches):
                 data2 = gen.sample_counting(batch=min(256, 128))
-                ids2, mask2 = _pack_count_examples_text(data2["kind"], data2["a"], data2["c"], tok, max_len=args.max_len)
+                ids2, mask2 = _pack_count_examples_text(
+                    data2["kind"], data2["a"], data2["c"], tok, max_len=args.max_len
+                )
                 y2 = data2["target"].to(device)
                 _, logits_seq2, _, _, _, _ = model(ids2, mask2)
                 pred2 = logits_seq2.argmax(dim=-1)
                 hit += (pred2 == y2).sum().item()
                 tot += y2.numel()
-        print(f"Counting eval accuracy: {hit/max(1,tot):.3f}")
+        print(f"Counting eval accuracy: {hit / max(1, tot):.3f}")
         # sample questions
         import random as _r
+
         with torch.no_grad():
             data = gen.sample_counting(batch=6)
-            ids, mask = _pack_count_examples_text(data["kind"], data["a"], data["c"], tok, max_len=args.max_len)
+            ids, mask = _pack_count_examples_text(
+                data["kind"], data["a"], data["c"], tok, max_len=args.max_len
+            )
             y = data["target"].tolist()
             _, logits_seq, _, _, _, _ = model(ids, mask)
             pred = logits_seq.argmax(dim=-1).tolist()

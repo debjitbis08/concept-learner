@@ -16,6 +16,16 @@ class CLModel(nn.Module):
         pad_id: int = 0,
         cls_id: int = 1,
         max_len: int = 128,
+        # VQ configuration (optional overrides)
+        vq_dim: int | None = None,
+        vq_codebook_size: int | None = None,
+        vq_num_quantizers: int | None = None,
+        vq_num_parallel_heads: int | None = None,
+        vq_serial_codebook_size: int | None = None,
+        vq_commitment_weight: float | None = None,
+        vq_pre_vq_noise_std: float | None = None,
+        vq_orth_weight: float | None = None,
+        vq_entropy_weight: float | None = None,
     ):
         super().__init__()
         self.enc = TinyEncoder(
@@ -27,18 +37,29 @@ class CLModel(nn.Module):
                 cls_id=cls_id,
             )
         )
+        # Defaults
+        _rvq_dim = 48 if vq_dim is None else int(vq_dim)
+        _codebook = 16 if vq_codebook_size is None else int(vq_codebook_size)
+        _num_q = 3 if vq_num_quantizers is None else int(vq_num_quantizers)
+        _num_ph = 2 if vq_num_parallel_heads is None else int(vq_num_parallel_heads)
+        _serial_codebook = 8 if vq_serial_codebook_size is None else int(vq_serial_codebook_size)
+        _commit_w = 0.45 if vq_commitment_weight is None else float(vq_commitment_weight)
+        _noise_std = 0.07 if vq_pre_vq_noise_std is None else float(vq_pre_vq_noise_std)
+        _orth_w = 1e-4 if vq_orth_weight is None else float(vq_orth_weight)
+        _ent_w = 0.0 if vq_entropy_weight is None else float(vq_entropy_weight)
+
         self.rvq = ResidualVQLayer(
             in_dim=d_model,
-            rvq_dim=48,
-            codebook_size=16,
-            num_quantizers=3,
-            num_parallel_heads=2,
-            serial_codebook_size=8,
-            commitment_weight=0.45,
-            pre_vq_noise_std=0.07,
-            orth_weight=1e-4,  # keep tiny
-            entropy_weight=0.0,  # off for now
-            use_cosine_sim=True,  # pass via your allowed kwargs
+            rvq_dim=_rvq_dim,
+            codebook_size=_codebook,
+            num_quantizers=_num_q,
+            num_parallel_heads=_num_ph,
+            serial_codebook_size=_serial_codebook,
+            commitment_weight=_commit_w,
+            pre_vq_noise_std=_noise_std,
+            orth_weight=_orth_w,
+            entropy_weight=_ent_w,
+            use_cosine_sim=True,  # pass via allowed kwargs
             kmeans_init=True,
             kmeans_iters=10,
             threshold_ema_dead_code=2,
@@ -75,8 +96,12 @@ class FiLM(nn.Module):
         super().__init__()
         self.to_gamma = nn.Linear(d, d)
         self.to_beta = nn.Linear(d, d)
+        nn.init.zeros_(self.to_gamma.weight)
+        nn.init.zeros_(self.to_gamma.bias)
+        nn.init.zeros_(self.to_beta.weight)
+        nn.init.zeros_(self.to_beta.bias)
 
-    def forward(self, H, z):
+    def forward(self, H: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         gamma = self.to_gamma(z).unsqueeze(1)
         beta = self.to_beta(z).unsqueeze(1)
         return H * (1 + gamma) + beta

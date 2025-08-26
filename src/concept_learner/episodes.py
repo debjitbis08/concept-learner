@@ -566,10 +566,17 @@ class EpisodeGenerator:
             elif k == 1:  # predecessor
                 y[i] = (ai - 1) % N
             else:  # between
-                # choose c = a + 2 within range; wrap if needed
-                ci = (ai + 2) % N
-                c[i] = ci
-                y[i] = (ai + 1) % N
+                # choose contiguous triple (a, a+1, a+2) without wrap-around
+                if N >= 3:
+                    ai = int(torch.randint(0, N - 2, (1,), device=device).item())
+                    a[i] = ai
+                    c[i] = ai + 2
+                    y[i] = ai + 1
+                else:
+                    # degenerate small-N fallback: keep modulo behavior
+                    ci = (ai + 2) % N
+                    c[i] = ci
+                    y[i] = (ai + 1) % N
         return {
             "kind": kind,  # 0 succ, 1 pred, 2 between
             "a": a,
