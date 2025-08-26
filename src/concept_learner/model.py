@@ -29,14 +29,18 @@ class CLModel(nn.Module):
         )
         self.rvq = ResidualVQLayer(
             in_dim=d_model,
-            rvq_dim=64,
-            codebook_size=24,
+            rvq_dim=48,
+            codebook_size=16,
             num_quantizers=3,
-            decay=0.99,
-            commitment_weight=0.25,
+            num_parallel_heads=2,
+            serial_codebook_size=8,
+            commitment_weight=0.45,
+            pre_vq_noise_std=0.07,
+            orth_weight=1e-4,  # keep tiny
+            entropy_weight=0.0,  # off for now
+            use_cosine_sim=True,  # pass via your allowed kwargs
             kmeans_init=True,
-            kmeans_iters=4,
-            use_cosine_sim=True,
+            kmeans_iters=10,
             threshold_ema_dead_code=2,
         )
         self.head = nn.Linear(

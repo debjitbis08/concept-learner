@@ -31,7 +31,7 @@ class ResidualVQLayer(nn.Module):
         num_parallel_heads: int | None = None,
         serial_codebook_size: int | None = None,
         commitment_weight: float = 0.25,
-        pre_vq_noise_std: float = 0.0,
+        pre_vq_noise_std: float = 0.05,
         orth_weight: float = 0.0,
         entropy_weight: float = 0.0,
         # Unused legacy kwargs accepted for compatibility
@@ -80,6 +80,7 @@ class ResidualVQLayer(nn.Module):
                 VectorQuantize(
                     dim=d,
                     codebook_size=self.codebook_size,
+                    commitment_weight=self.commitment_weight,
                     **self._vq_kwargs,
                 )
                 for d in head_dims
@@ -100,6 +101,7 @@ class ResidualVQLayer(nn.Module):
             vq = VectorQuantize(
                 dim=concat_dim,
                 codebook_size=self.serial_codebook_size,
+                commitment_weight=self.commitment_weight,
                 **self._vq_kwargs,
             )
             serial_modules.append(nn.ModuleDict({"mlp": mlp, "vq": vq}))
@@ -110,30 +112,32 @@ class ResidualVQLayer(nn.Module):
         final_in_dim = concat_dim * (1 + self.num_serial)
         self.proj_out = nn.Linear(final_in_dim, out_dim)
 
-    def _entropy_bonus(
-        self, indices_list: list[torch.Tensor], K_list: list[int]
-    ) -> torch.Tensor:
+    def _entropy_bonus(self, indices_list, K_list) -> torch.Tensor:
         if self.entropy_weight <= 0:
             return torch.tensor(0.0, device=indices_list[0].device)
+        H_target = 0.7 * torch.log(
+            torch.tensor(float(max(K_list)), device=indices_list[0].device)
+        )
         bonus = 0.0
         for idx, K in zip(indices_list, K_list):
-            # idx: (B, L) or (B,)
             hist = torch.bincount(idx.view(-1), minlength=K).float()
             p = hist / (hist.sum() + 1e-8)
             ent = -(p * (p + 1e-8).log()).sum()
-            bonus = bonus + ent
-        return -self.entropy_weight * bonus  # negative to reduce loss when entropy high
+            over = (ent - H_target).clamp(min=0)
+            bonus = bonus + over * over
+        return self.entropy_weight * bonus
 
     def _orth_penalty(self) -> torch.Tensor:
         if self.orth_weight <= 0 or self.num_parallel_heads < 2:
             return torch.tensor(0.0, device=self.parallel_proj[0].weight.device)
-        # Encourage diversity between projection matrices
         pen = 0.0
         for i in range(self.num_parallel_heads):
             for j in range(i + 1, self.num_parallel_heads):
-                Pi = self.parallel_proj[i].weight  # (d_i, in_dim)
-                Pj = self.parallel_proj[j].weight  # (d_j, in_dim)
-                C = Pi @ Pj.t()  # (d_i, d_j)
+                Pi = self.parallel_proj[i].weight
+                Pj = self.parallel_proj[j].weight
+                Pi = Pi / (Pi.norm(dim=1, keepdim=True) + 1e-8)
+                Pj = Pj / (Pj.norm(dim=1, keepdim=True) + 1e-8)
+                C = Pi @ Pj.t()
                 pen = pen + (C**2).sum()
         return self.orth_weight * pen
 
