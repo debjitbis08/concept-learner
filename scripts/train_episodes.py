@@ -1,5 +1,6 @@
 import argparse
 import os
+import math
 import torch
 from typing import List
 from concept_learner.episodes import EpisodeConfig, EpisodeGenerator
@@ -34,19 +35,22 @@ def _pack_pairs(a_desc, a_mask, b_desc, b_mask, device):
     return ids, mask
 
 
-def save_checkpoint(path, model, opt, step, best_acc: float | None = None):
+def save_checkpoint(path, model, opt, step, best_acc: float | None = None, ema_state: dict | None = None):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step}
     if best_acc is not None:
         payload["best_acc"] = float(best_acc)
+    if ema_state is not None:
+        payload["ema"] = ema_state
     torch.save(payload, path)
 
 
-def load_checkpoint(path, model, opt, map_location=None):
+def load_checkpoint(path, model, opt, map_location=None, ema=None):
     ckpt = torch.load(path, map_location=map_location)
     sd = ckpt["model"]
     # expose best_acc to callers for resume logic
     load_checkpoint.last_best_acc = ckpt.get("best_acc", None)
+    load_checkpoint.loaded_ema = False
     try:
         model.load_state_dict(sd)
     except RuntimeError as e:
@@ -120,6 +124,13 @@ def load_checkpoint(path, model, opt, map_location=None):
                 pass
         except Exception:
             pass
+    # optionally restore EMA state
+    try:
+        if ema is not None and isinstance(ckpt.get("ema"), dict):
+            ema.load_state_dict(ckpt["ema"])
+            load_checkpoint.loaded_ema = True
+    except Exception:
+        pass
     return int(ckpt.get("step", 0))
 
 
@@ -225,6 +236,60 @@ def _pack_equality_examples_text(a: torch.Tensor, kind: torch.Tensor, tok: HFTok
     return ids, mask, y
 
 
+class ExponentialMovingAverage:
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999):
+        self.decay = float(decay)
+        self.shadow = {}
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        d = self.decay
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name not in self.shadow:
+                self.shadow[name] = param.detach().clone()
+            new_avg = (1.0 - d) * param.detach() + d * self.shadow[name]
+            self.shadow[name] = new_avg
+
+    def store(self, model: torch.nn.Module):
+        self.backup = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.backup[name] = param.detach().clone()
+
+    @torch.no_grad()
+    def copy_to(self, model: torch.nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                param.data.copy_(self.shadow[name].data)
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name].data)
+        self.backup = {}
+
+    def state_dict(self) -> dict:
+        return {"decay": self.decay, "shadow": {k: v.clone().cpu() for k, v in self.shadow.items()}}
+
+    def load_state_dict(self, state: dict):
+        self.decay = float(state.get("decay", self.decay))
+        shadow = state.get("shadow", {})
+        self.shadow = {k: v.clone() for k, v in shadow.items()}
+
+    def reset(self, model: torch.nn.Module):
+        self.shadow = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.detach().clone()
+
+
 def train(args):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     min_base = 10 if getattr(args, "base10", False) else args.min_base
@@ -252,11 +317,11 @@ def train(args):
         cls_id=1,
         max_len=args.max_len,
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
-        start_step = load_checkpoint(args.resume, model, opt, map_location=device)
+        start_step = load_checkpoint(args.resume, model, opt, map_location=device, ema=None)
         print(f"Resumed from {args.resume} at step {start_step}")
         # initialize best_acc from checkpoint if present; else from a quick eval
         ckpt_best = getattr(load_checkpoint, "last_best_acc", None)
@@ -276,10 +341,45 @@ def train(args):
             )
             print(f"Computed baseline val_acc after resume: {best_acc:.3f}")
 
+    # optional EMA of parameters
+    ema = None
+    if getattr(args, "ema_decay", 0.0) and args.ema_decay > 0.0:
+        ema = ExponentialMovingAverage(model, decay=args.ema_decay)
+        if args.resume and os.path.isfile(args.resume):
+            try:
+                ck = torch.load(args.resume, map_location=device)
+                if isinstance(ck.get("ema"), dict):
+                    ema.load_state_dict(ck["ema"])
+                else:
+                    ema.reset(model)
+            except Exception:
+                ema.reset(model)
+
+    # schedulers
+    def set_cosine_lr(step_idx: int):
+        warmup = max(1, int(args.steps * args.warmup_ratio))
+        if step_idx < warmup:
+            lr = args.lr * float(step_idx + 1) / float(warmup)
+        else:
+            t = (step_idx - warmup) / max(1.0, (args.steps - warmup))
+            t = min(max(t, 0.0), 1.0)
+            cos_factor = 0.5 * (1.0 + math.cos(math.pi * t))
+            lr = args.min_lr + (args.lr - args.min_lr) * cos_factor
+        for g in opt.param_groups:
+            g["lr"] = lr
+
+    plateau_scheduler = None
+    if args.sched == "plateau":
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode="max", factor=args.plateau_factor, patience=args.plateau_patience, min_lr=args.min_lr, threshold=1e-4
+        )
+
     best_acc = -1.0 if not (args.resume and os.path.isfile(args.resume)) else best_acc
     model.train()
     seq_len = args.max_len
     for step in range(start_step, args.steps):
+        if args.sched == "cosine":
+            set_cosine_lr(step)
         if args.overfit_batch is not None and step == start_step:
             cached = gen.sample_posneg_pairs(batch=args.overfit_batch)
         batch = cached if args.overfit_batch is not None else gen.sample_posneg_pairs(batch=args.batch_size)
@@ -313,7 +413,7 @@ def train(args):
         y = torch.cat([y_pairs, y_eq, y_cnt], dim=0)
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
 
-        loss_seq = torch.nn.functional.cross_entropy(logits_seq, y)
+        loss_seq = torch.nn.functional.cross_entropy(logits_seq, y, label_smoothing=args.label_smoothing)
         stop_loss = torch.nn.functional.binary_cross_entropy_with_logits(
             stop_logits, torch.zeros_like(stop_logits)
         )
@@ -323,6 +423,8 @@ def train(args):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
+        if ema is not None:
+            ema.update(model)
 
         if (step + 1) % args.log_every == 0:
             with torch.no_grad():
@@ -340,6 +442,11 @@ def train(args):
             except Exception:
                 vq_util = None
 
+            # if EMA is enabled, evaluate with EMA weights
+            _using_ema = ema is not None
+            if _using_ema:
+                ema.store(model)
+                ema.copy_to(model)
             val_acc_pair = _quick_eval(
                 model,
                 gen,
@@ -365,24 +472,31 @@ def train(args):
                     hit += (pred2 == y2).sum().item()
                     tot += y2.numel()
             model.train()
+            if _using_ema:
+                ema.restore(model)
             val_acc_cnt = hit / max(1, tot)
             val_acc = 0.5 * (val_acc_pair + val_acc_cnt)
+            if plateau_scheduler is not None:
+                plateau_scheduler.step(val_acc)
+            cur_lr = opt.param_groups[0]["lr"]
             extra = f" vq_util={vq_util:.3f}" if vq_util is not None else ""
             print(
                 f"step {step+1}/{args.steps} loss={loss.item():.4f} seq={loss_seq.item():.4f} "
-                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f}{extra}"
+                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}{extra}"
             )
             if args.save_dir and val_acc > best_acc:
                 best_acc = val_acc
                 best_path = os.path.join(args.save_dir, "best.pt")
-                save_checkpoint(best_path, model, opt, step + 1, best_acc=val_acc)
+                ema_state = ema.state_dict() if ema is not None else None
+                save_checkpoint(best_path, model, opt, step + 1, best_acc=val_acc, ema_state=ema_state)
                 print(f"  Saved best checkpoint: {best_path} (val_acc={val_acc:.3f})")
 
         if args.save_dir and (step + 1) % args.ckpt_every == 0:
             ckpt_path = os.path.join(args.save_dir, f"ckpt_step_{step+1}.pt")
-            save_checkpoint(ckpt_path, model, opt, step + 1)
+            ema_state = ema.state_dict() if ema is not None else None
+            save_checkpoint(ckpt_path, model, opt, step + 1, ema_state=ema_state)
             latest = os.path.join(args.save_dir, "latest.pt")
-            save_checkpoint(latest, model, opt, step + 1, best_acc=best_acc if best_acc >= 0 else None)
+            save_checkpoint(latest, model, opt, step + 1, best_acc=best_acc if best_acc >= 0 else None, ema_state=ema_state)
 
 
 @torch.no_grad()
@@ -655,6 +769,14 @@ def main():
     add_shared(pt)
     pt.add_argument("--steps", type=int, default=1000)
     pt.add_argument("--lr", type=float, default=3e-4)
+    pt.add_argument("--weight_decay", type=float, default=0.0)
+    pt.add_argument("--label_smoothing", type=float, default=0.0)
+    pt.add_argument("--sched", type=str, default="none", choices=["none", "plateau", "cosine"], help="LR scheduler to use")
+    pt.add_argument("--min_lr", type=float, default=1e-6)
+    pt.add_argument("--warmup_ratio", type=float, default=0.03, help="Warmup ratio for cosine schedule")
+    pt.add_argument("--plateau_factor", type=float, default=0.5)
+    pt.add_argument("--plateau_patience", type=int, default=800)
+    pt.add_argument("--ema_decay", type=float, default=0.0, help="EMA decay (0 to disable)")
     pt.add_argument("--lambda_vq", type=float, default=0.1)
     pt.add_argument("--lambda_stop", type=float, default=0.1)
     pt.add_argument("--save_dir", type=str, default="runs/episodes")
