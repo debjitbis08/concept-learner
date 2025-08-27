@@ -1372,6 +1372,8 @@ def train(args):
         lambda_margin = 1.0
         lambda_k = 1e-3
 
+        # include auxiliary sparsity and halting penalties from reasoner if present
+        aux = getattr(model.reasoner, "_aux_loss", {}) or {}
         loss = (
             loss_seq
             + args.lambda_vq * vq_loss
@@ -1380,6 +1382,8 @@ def train(args):
             + lambda_num * num_loss
             + lambda_margin * bce_margin
             + lambda_k * reg_k
+            + 1e-3 * aux.get("sparse", torch.tensor(0.0, device=device))
+            + 1e-3 * aux.get("halt_over", torch.tensor(0.0, device=device))
         )
 
         # Consistency loss with EMA teacher for numeric head (digit-dropout view)

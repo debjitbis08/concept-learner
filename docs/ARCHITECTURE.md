@@ -1,99 +1,47 @@
-Architecture overview (HLD)
+Concept Learner: Numeric-Aware Reasoning (HLD)
 
-Purpose
+Overview
+- Tokenizer: numeric-aware per-digit tokenization with sign preservation and optional digit-position channel.
+- Encoder: Transformer encoder with sinusoidal PE, modulo-10 learned PE, and a small local window mixer to help carry/borrow.
+- VQ layer: Residual VQ with parallel + serial codebooks; exposes both a projected z_q and a richer concatenated z_q_all fed to reasoning.
+- Reasoner: Multi-step controller with discrete operator selection, STOP head with cumulative halting, and broadcast back to tokens. Typed state includes mask, scalar val, boolean flag, optional pointer span, and a small environment (stack) buffer.
+- Operators: Filter, Count, Add, Compare, plus integer-locked add (soft projection) and span-aware variants.
+- Decoder: Token and sequence heads; auxiliary numeric head v(x) for ranking/regression.
 
-Small, testable, text‑only concept learner. A tiny Transformer encodes input tokens; a compact factorized VQ bottleneck provides discrete features; a lightweight reasoning loop updates a typed state with a few general operators; a unified decoder produces token‑level and pooled sequence logits.
+Tokenizer: numeric awareness
+- HFTokenizerWrapper encodes per-digit (and sign) tokens via a pre-tokenization pass.
+- encode() also emits optional per-token digit_pos indices (ones=0, tens=1, …) to enable downstream digit-position embeddings.
 
+Scalar numeric channel v(x)
+- Model maintains a small MLP head to predict a scalar magnitude from pooled digit states. Used for:
+  - Training: ranking loss (hinge) on compare pairs; optional numeric regression on log1p(n).
+  - Inference/Reasoning: available as a stable magnitude signal.
 
-Key components
+Reasoner typed state and control
+- Typed state: {mask, val, boolean, ptr_start, ptr_end, env[4]} enabling span selection and small carry/stack memory.
+- Controller: softmax over ops with sparsity penalty; cumulative halting with overrun penalty; hard selection via Gumbel-Softmax in training, argmax in eval.
 
-- Tokenizer (tokenizer.py)
-  - HFTokenizerWrapper uses a Hugging Face tokenizer when available (bert-base-cased)
-  - Falls back to a tiny whitespace tokenizer with [CLS]/[SEP]/[PAD] if downloads aren’t possible
-  - Exposes ids and attention mask with fixed max length
+Operators
+- OpFilterMLP/OpCount: legacy ops (mask/val updates).
+- OpFilterSpan/OpCountSpan: operate only within pointer spans if set.
+- OpAdd: generic add; OpAddInt: integer-locked via soft projection of k onto {−10, −1, +1, +10}.
+- OpCompareGeneric: unified comparator for gt/lt/eq.
 
-- Encoder (encoder.py)
-  - TinyEncoder: 2‑layer Transformer encoder (batch_first, norm_first)
-  - Returns
-    - h: pooled vector (uses [CLS] if present, else masked mean)
-    - H: per‑token states (B, T, d)
+Training/eval contract (frozen sampler mix)
+- Each batch composes compare tasks with fixed ratios:
+  - 60% in-dist, 20% boundary, 15% range-OOD, 5% counterfactual.
+  - Boundary: |a−b| ∈ {0,1} with carry/borrow cases (…9+1, …0−1) and small negatives (−1,0,+1).
+  - Range-OOD: sampled from a held-out numeric range with width balancing.
+  - Optional hard-negative mining: keep the hardest 25% (smallest margin) in boundary/OOD.
+- Auxiliary losses (light weights):
+  - Ranking loss (λ≈0.1), numeric regression (λ≈0.05), boundary-weighted BCE (≥1.3×), OpAdd integer regularizer (≈1e−3), controller sparsity+halt penalties (≈1e−3 each).
+- Dynamic reweighting:
+  - If boundary accuracy < target, increase λ_bd by 1.1× (cap 2×). Same for range-OOD.
+- Calibration: temperature scaling at eval; optional per-split temperatures (extendable).
 
-- Vector‑quantization bottleneck (vq_layer.py)
-  - ResidualVQLayer implements a factorized VQ composed of:
-    - Parallel heads: multiple linear projections of the pooled encoder state, each quantized independently with a small codebook (vector_quantize_pytorch.VectorQuantize).
-    - Optional serial refiners: small MLP stages that operate on the concatenated parallel embeddings; each refiner has its own quantizer. This is not classic residual VQ; there is no numeric residual pass‑through between stages.
-  - Returns a continuous embedding z_q (projection of the concatenated quantized features back to model dim), a list of index tensors (one per quantizer stage: all parallel heads first, then serial refiners), and a summed VQ loss.
-  - Includes optional regularizers and training knobs:
-    - Pre‑VQ Gaussian noise
-    - Projection orthogonality penalty across parallel heads
-    - Entropy bonus encouraging codebook usage
-  - Accepts selected VectorQuantize kwargs (e.g., use_cosine_sim, kmeans_init) which are forwarded to the underlying quantizers.
+Acceptance metrics
+- Accuracy vs digits (2→8): no post-train cliff; unseen widths ≥ 0.70.
+- Carry/Borrow sets: ≥ 0.80; Equals ≥ 0.90.
+- Range-OOD: ≥ 0.70; Boundary-OOD stable (±2 pts) over last 20% steps.
+- Calibration: ECE per split ≤ 3% after temperature scaling.
 
-- Conditioning (model.py)
-  - FiLM module applies z_q to per‑token H: H_cond = H * (1 + gamma(z_q)) + beta(z_q)
-  - Keeps the interface simple and end‑to‑end trainable
-
-- Reasoning (reasoning_v2.py, reasoning_ops.py)
-  - Typed state per batch:
-    - mask: selection over tokens (float 0..1)
-    - val: scalar (B, 1)
-    - boolean: scalar (B, 1)
-  - Operators (generic and learnable):
-    - Filter: per‑token scorer in [0,1]; mask’ = min(mask, score)
-    - Count: DeepSets aggregator to produce val = sum(phi(item) * mask)
-    - Add: val’ = beta * val + alpha * k (k may be predicted from z_q)
-    - Compare: boolean’ = sigmoid(w · f(val − k) + b) with non‑negative basis
-  - Controller (ReasonerV2):
-    - For up to max_steps:
-      - Compute action logits over operators from concat(state, z_q)
-      - Soft mixture of operator outputs updates (mask, val, boolean)
-      - STOP head predicts halting at each step (used in training scripts)
-    - Broadcast final state back to tokens via a small MLP and residual add
-
-- Decoder (decoder.py)
-  - token_head: per‑token logits (B, T, C)
-  - seq_head: pooled sequence logits (B, C)
-  - Training scripts primarily use seq_head for tasks (classification/regression‑as‑classification)
-
-
-Data flow (forward)
-
-1) Tokenize: ids, mask = tokenizer.encode(text)
-2) Encode: h, H = TinyEncoder(ids, mask)
-3) Quantize: z_q, indices, vq_loss = ResidualVQLayer(h)
-4) Condition tokens with FiLM: H_cond = FiLM(H, z_q)
-5) Reasoning: H_reasoned, s_final, stop_logits, action_logits = ReasonerV2(H_cond, z_q, mask)
-6) Decode: logits_tok, logits_seq = UnifiedDecoder(H_reasoned, mask)
-
-
-Training signals (as used in repo)
-
-- Cross‑entropy on the pooled sequence head (logits_seq) for tasks in scripts/train.py, scripts/train_count.py, scripts/train_episodes.py
-- Optional token‑level loss in tests/trainer for smoke checks
-- VQ regularizer: vq_loss (weighted)
-- STOP head: binary cross‑entropy on stop_logits in trainer/scripts using synthetic or zero targets
-
-
-Constraints and non‑goals (current code)
-
-- Factorized VQ with parallel heads and optional serial refiners; not a hierarchical bank of subject/domain/operator codebooks
-- No explicit schema‑based MoE registry; operator mixing is softmax‑based
-- No external tools/retrieval; text‑only inputs
-- Single‑token classification decoder (no autoregressive decoding)
-
-
-Extensibility guide
-
-- New operators: follow the OpBase(state, z_q) -> (mask, val, boolean) contract in reasoning_ops.py
-- Larger encoder: swap TinyEncoder for a deeper Transformer; keep output (h, H)
-- Different quantizer: replace ResidualVQLayer with your module if it returns (z_q, indices, loss)
-- Multi‑token outputs: replace decoder.seq_head with an autoregressive head; training code will need adjustment
-
-
-References and entry points
-
-- Model wiring: src/concept_learner/model.py (Encoder → RVQ → FiLM → ReasonerV2 → Decoder)
-- Operators and typed state: src/concept_learner/reasoning_ops.py
-- Controller: src/concept_learner/reasoning_v2.py
-- Scripts: scripts/train.py, scripts/train_count.py, scripts/train_episodes.py
-- Tests: tests/concept_learner/*

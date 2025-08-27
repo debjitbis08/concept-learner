@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional
 
 try:
@@ -11,6 +11,8 @@ except Exception:  # transformers may be unavailable in CI
 class EncodeOutput:
     ids: List[int]
     mask: List[int]
+    # Optional per-token digit-position ids (e.g., ones=0, tens=1, ...). 0 for non-digits by default.
+    digit_pos: Optional[List[int]] = field(default=None)
 
 
 class _SimpleTokenizer:
@@ -117,7 +119,7 @@ class HFTokenizerWrapper:
         self.vocab_size = getattr(self.tok, "vocab_size", None) or 30522
 
     def _digit_aware_pretokenize(self, text: str) -> list[str]:
-        # Split into tokens such that sequences of digits become per-digit tokens,
+        # Split into tokens such that sequences of digits become per-digit tokens with sign preserved,
         # alphabetic sequences stay grouped, and punctuation becomes separate tokens.
         import string
         out: list[str] = []
@@ -128,18 +130,33 @@ class HFTokenizerWrapper:
             if buf:
                 out.append(buf)
                 buf = ""
-        for ch in text:
+        i = 0
+        while i < len(text):
+            ch = text[i]
             if ch.isdigit():
                 flush()
                 out.append(ch)
                 mode = None
+                i += 1
+                continue
+            # handle signed numbers: capture leading '-' or '+' before a digit
+            if ch in "+-" and (i + 1) < len(text) and text[i + 1].isdigit():
+                flush()
+                out.append(ch)
+                mode = None
+                i += 1
+                continue
             elif ch.isspace():
                 flush()
                 mode = None
+                i += 1
+                continue
             elif ch in string.punctuation:
                 flush()
                 out.append(ch)
                 mode = None
+                i += 1
+                continue
             else:
                 if mode != 'alpha':
                     flush()
@@ -147,8 +164,38 @@ class HFTokenizerWrapper:
                     mode = 'alpha'
                 else:
                     buf += ch
+                i += 1
         flush()
         return out
+
+    def _digit_positions(self, toks: List[str]) -> List[int]:
+        # Compute per-token digit place (0=ones,1=tens,...) for contiguous numeric spans,
+        # non-digit tokens get 0 by default. We scan contiguous [sign][digits...] groups.
+        pos = [0] * len(toks)
+        i = 0
+        while i < len(toks):
+            # detect signed number span
+            j = i
+            saw_sign = False
+            if toks[j] in ['+', '-']:
+                saw_sign = True
+                j += 1
+            k = j
+            while k < len(toks) and toks[k].isdigit():
+                k += 1
+            if k > j:  # we have digits from j..k-1
+                width = k - j
+                # assign positions from right to left
+                for t in range(j, k):
+                    # t from j..k-1, position index from rightmost
+                    pos[t] = (k - 1 - t)
+                # optional: mark sign token position as 0
+                if saw_sign:
+                    pos[i] = 0
+                i = k
+            else:
+                i = i + 1
+        return pos
 
     def encode(self, text: str, max_len: int = 64) -> EncodeOutput:
         toks = self._digit_aware_pretokenize(text)
@@ -162,7 +209,18 @@ class HFTokenizerWrapper:
             truncation=True,
             return_attention_mask=True,
         )
-        return EncodeOutput(ids=enc["input_ids"], mask=enc["attention_mask"])
+        # compute digit positions matching the produced tokens (before padding)
+        try:
+            # account for special tokens we added ([CLS] at start, [SEP] at end) in our own pass
+            pos_ids = [0] + self._digit_positions(toks) + [0]
+            # pad/truncate to max_len
+            if len(pos_ids) > max_len:
+                pos_ids = pos_ids[:max_len]
+            if len(pos_ids) < max_len:
+                pos_ids = pos_ids + [0] * (max_len - len(pos_ids))
+        except Exception:
+            pos_ids = [0] * max_len
+        return EncodeOutput(ids=enc["input_ids"], mask=enc["attention_mask"], digit_pos=pos_ids)
 
     def decode(self, ids: List[int], skip_special_tokens: bool = False) -> str:
         return self.tok.decode(ids, skip_special_tokens=skip_special_tokens)

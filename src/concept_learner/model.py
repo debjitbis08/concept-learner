@@ -82,6 +82,8 @@ class CLModel(nn.Module):
             d_model=d_model,
             max_steps=4,
             temperature=1.0,
+            lambda_sparse=1e-3,
+            lambda_halt=1e-3,
         )
         self.decoder = UnifiedDecoder(d_model, num_classes)  # NEW
         # Auxiliary numeric head (scalar) for ranking/regression losses

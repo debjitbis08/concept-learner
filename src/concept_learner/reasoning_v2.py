@@ -9,6 +9,7 @@ from concept_learner.reasoning_ops import (
     OpCompareGeneric,
     OpCount,
     OpAdd,
+    OpAddInt,
 )
 
 
@@ -26,12 +27,15 @@ class ReasonerV2(nn.Module):
         d_model: int,
         max_steps: int = 4,
         temperature: float = 1.0,
+        lambda_sparse: float = 1e-3,
+        lambda_halt: float = 1e-3,
     ):
         super().__init__()
         ops = [
             OpFilterMLP(d_model),  # Filter(p)
             OpCount(d_model, learn_phi=False),  # Count()
             OpAdd(d_model, use_z=True),  # Generic Add, k from z
+            OpAddInt(d_model, use_z=True),  # Integer-locked Add (soft projection)
             OpCompareGeneric(d_model, use_z=True),  # Unified Compare
         ]
         assert len(ops) >= 1, "Need at least one operator"
@@ -39,6 +43,8 @@ class ReasonerV2(nn.Module):
         self.ops = nn.ModuleList(ops)
         self.max_steps = max_steps
         self.temperature = float(temperature)
+        self.lambda_sparse = float(lambda_sparse)
+        self.lambda_halt = float(lambda_halt)
 
         # token featurizer for initial state
         self.phi = nn.Sequential(
@@ -93,12 +99,20 @@ class ReasonerV2(nn.Module):
         action_logits_all = []
         # track per-example STOP
         done = torch.zeros(B, dtype=torch.bool, device=H.device)
+        # cumulative halting probability (for variable compute)
+        cum_halt = torch.zeros(B, 1, device=H.device)
+        # sparsity and over-halt penalties accumulators
+        pen_sparse = []
+        pen_halt = []
 
         for step in range(self.max_steps):
             x = torch.cat([s, z], dim=-1)  # (B,2d)
 
             # ----- action logits over ops -----
             logits_action = self.to_action(x)  # (B, num_ops)
+            probs_action = torch.softmax(logits_action, dim=-1)
+            # sparsity penalty: encourage peaky distribution (L1-like)
+            pen_sparse.append((probs_action.sum(dim=-1) - probs_action.max(dim=-1).values).mean())
             # Discrete operator selection per step
             if self.training:
                 pick = F.gumbel_softmax(
@@ -151,8 +165,11 @@ class ReasonerV2(nn.Module):
             stop_logits_all.append(stop_logit)
             action_logits_all.append(logits_action.unsqueeze(1))  # (B,1,num_ops)
 
-            p_stop = torch.sigmoid(stop_logit).squeeze(-1)  # (B,)
-            done = done | (p_stop > 0.5)
+            p_stop = torch.sigmoid(stop_logit)  # (B,1)
+            cum_halt = cum_halt + p_stop
+            # over-halt penalty when cumulative exceeds 1.0
+            pen_halt.append((cum_halt - 1.0).clamp_min(0.0).mean())
+            done = done | (cum_halt.squeeze(-1) >= 1.0)
 
         stop_logits = torch.cat(stop_logits_all, dim=1)  # (B, max_steps)
         action_logits = torch.cat(action_logits_all, dim=1)  # (B, max_steps, num_ops)
@@ -163,5 +180,10 @@ class ReasonerV2(nn.Module):
 
         # expose final scalar value stream for downstream decoders
         self._last_val = val
+        # expose auxiliary losses for trainer
+        self._aux_loss = {
+            "sparse": (torch.stack(pen_sparse).mean() if len(pen_sparse) > 0 else torch.tensor(0.0, device=H.device)),
+            "halt_over": (torch.stack(pen_halt).mean() if len(pen_halt) > 0 else torch.tensor(0.0, device=H.device)),
+        }
 
         return H_reasoned, s, stop_logits, action_logits

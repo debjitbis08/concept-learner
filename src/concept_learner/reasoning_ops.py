@@ -14,6 +14,11 @@ class TypedState:
     mask: torch.Tensor  # (B, T) float 0..1
     val: torch.Tensor  # (B, 1) float
     boolean: torch.Tensor  # (B, 1) float 0..1
+    # Optional span pointer [start,end) as scalar indices; -1 means unset
+    ptr_start: torch.Tensor | None = None  # (B,1)
+    ptr_end: torch.Tensor | None = None  # (B,1)
+    # Small scratch env/stack of size K (e.g., K=4)
+    env: torch.Tensor | None = None  # (B,K)
 
     @staticmethod
     def from_H_mask(H: torch.Tensor, mask_int: torch.Tensor) -> "TypedState":
@@ -21,7 +26,10 @@ class TypedState:
         mask = mask_int.float().clamp(0, 1)
         val = H.new_zeros(B, 1)
         boolean = H.new_zeros(B, 1)
-        return TypedState(H=H, mask=mask, val=val, boolean=boolean)
+        ptr_s = H.new_full((B, 1), -1.0)
+        ptr_e = H.new_full((B, 1), -1.0)
+        env = H.new_zeros(B, 4)
+        return TypedState(H=H, mask=mask, val=val, boolean=boolean, ptr_start=ptr_s, ptr_end=ptr_e, env=env)
 
 
 class OpBase(nn.Module):
@@ -86,6 +94,54 @@ class OpCount(OpBase):
         else:
             contrib = self.phi(state.H).squeeze(-1)  # (B,T)
         val = (contrib * state.mask).sum(dim=1, keepdim=True)  # (B,1)
+        return state.mask, val, state.boolean
+
+
+class OpFilterSpan(OpBase):
+    """Apply filter within a pointer span [start,end); fallback to full mask if unset."""
+
+    def __init__(self):
+        super().__init__()
+        self.name = "filter_span"
+
+    def forward(self, state: TypedState, z: torch.Tensor):
+        m = state.mask
+        B, T = m.shape
+        if state.ptr_start is None or state.ptr_end is None:
+            return m, state.val, state.boolean
+        s = state.ptr_start.clamp_min(0).long().view(-1)
+        e = state.ptr_end.clamp_min(0).long().view(-1)
+        span_mask = m.new_zeros(B, T)
+        for i in range(B):
+            si = int(s[i].item()) if s[i] >= 0 else 0
+            ei = int(e[i].item()) if e[i] >= 0 else T
+            si = max(0, min(T, si)); ei = max(si, min(T, ei))
+            span_mask[i, si:ei] = 1.0
+        new_mask = m * span_mask
+        return new_mask, state.val, state.boolean
+
+
+class OpCountSpan(OpBase):
+    """Count only within the current pointer span if set."""
+
+    def __init__(self):
+        super().__init__()
+        self.name = "count_span"
+
+    def forward(self, state: TypedState, z: torch.Tensor):
+        B, T = state.mask.shape
+        if state.ptr_start is None or state.ptr_end is None:
+            val = (state.mask).sum(dim=1, keepdim=True)
+            return state.mask, val, state.boolean
+        s = state.ptr_start.clamp_min(0).long().view(-1)
+        e = state.ptr_end.clamp_min(0).long().view(-1)
+        vals = []
+        for i in range(B):
+            si = int(s[i].item()) if s[i] >= 0 else 0
+            ei = int(e[i].item()) if e[i] >= 0 else T
+            si = max(0, min(T, si)); ei = max(si, min(T, ei))
+            vals.append(state.mask[i, si:ei].sum())
+        val = torch.stack(vals, dim=0).unsqueeze(-1)
         return state.mask, val, state.boolean
 
 
@@ -199,6 +255,40 @@ class OpAdd(OpBase):
         targets = torch.stack([(k - 1.0).abs(), (k + 1.0).abs(), (k - 10.0).abs()], dim=-1)
         pen = targets.min(dim=-1).values
         return pen.mean()
+
+
+class OpAddInt(OpBase):
+    """Integer-locked add: project k_hat onto {-10, -1, +1, +10} via soft weights.
+
+    k_hat is predicted from z (or learned scalar). We form k_proj = sum w_i * cand_i,
+    where w = softmax(affine([k_hat, z]))
+    """
+
+    def __init__(self, d_model: int, use_z: bool = True):
+        super().__init__()
+        self.name = "add_int"
+        self.use_z = use_z
+        self.candidates = torch.tensor([-10.0, -1.0, 1.0, 10.0])
+        self.k_head = nn.Linear(d_model, 1) if use_z else None
+        self.mix = nn.Linear(d_model + 1, 4)
+        nn.init.zeros_(self.mix.weight)
+        nn.init.zeros_(self.mix.bias)
+        if self.k_head is not None:
+            nn.init.zeros_(self.k_head.weight)
+            nn.init.zeros_(self.k_head.bias)
+
+    def forward(self, state: TypedState, z: torch.Tensor):
+        B = state.val.size(0)
+        if self.use_z and self.k_head is not None:
+            k_hat = self.k_head(z)  # (B,1)
+        else:
+            k_hat = state.val.new_zeros(B, 1)
+        mix_in = torch.cat([z, k_hat], dim=-1)
+        w = torch.softmax(self.mix(mix_in), dim=-1)  # (B,4)
+        c = self.candidates.to(z.device).view(1, 4)
+        k_proj = (w * c).sum(dim=-1, keepdim=True)
+        val = state.val + k_proj
+        return state.mask, val, state.boolean
 
 
 # ------------------------------ GENERIC COMPARE --------------------------
