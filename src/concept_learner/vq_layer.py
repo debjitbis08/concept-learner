@@ -88,6 +88,7 @@ class ResidualVQLayer(nn.Module):
         )
 
         concat_dim = sum(head_dims)
+        self.concat_dim = concat_dim
 
         # Serial refiners: MLP (to base dim) + VQ (base dim).
         # Stage j sees input of size (1 + j) * concat_dim and outputs concat_dim.
@@ -186,6 +187,8 @@ class ResidualVQLayer(nn.Module):
         all_feats = [c] + serial_embs
         final_repr = torch.cat(all_feats, dim=-1)
         z_q = self.proj_out(final_repr)
+        # Expose the unprojected concatenated quantized features for downstream consumers
+        self._last_all = final_repr
 
         # Regularizers
         total_loss = total_loss + self._orth_penalty()
@@ -199,6 +202,7 @@ class ResidualVQLayer(nn.Module):
         indices_list = parallel_indices + serial_indices
         if squeeze:
             z_q = z_q.squeeze(1)
+            self._last_all = self._last_all.squeeze(1)
             indices_list = [
                 t.squeeze(1) if t.ndim == 2 and t.shape[1] == 1 else t
                 for t in indices_list

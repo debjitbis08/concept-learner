@@ -74,6 +74,9 @@ class CLModel(nn.Module):
         # Use value passed to out_dim instead of d_model if specified
         # in ResidualVQLayer
         self.film = FiLM(d_model)
+        # Projection to condense rich RVQ features (concat of parallel + serial) to d_model
+        z_all_dim = _rvq_dim * (1 + max(0, _num_q - _num_ph))
+        self.z_all_proj = nn.Linear(z_all_dim, d_model)
 
         self.reasoner = ReasonerV2(
             d_model=d_model,
@@ -92,10 +95,15 @@ class CLModel(nn.Module):
         # ids: (B,T) long, mask: (B,T) long (1=real, 0=pad)
         h, H = self.enc(ids, mask)  # h: (B,d), H: (B,T,d)
         z_q, indices, vq_loss = self.rvq(h)  # z_q: (B,d)
+        z_all = getattr(self.rvq, "_last_all", None)
+        if isinstance(z_all, torch.Tensor) and z_all.dim() == 2:
+            z_for_reason = self.z_all_proj(z_all)
+        else:
+            z_for_reason = z_q
         # H_cond = H + z_q.unsqueeze(1)  # (B,T,d)
-        H_cond = self.film(H, z_q)
+        H_cond = self.film(H, z_for_reason)
         H_reasoned, s_final, stop_logits, action_logits = self.reasoner(
-            H_cond, z_q, mask
+            H_cond, z_for_reason, mask
         )
         val_final = getattr(self.reasoner, "_last_val", None)
         logits_tok, logits_seq = self.decoder(H_reasoned, mask, val=val_final)

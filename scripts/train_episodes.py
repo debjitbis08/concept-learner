@@ -704,8 +704,15 @@ def train(args):
         if step_idx < warmup:
             lr = args.lr * float(step_idx + 1) / float(warmup)
         else:
-            t = (step_idx - warmup) / max(1.0, (args.steps - warmup))
-            t = min(max(t, 0.0), 1.0)
+            # optional single warm restart
+            total = max(1, args.steps - warmup)
+            if getattr(args, 'cosine_restart_step', 0) and args.cosine_restart_step > 0:
+                period = int(args.cosine_restart_step)
+                t_idx = (step_idx - warmup) % max(1, period)
+                t = t_idx / max(1.0, period)
+            else:
+                t = (step_idx - warmup) / float(total)
+                t = min(max(t, 0.0), 1.0)
             cos_factor = 0.5 * (1.0 + math.cos(math.pi * t))
             lr = args.min_lr + (args.lr - args.min_lr) * cos_factor
         for g in opt.param_groups:
@@ -740,6 +747,120 @@ def train(args):
     tmpl_train, tmpl_ood = build_template_filters(getattr(args, "template_holdout", 0.0))
     model.train()
     seq_len = args.max_len
+    # per-task dynamic weights
+    lambda_bd = 1.0
+    lambda_ood = 1.0
+    # optional numeric-head EMA teacher
+    num_ema = None
+    try:
+        import copy as _copy
+        model.num_head_teacher = _copy.deepcopy(model.num_head).to(device)
+        for p in model.num_head_teacher.parameters():
+            p.requires_grad = False
+        num_ema = {"decay": float(args.num_ema_decay)}
+    except Exception:
+        model.num_head_teacher = None
+        num_ema = None
+
+    # helpers for frozen mix
+    def _digit_widths(nums: torch.Tensor) -> torch.Tensor:
+        # base-10 digit count; treat 0 as width=1; allow negatives
+        x = nums.abs().clamp_min(0)
+        w = torch.ones_like(x)
+        xnz = x.clone()
+        xnz[xnz == 0] = 1
+        w = torch.floor(torch.log10(xnz.float()) + 1).long()
+        return w
+
+    def _sample_by_width(n: int, widths: list[int], idx_range: tuple[int, int] | None):
+        lo, hi = (0, gen.n_items - 1) if idx_range is None else (int(idx_range[0]), int(idx_range[1]))
+        all_idx = torch.arange(lo, hi + 1, device=device)
+        ws = _digit_widths(all_idx)
+        # allocate counts evenly across given widths
+        m = max(1, len(widths))
+        counts = [n // m + (1 if i < (n % m) else 0) for i in range(m)]
+        out = []
+        for w, c in zip(widths, counts):
+            cand = all_idx[ws == w]
+            if len(cand) == 0:
+                continue
+            idxs = cand[torch.randint(0, len(cand), (c,), device=device)]
+            out.append(idxs)
+        if len(out) == 0:
+            return torch.randint(lo, hi + 1, (n,), device=device)
+        return torch.cat(out, dim=0)[:n]
+
+    def _build_compare_subset(n: int, kind: str, idx_range: tuple[int, int] | None):
+        # kind: 'id' | 'bd' | 'ood' | 'cf'
+        if n <= 0:
+            return None
+        # choose widths 2..7 evenly
+        widths = [2, 3, 4, 5, 6, 7]
+        if kind == 'ood' and args.ood_range:
+            # sample entirely from OOD range if provided
+            lo, hi = map(int, args.ood_range.split('-'))
+            a = _sample_by_width(n, widths, (lo, hi))
+            b = _sample_by_width(n, widths, (lo, hi))
+        else:
+            a = _sample_by_width(n, widths, idx_range)
+            b = _sample_by_width(n, widths, idx_range)
+        # boundary: force |a-b| in {0,1} and include a few special patterns
+        if kind == 'bd':
+            # half equal, half ±1
+            half = n // 2
+            a[:half] = a[:half]
+            b[:half] = a[:half]
+            rem = n - half
+            if rem > 0:
+                a[half:] = a[half:]
+                delta = torch.randint(0, 2, (rem,), device=device)
+                delta = torch.where(delta == 0, torch.tensor(-1, device=device), torch.tensor(1, device=device))
+                b[half:] = (a[half:] + delta).clamp(0, gen.n_items - 1)
+        # counterfactual flips: start from in-dist and tilt by ±1 to flip
+        op = torch.randint(0, 2, (n,), device=device)  # 0:'>', 1:'<'
+        y_bin = torch.where(op == 0, (a > b).long(), (a < b).long())
+        if kind == 'cf':
+            delta = torch.where(y_bin > 0, -1, 1)
+            b = (b + delta).clamp(0, gen.n_items - 1)
+            y_bin = torch.where(op == 0, (a > b).long(), (a < b).long())
+        # hard-negative mining for bd/ood: oversample pool and keep hardest n by small margin
+        if kind in ('bd', 'ood') and n > 0 and args.hard_mine_pct > 0:
+            pool = max(n, int(n / max(1e-6, min(0.99, args.hard_mine_pct))))
+            pool = max(pool, n)
+            # expand by sampling additional a,b
+            aa = _sample_by_width(pool, widths, idx_range if kind != 'ood' or not args.ood_range else tuple(int(x) for x in args.ood_range.split('-')))
+            bb = _sample_by_width(pool, widths, idx_range if kind != 'ood' or not args.ood_range else tuple(int(x) for x in args.ood_range.split('-')))
+            if kind == 'bd':
+                half = pool // 2
+                bb[:half] = aa[:half]
+                rem = pool - half
+                if rem > 0:
+                    delta = torch.randint(0, 2, (rem,), device=device)
+                    delta = torch.where(delta == 0, torch.tensor(-1, device=device), torch.tensor(1, device=device))
+                    bb[half:] = (aa[half:] + delta).clamp(0, gen.n_items - 1)
+            oo = torch.randint(0, 2, (pool,), device=device)
+            yb = torch.where(oo == 0, (aa > bb).long(), (aa < bb).long())
+            ids_p, mask_p = _pack_symbolic_compare_text(aa, bb, oo, tok, max_len=seq_len)
+            with torch.no_grad():
+                _, logits_p, _, _, _, _ = model(ids_p, mask_p)
+                lp = logits_p[:, [NO_IDX, YES_IDX]]
+                margin = (lp[:, 1] - lp[:, 0]).abs()  # |logit_yes - logit_no|
+                # smallest margins are hardest
+                idx_sel = torch.topk(-margin, k=n).indices
+            ids = ids_p[idx_sel]
+            mask = mask_p[idx_sel]
+            a = aa[idx_sel]
+            b = bb[idx_sel]
+            op = oo[idx_sel]
+            y_bin = yb[idx_sel]
+        ids, mask = ids, mask
+        y = torch.where(
+            y_bin > 0,
+            torch.full((y_bin.size(0),), YES_IDX, dtype=torch.long, device=device),
+            torch.full((y_bin.size(0),), NO_IDX, dtype=torch.long, device=device),
+        )
+        meta = {"a": a, "b": b, "op": op, "y_bin": y_bin}
+        return ids, mask, y, meta
     for step in range(start_step, args.steps):
         if args.sched == "cosine":
             set_cosine_lr(step)
@@ -754,7 +875,7 @@ def train(args):
         if rel_arg and rel_arg.strip().lower() != "all" and (rel_ids is None or len(rel_ids) == 0):
             include_pairs = False
 
-        if include_pairs:
+        if include_pairs and not args.frozen_mix:
             # optional restriction to training range for in-distribution sampling
             def parse_range(s):
                 if not s:
@@ -776,7 +897,7 @@ def train(args):
                     batch=args.batch_size, allowed_relations=rel_ids, idx_range=train_idx_range
                 )
             )
-        else:
+        elif not include_pairs:
             # empty pairs batch
             B0 = 0
             device0 = device
@@ -786,16 +907,50 @@ def train(args):
                 "rel": torch.empty(B0, dtype=torch.long, device=device0),
                 "label": torch.empty(B0, dtype=torch.long, device=device0),
             }
+        else:
+            # Frozen mix batch for pair compares
+            Bm = args.batch_size
+            n_id = int(args.mix_ratio_id * Bm)
+            n_bd = int(args.mix_ratio_bd * Bm)
+            n_ood = int(args.mix_ratio_ood * Bm)
+            n_cf = max(0, Bm - (n_id + n_bd + n_ood)) if args.mix_ratio_cf <= 0 else int(args.mix_ratio_cf * Bm)
+            # In-dist idx range
+            def parse_range(s):
+                if not s:
+                    return None
+                try:
+                    lo, hi = s.split("-")
+                    return (int(lo), int(hi))
+                except Exception:
+                    return None
+            train_idx_range = parse_range(getattr(args, "train_range", None))
+            comp_splits = {}
+            comp_splits['id'] = _build_compare_subset(n_id, 'id', train_idx_range)
+            comp_splits['bd'] = _build_compare_subset(n_bd, 'bd', train_idx_range)
+            comp_splits['ood'] = _build_compare_subset(n_ood, 'ood', train_idx_range)
+            comp_splits['cf'] = _build_compare_subset(n_cf, 'cf', train_idx_range)
+            ids_cmp_list, mask_cmp_list, y_cmp_list = [], [], []
+            for key in ['id', 'bd', 'ood', 'cf']:
+                if comp_splits[key] is None:
+                    continue
+                ids_k, mask_k, y_k, _ = comp_splits[key]
+                ids_cmp_list.append(ids_k)
+                mask_cmp_list.append(mask_k)
+                y_cmp_list.append(y_k)
+            ids_pairs = torch.cat(ids_cmp_list, dim=0) if len(ids_cmp_list) > 0 else torch.empty(0, seq_len, dtype=torch.long, device=device)
+            mask_pairs = torch.cat(mask_cmp_list, dim=0) if len(mask_cmp_list) > 0 else torch.empty(0, seq_len, dtype=torch.long, device=device)
+            y_pairs = torch.cat(y_cmp_list, dim=0) if len(y_cmp_list) > 0 else torch.empty(0, dtype=torch.long, device=device)
         # natural-language pair questions
-        ids_pairs, mask_pairs = _pack_pair_questions_text(
-            batch, tok, max_len=seq_len, template_filter=tmpl_train
-        )
-        y_pairs_bin = batch["label"].to(device)
-        y_pairs = torch.where(
-            y_pairs_bin > 0,
-            torch.full_like(y_pairs_bin, YES_IDX),
-            torch.full_like(y_pairs_bin, NO_IDX),
-        )
+        if not args.frozen_mix:
+            ids_pairs, mask_pairs = _pack_pair_questions_text(
+                batch, tok, max_len=seq_len, template_filter=tmpl_train
+            )
+            y_pairs_bin = batch["label"].to(device)
+            y_pairs = torch.where(
+                y_pairs_bin > 0,
+                torch.full_like(y_pairs_bin, YES_IDX),
+                torch.full_like(y_pairs_bin, NO_IDX),
+            )
         # mix in equality statements (succ/pred == a±1)
         eq_bsz = max(1, args.batch_size // 4)
         a_eq = torch.randint(0, gen.n_items, (eq_bsz,), device=device)
@@ -910,6 +1065,21 @@ def train(args):
         mask = torch.cat([mask, mask_add], dim=0)
         y = torch.cat([y, y_add], dim=0)
 
+        # Oversample carry cases for addition (…9 + 1)
+        try:
+            Bc = max(1, args.batch_size // 8)
+            a_carry = torch.randint(0, gen.n_items, (Bc,), device=device)
+            a_carry = (a_carry // 10) * 10 + 9
+            a_carry = a_carry.clamp(max=gen.n_items - 1)
+            b_carry = torch.ones_like(a_carry)
+            y_carry = (a_carry + b_carry).clamp(max=gen.n_items - 1)
+            ids_add2, mask_add2 = _pack_addition_text(a_carry, b_carry, tok, max_len=seq_len)
+            ids = torch.cat([ids, ids_add2], dim=0)
+            mask = torch.cat([mask, mask_add2], dim=0)
+            y = torch.cat([y, y_carry], dim=0)
+        except Exception:
+            pass
+
         # parity batch -> outputs EVEN/ODD classes
         par_bsz = args.batch_size
         data_par = gen.sample_parity(batch=par_bsz, idx_range=train_idx_range)
@@ -933,11 +1103,79 @@ def train(args):
         ids = torch.cat([ids, ids_off], dim=0)
         mask = torch.cat([mask, mask_off], dim=0)
         y = torch.cat([y, y_off], dim=0)
+
+        # Oversample successor/pred around carries/borrows: …9 + 1 and …0 − 1
+        try:
+            Bsp = max(1, args.batch_size // 8)
+            # successor with ones=9
+            a_succ = torch.randint(0, gen.n_items, (Bsp,), device=device)
+            a_succ = (a_succ // 10) * 10 + 9
+            kind_succ = torch.zeros(Bsp, dtype=torch.long, device=device)  # successor
+            c_dummy = torch.full_like(a_succ, -1)
+            y_succ = (a_succ + 1).clamp(max=gen.n_items - 1)
+            ids_succ, mask_succ = _pack_count_examples_text(kind_succ, a_succ, c_dummy, tok, max_len=seq_len)
+            # predecessor with ones=0
+            a_pred = torch.randint(0, gen.n_items, (Bsp,), device=device)
+            a_pred = (a_pred // 10) * 10 + 0
+            kind_pred = torch.ones(Bsp, dtype=torch.long, device=device)  # predecessor
+            y_pred = (a_pred - 1).clamp(min=0)
+            ids_pred, mask_pred = _pack_count_examples_text(kind_pred, a_pred, c_dummy, tok, max_len=seq_len)
+            ids = torch.cat([ids, ids_succ, ids_pred], dim=0)
+            mask = torch.cat([mask, mask_succ, mask_pred], dim=0)
+            y = torch.cat([y, y_succ, y_pred], dim=0)
+        except Exception:
+            pass
+
+        # Negatives around zero for comparisons: -1, 0, +1
+        try:
+            vals = torch.tensor([-1, 0, 1], device=device)
+            combos = []
+            for ai in vals:
+                for bi in vals:
+                    combos.append((ai.item(), bi.item()))
+            a_n = torch.tensor([c[0] for c in combos], device=device)
+            b_n = torch.tensor([c[1] for c in combos], device=device)
+            # alternate operators > and <
+            op_n = torch.tensor([i % 2 for i in range(len(combos))], device=device)
+            y_bin_n = torch.where(op_n == 0, (a_n > b_n).long(), (a_n < b_n).long())
+            ids_ncmp, mask_ncmp = _pack_symbolic_compare_text(a_n, b_n, op_n, tok, max_len=seq_len)
+            y_ncmp = torch.where(
+                y_bin_n > 0,
+                torch.full((len(combos),), YES_IDX, dtype=torch.long, device=device),
+                torch.full((len(combos),), NO_IDX, dtype=torch.long, device=device),
+            )
+            ids = torch.cat([ids, ids_ncmp], dim=0)
+            mask = torch.cat([mask, mask_ncmp], dim=0)
+            y = torch.cat([y, y_ncmp], dim=0)
+        except Exception:
+            pass
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
 
+        # If frozen mix is enabled, compute separate CE losses for each compare split and reweight
         loss_seq = torch.nn.functional.cross_entropy(
             logits_seq, y, label_smoothing=args.label_smoothing
         )
+        if args.frozen_mix:
+            # recompute logits for compare-only batch and split by sizes
+            offs = []
+            for key in ['id', 'bd', 'ood', 'cf']:
+                if key in locals() and comp_splits.get(key) is not None and comp_splits[key][0].size(0) > 0:
+                    offs.append((key, comp_splits[key][0].size(0)))
+            start = 0
+            loss_cmp_total = torch.tensor(0.0, device=device)
+            for key, sz in offs:
+                ids_k, mask_k, y_k, _m = comp_splits[key]
+                _, logits_k, _, _, _, _ = model(ids_k, mask_k)
+                ce_k = torch.nn.functional.cross_entropy(logits_k, y_k, label_smoothing=args.label_smoothing)
+                w = 1.0
+                if key == 'bd':
+                    w = lambda_bd
+                elif key == 'ood':
+                    w = lambda_ood
+                loss_cmp_total = loss_cmp_total + w * ce_k
+            if len(offs) > 0:
+                # replace default CE contribution with the reweighted compare CE averaged with other tasks
+                loss_seq = loss_seq * 0.5 + loss_cmp_total * 0.5
 
         # ---- Auxiliary: margin-aware BCE for YES/NO near boundary ----
         # apply only on symbolic compares where |a-b|<=1 or a==b
@@ -945,17 +1183,23 @@ def train(args):
             a_cmp = data_cmp["a"].to(device)
             b_cmp = data_cmp["b"].to(device)
             y_cmp_bin = data_cmp["label"].float().to(device)
-            # recompute logits for compare-only subset to select YES/NO channels
             with torch.no_grad():
                 ids_c, mask_c = ids_cmp, mask_cmp
             logits_cmp = model(ids_c, mask_c)[1]
-            yes_no = logits_cmp[:, [YES_IDX, NO_IDX]]  # (B,2)
-            # convert to a single logit for p(yes)
+            yes_no = logits_cmp[:, [YES_IDX, NO_IDX]]
             logit_yes = yes_no[:, 0] - yes_no[:, 1]
             w = torch.where((a_cmp == b_cmp) | ((a_cmp - b_cmp).abs() <= 1), 1.3, 1.0)
-            bce_margin = torch.nn.functional.binary_cross_entropy_with_logits(
-                logit_yes, y_cmp_bin, weight=w
+            # focal-like weighting if skewed
+            p = torch.sigmoid(logit_yes).clamp(1e-4, 1 - 1e-4)
+            y = y_cmp_bin
+            p_t = torch.where(y > 0, p, 1 - p)
+            pos_ratio = y.mean().item()
+            gamma = 0.5 if (pos_ratio < 0.4 or pos_ratio > 0.6) else 0.0
+            focal = (1 - p_t) ** gamma if gamma > 0 else 1.0
+            bce_raw = torch.nn.functional.binary_cross_entropy_with_logits(
+                logit_yes, y, reduction="none"
             )
+            bce_margin = ((bce_raw * w * focal).mean())
         except Exception:
             bce_margin = torch.tensor(0.0, device=device)
 
@@ -1138,12 +1382,58 @@ def train(args):
             + lambda_k * reg_k
         )
 
+        # Consistency loss with EMA teacher for numeric head (digit-dropout view)
+        if getattr(model, 'num_head_teacher', None) is not None and args.lambda_consistency > 0:
+            try:
+                # unlabeled pool: union of numbers in current sub-batches
+                nums_uni = []
+                for t in [
+                    data_add.get("a"), data_add.get("b"), data_add.get("target"),
+                    data_off.get("a"), data_off.get("target"),
+                    data_cnt.get("a"), data_cnt.get("target"),
+                ]:
+                    if t is not None:
+                        nums_uni.append(t.to(device))
+                if len(nums_uni) > 0:
+                    Nset = torch.unique(torch.cat(nums_uni))
+                    # pack clean texts
+                    clean_texts = [str(int(v.item())) for v in Nset]
+                    # apply digit-dropout to create a noisy view (mask a non-leading digit)
+                    def _digit_dropout_str(s: str) -> str:
+                        if len(s) <= 1 or not s.isdigit():
+                            return s
+                        import random as _r
+                        idxs = [i for i in range(1, len(s)) if s[i].isdigit()]
+                        if not idxs:
+                            return s
+                        j = _r.choice(idxs)
+                        # replace with same digit to keep magnitude? here we use identity most times; occasionally flip
+                        if _r.random() < 0.5:
+                            return s[:j] + s[j] + s[j + 1:]
+                        return s[:j] + str((int(s[j]) + 1) % 10) + s[j + 1:]
+                    noisy_texts = [_digit_dropout_str(t) for t in clean_texts]
+                    ids_clean, mask_clean = _pack_text_batch(clean_texts, tok, max_len=seq_len, device=device)
+                    ids_noisy, mask_noisy = _pack_text_batch(noisy_texts, tok, max_len=seq_len, device=device)
+                    with torch.no_grad():
+                        v_teacher = model.num_head_teacher(model.enc(ids_clean, mask_clean)[0]).squeeze(-1)
+                    v_student = model.predict_scalar(ids_noisy, mask_noisy).squeeze(-1)
+                    cons_loss = torch.nn.functional.mse_loss(v_student, v_teacher)
+                    loss = loss + args.lambda_consistency * cons_loss
+            except Exception:
+                pass
+
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
         if ema is not None:
             ema.update(model)
+        # update EMA teacher for numeric head
+        if getattr(model, 'num_head_teacher', None) is not None and num_ema is not None:
+            with torch.no_grad():
+                m = num_ema["decay"]
+                for p_t, p_s in zip(model.num_head_teacher.parameters(), model.num_head.parameters()):
+                    p_t.copy_(m * p_t + (1.0 - m) * p_s)
 
         if (step + 1) % args.log_every == 0:
             with torch.no_grad():
@@ -1386,6 +1676,39 @@ def evaluate(args):
     all_a = []
     all_b = []
     all_rel = []
+    # Optional temperature fitting on a small held-out sample
+    T = 1.0
+    if args.temp_fit:
+        with torch.no_grad():
+            logits_stack, labels_stack = [], []
+            n_fit = max(1, args.eval_batches // 3)
+            for _ in range(n_fit):
+                batch = gen.sample_posneg_pairs(batch=args.batch_size)
+                ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len)
+                y = batch["label"].to(device)
+                _, logits_seq_fit, _, _, _, _ = model(ids, mask)
+                lp = logits_seq_fit[:, [NO_IDX, YES_IDX]]
+                logits_stack.append(lp)
+                labels_stack.append(y)
+            if len(logits_stack) > 0:
+                L = torch.cat(logits_stack, dim=0)
+                Y = torch.cat(labels_stack, dim=0)
+                temp = torch.tensor(1.0, device=device, requires_grad=True)
+                opt_t = torch.optim.LBFGS([temp], lr=0.5, max_iter=50)
+
+                def closure():
+                    opt_t.zero_grad()
+                    logits_scaled = L / temp.clamp_min(1e-2)
+                    loss = torch.nn.functional.cross_entropy(logits_scaled, Y)
+                    loss.backward()
+                    return loss
+
+                try:
+                    opt_t.step(closure)
+                    T = float(temp.detach().clamp(0.05, 10.0).item())
+                except Exception:
+                    T = 1.0
+
     for _ in range(args.eval_batches):
         batch = gen.sample_posneg_pairs(batch=args.batch_size)
         ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len)
@@ -1394,7 +1717,7 @@ def evaluate(args):
         a_idx = batch["a_idx"].to(device)
         b_idx = batch["b_idx"].to(device)
         _, logits_seq, _, _, _, _ = model(ids, mask)
-        logits_pair = logits_seq[:, [NO_IDX, YES_IDX]]
+        logits_pair = logits_seq[:, [NO_IDX, YES_IDX]] / T
         pred = logits_pair.argmax(dim=-1)
         probs = torch.softmax(logits_pair, dim=-1)[:, 1]
         correct += (pred == y).sum().item()
@@ -1716,6 +2039,21 @@ def main():
             "Special: place_value, face_value (controls inclusion of place/face value tasks)."
         ),
     )
+    # Frozen sampler mix (fixed ratios) for pair comparisons
+    pt.add_argument("--frozen_mix", action="store_true", help="Use fixed-ratio batch composition for compare tasks")
+    pt.add_argument("--mix_ratio_id", type=float, default=0.60)
+    pt.add_argument("--mix_ratio_bd", type=float, default=0.20)
+    pt.add_argument("--mix_ratio_ood", type=float, default=0.15)
+    pt.add_argument("--mix_ratio_cf", type=float, default=0.05)
+    # Dynamic reweighting targets for boundary and OOD
+    pt.add_argument("--target_bd_acc", type=float, default=0.85)
+    pt.add_argument("--target_ood_acc", type=float, default=0.80)
+    # EMA teacher for numeric head
+    pt.add_argument("--num_ema_decay", type=float, default=0.995)
+    pt.add_argument("--lambda_consistency", type=float, default=0.02)
+    pt.add_argument("--hard_mine_pct", type=float, default=0.25, help="Fraction in boundary/OOD buckets to select as hardest based on margin")
+    # Cosine warm restart step (0 to disable)
+    pt.add_argument("--cosine_restart_step", type=int, default=0)
 
     pe = sub.add_parser("eval", help="Evaluate from a checkpoint")
     add_shared(pe)
@@ -1727,6 +2065,7 @@ def main():
         action="store_true",
         help="Force base-10 rendering only (min_base=max_base=10)",
     )
+    pe.add_argument("--temp_fit", action="store_true", help="Fit a scalar temperature on a held-out split for calibration")
 
     # Counting subcommands (unified CLI)
     ct = sub.add_parser(

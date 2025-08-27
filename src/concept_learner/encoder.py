@@ -55,6 +55,14 @@ class TinyEncoder(nn.Module):
             self.pos_mod10 = nn.Embedding(10, cfg.d_model)
         else:
             self.pos_mod10 = None
+        # optional local mixer (small-window attention via conv) to help carry/borrow
+        k = 5
+        self.local_mixer = nn.Sequential(
+            nn.Conv1d(cfg.d_model, cfg.d_model, kernel_size=k, padding=k // 2, groups=1),
+            nn.GELU(),
+            nn.Conv1d(cfg.d_model, cfg.d_model, kernel_size=1),
+        )
+        self.local_gain = nn.Parameter(torch.tensor(-3.0))  # start tiny
         enc_layer = nn.TransformerEncoderLayer(
             d_model=cfg.d_model,
             nhead=cfg.nhead,
@@ -86,6 +94,12 @@ class TinyEncoder(nn.Module):
             pos_ids = torch.arange(T, device=x.device).remainder(10)
             x = x + self.pos_mod10(pos_ids).unsqueeze(0)
         H = self.encoder(x, src_key_padding_mask=key_padding_mask)  # (B,T,d)
+        # apply local window mixer (digit-local attention approximation)
+        s = torch.sigmoid(self.local_gain)
+        if s > 0:
+            Ht = H.transpose(1, 2)  # (B,d,T)
+            H_loc = self.local_mixer(Ht).transpose(1, 2)
+            H = H + s * H_loc
         H = self.out_ln(H)
 
         # pooled h: prefer [CLS] position if present, else masked mean
