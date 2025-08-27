@@ -65,7 +65,7 @@ class EpisodeGenerator:
             "domain": torch.zeros(batch, dtype=torch.long, device=device),
         }
 
-    def sample_posneg_pairs(self, batch: int) -> Dict[str, torch.Tensor]:
+    def sample_posneg_pairs(self, batch: int, allowed_relations: List[int] | None = None) -> Dict[str, torch.Tensor]:
         """Binary classification pairs on simple kindergarten-friendly relations.
 
         Positive if pair (a,b) satisfies one randomly chosen relation from:
@@ -84,8 +84,13 @@ class EpisodeGenerator:
         n = batch
         a = torch.randint(0, self.n_items, (n,), device=device)
         b = torch.empty_like(a)
-        # choose relations uniformly
-        rel = torch.randint(0, 9, (n,), device=device)
+        # choose relations uniformly from allowed set (default: all 0..8)
+        if allowed_relations is None or len(allowed_relations) == 0:
+            rel_choices = torch.arange(0, 9, device=device)
+        else:
+            rel_choices = torch.tensor(allowed_relations, dtype=torch.long, device=device)
+        sel = torch.randint(0, len(rel_choices), (n,), device=device)
+        rel = rel_choices[sel]
         y = torch.empty(n, dtype=torch.long, device=device)
 
         def _tens(x: int) -> int:
@@ -197,6 +202,43 @@ class EpisodeGenerator:
             "label": y,
             "domain": torch.zeros(n, dtype=torch.long, device=self.cfg.device),
         }
+
+    def sample_place_value(self, batch: int, allowed_kinds: List[int] | None = None) -> Dict[str, torch.Tensor]:
+        """
+        Returns questions about digits and place values with numeric targets.
+        kind encodes the task type:
+          0 -> ones digit (target = ones(a))
+          1 -> tens digit (target = tens(a))
+          2 -> tens place value (target = 10 * tens(a))
+          3 -> face value of the specified digit (ones/tens) (target = that digit)
+        """
+        device = self.cfg.device
+        N = self.n_items
+        if allowed_kinds is None or len(allowed_kinds) == 0:
+            kind_choices = torch.arange(0, 4, device=device)
+        else:
+            kind_choices = torch.tensor(allowed_kinds, dtype=torch.long, device=device)
+        sel = torch.randint(0, len(kind_choices), (batch,), device=device)
+        kind = kind_choices[sel]
+        a = torch.randint(0, N, (batch,), device=device)
+        y = torch.zeros_like(a)
+        face_place = torch.full_like(a, -1)  # -1: N/A, 0: ones, 1: tens
+        for i in range(batch):
+            ai = int(a[i].item())
+            k = int(kind[i].item())
+            tens = (ai // 10) % 10
+            ones = ai % 10
+            if k == 0:  # ones digit
+                y[i] = ones
+            elif k == 1:  # tens digit
+                y[i] = tens
+            elif k == 2:  # tens place value
+                y[i] = tens * 10
+            else:  # face value of a specific place (choose ones or tens)
+                fp = int(torch.randint(0, 2, (1,), device=device).item())
+                face_place[i] = fp
+                y[i] = ones if fp == 0 else tens
+        return {"kind": kind, "a": a, "target": y, "face_place": face_place}
 
     def sample_triples(self, batch: int) -> Dict[str, torch.Tensor]:
         device = self.cfg.device

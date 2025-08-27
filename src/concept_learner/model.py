@@ -42,8 +42,12 @@ class CLModel(nn.Module):
         _codebook = 16 if vq_codebook_size is None else int(vq_codebook_size)
         _num_q = 3 if vq_num_quantizers is None else int(vq_num_quantizers)
         _num_ph = 2 if vq_num_parallel_heads is None else int(vq_num_parallel_heads)
-        _serial_codebook = 8 if vq_serial_codebook_size is None else int(vq_serial_codebook_size)
-        _commit_w = 0.45 if vq_commitment_weight is None else float(vq_commitment_weight)
+        _serial_codebook = (
+            8 if vq_serial_codebook_size is None else int(vq_serial_codebook_size)
+        )
+        _commit_w = (
+            0.45 if vq_commitment_weight is None else float(vq_commitment_weight)
+        )
         _noise_std = 0.07 if vq_pre_vq_noise_std is None else float(vq_pre_vq_noise_std)
         _orth_w = 1e-4 if vq_orth_weight is None else float(vq_orth_weight)
         _ent_w = 0.0 if vq_entropy_weight is None else float(vq_entropy_weight)
@@ -92,19 +96,24 @@ class CLModel(nn.Module):
 
 
 class FiLM(nn.Module):
-    def __init__(self, d):
+    def __init__(self, d, hidden=None):
         super().__init__()
-        self.to_gamma = nn.Linear(d, d)
-        self.to_beta = nn.Linear(d, d)
-        nn.init.zeros_(self.to_gamma.weight)
-        nn.init.zeros_(self.to_gamma.bias)
-        nn.init.zeros_(self.to_beta.weight)
-        nn.init.zeros_(self.to_beta.bias)
+        h = hidden or max(64, d // 2)
+        self.gamma_net = nn.Sequential(nn.Linear(d, h), nn.GELU(), nn.Linear(h, d))
+        self.beta_net = nn.Sequential(nn.Linear(d, h), nn.GELU(), nn.Linear(h, d))
+        nn.init.zeros_(self.gamma_net[-1].weight)
+        nn.init.zeros_(self.gamma_net[-1].bias)
+        nn.init.zeros_(self.beta_net[-1].weight)
+        nn.init.zeros_(self.beta_net[-1].bias)
+        self.post_ln = nn.LayerNorm(d)
+        # global strength (logit) → starts tiny
+        self.strength = nn.Parameter(torch.tensor(-3.0))  # σ(-3)≈0.047
 
-    def forward(self, H: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        gamma = self.to_gamma(z).unsqueeze(1)
-        beta = self.to_beta(z).unsqueeze(1)
-        return H * (1 + gamma) + beta
+    def forward(self, H, z):
+        s = torch.sigmoid(self.strength)
+        gamma = self.gamma_net(z).unsqueeze(1) * s
+        beta = self.beta_net(z).unsqueeze(1) * s
+        return self.post_ln(H * (1 + gamma) + beta)
 
 
 # class FiLM(nn.Module):

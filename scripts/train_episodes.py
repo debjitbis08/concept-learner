@@ -168,11 +168,13 @@ def _quick_eval(
     eval_batches: int,
     max_len: int,
     num_numbers: int,
+    relations: str | None = None,
 ) -> float:
     model.eval()
     total, correct = 0, 0
     for _ in range(eval_batches):
-        batch = gen.sample_posneg_pairs(batch=batch_size)
+        rel_ids = _parse_relations_arg(relations)
+        batch = gen.sample_posneg_pairs(batch=batch_size, allowed_relations=rel_ids)
         ids, mask = _pack_pair_questions_text(batch, tok, max_len)
         y = batch["label"].to(device)
         _, logits_seq, _, _, _, _ = model(ids, mask)
@@ -274,6 +276,86 @@ def _pack_count_examples_text(kind, a, c, tok: HFTokenizerWrapper, max_len: int)
             )
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_place_value_text(kind, a, tok: HFTokenizerWrapper, max_len: int, face_place=None):
+    import random
+    kind_l = kind.tolist()
+    a_l = a.tolist()
+    texts = []
+    fp_l = None
+    if face_place is not None:
+        try:
+            fp_l = face_place.tolist()
+        except Exception:
+            fp_l = None
+    for idx, (k, ai) in enumerate(zip(kind_l, a_l)):
+        if k == 0:
+            texts.append(random.choice([
+                f"What is the ones digit of {ai}?",
+                f"Ones digit of {ai}?",
+                f"Which digit is in the ones place of {ai}?",
+            ]))
+        elif k == 1:
+            texts.append(random.choice([
+                f"What is the tens digit of {ai}?",
+                f"Tens digit of {ai}?",
+                f"Which digit is in the tens place of {ai}?",
+            ]))
+        elif k == 2:
+            texts.append(random.choice([
+                f"What is the place value of the tens digit of {ai}?",
+                f"Place value of tens digit in {ai}?",
+                f"What value does the tens place contribute in {ai}?",
+            ]))
+        else:
+            # face value of a specific place (ones/tens)
+            place = None
+            if fp_l is not None:
+                v = fp_l[idx]
+                place = "ones" if v == 0 else ("tens" if v == 1 else None)
+            if place is None:
+                place = random.choice(["ones", "tens"])
+            texts.append(random.choice([
+                f"What is the face value of the {place} digit of {ai}?",
+                f"Face value of the {place} digit in {ai}?",
+                f"What is the face value for the {place} place in {ai}?",
+            ]))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _parse_relations_arg(rel_arg: str | None):
+    """Parse --relations for pair relations (0..8). Returns list of ids or None (all)."""
+    if not rel_arg or rel_arg.strip().lower() == "all":
+        return None
+    name_to_id = {
+        "same_parity": 0,
+        "successor": 1,
+        "predecessor": 2,
+        "add_2": 3,
+        "same_tens": 4,
+        "same_ones": 5,
+        "makes_ten": 6,
+        "greater": 7,
+        "smaller": 8,
+    }
+    ids = []
+    for part in rel_arg.split(","):
+        s = part.strip().lower()
+        if s == "":
+            continue
+        if s.isdigit():
+            i = int(s)
+            if 0 <= i <= 8:
+                ids.append(i)
+        elif s in name_to_id:
+            ids.append(name_to_id[s])
+        else:
+            # ignore non-pair names here (e.g., place_value, face_value)
+            pass
+    ids = sorted(set(ids))
+    return ids if len(ids) > 0 else None
 
 
 def _pack_equality_examples_text(
@@ -447,6 +529,7 @@ def train(args):
                 eval_batches=10,
                 max_len=args.max_len,
                 num_numbers=num_numbers,
+                relations=getattr(args, "relations", None),
             )
             print(f"Computed baseline val_acc after resume: {best_acc:.3f}")
 
@@ -494,13 +577,34 @@ def train(args):
     for step in range(start_step, args.steps):
         if args.sched == "cosine":
             set_cosine_lr(step)
-        if args.overfit_batch is not None and step == start_step:
-            cached = gen.sample_posneg_pairs(batch=args.overfit_batch)
-        batch = (
-            cached
-            if args.overfit_batch is not None
-            else gen.sample_posneg_pairs(batch=args.batch_size)
-        )
+        rel_arg = getattr(args, "relations", None)
+        rel_ids = _parse_relations_arg(rel_arg)
+        include_pairs = True
+        if rel_arg and rel_arg.strip().lower() != "all" and (rel_ids is None or len(rel_ids) == 0):
+            include_pairs = False
+
+        if include_pairs:
+            if args.overfit_batch is not None and step == start_step:
+                cached = gen.sample_posneg_pairs(
+                    batch=args.overfit_batch, allowed_relations=rel_ids
+                )
+            batch = (
+                cached
+                if args.overfit_batch is not None
+                else gen.sample_posneg_pairs(
+                    batch=args.batch_size, allowed_relations=rel_ids
+                )
+            )
+        else:
+            # empty pairs batch
+            B0 = 0
+            device0 = device
+            batch = {
+                "a_idx": torch.empty(B0, dtype=torch.long, device=device0),
+                "b_idx": torch.empty(B0, dtype=torch.long, device=device0),
+                "rel": torch.empty(B0, dtype=torch.long, device=device0),
+                "label": torch.empty(B0, dtype=torch.long, device=device0),
+            }
         # natural-language pair questions
         ids_pairs, mask_pairs = _pack_pair_questions_text(batch, tok, max_len=seq_len)
         y_pairs_bin = batch["label"].to(device)
@@ -526,9 +630,34 @@ def train(args):
         )
         y_cnt = data_cnt["target"].to(device)  # 0..N-1
 
-        ids = torch.cat([ids_pairs, ids_eq, ids_cnt], dim=0)
-        mask = torch.cat([mask_pairs, mask_eq, mask_cnt], dim=0)
-        y = torch.cat([y_pairs, y_eq, y_cnt], dim=0)
+        # place-value / face-value inclusion controlled by --relations
+        include_place, include_face = True, True
+        rel_arg = getattr(args, "relations", None)
+        if rel_arg and rel_arg.strip().lower() != "all":
+            # determine inclusion from names
+            rel_arg_l = [s.strip().lower() for s in rel_arg.split(",") if s.strip()]
+            include_place = any(s in ("place_value",) for s in rel_arg_l)
+            include_face = any(s in ("face_value",) for s in rel_arg_l)
+        allowed_kinds = []
+        if include_face:
+            allowed_kinds += [0, 1, 3]
+        if include_place:
+            allowed_kinds += [2]
+        use_pv = len(allowed_kinds) > 0
+        if use_pv:
+            pv_bsz = args.batch_size
+            data_pv = gen.sample_place_value(batch=pv_bsz, allowed_kinds=allowed_kinds)
+            ids_pv, mask_pv = _pack_place_value_text(
+                data_pv["kind"], data_pv["a"], tok, max_len=seq_len, face_place=data_pv.get("face_place")
+            )
+            y_pv = data_pv["target"].to(device)
+            ids = torch.cat([ids_pairs, ids_eq, ids_cnt, ids_pv], dim=0)
+            mask = torch.cat([mask_pairs, mask_eq, mask_cnt, mask_pv], dim=0)
+            y = torch.cat([y_pairs, y_eq, y_cnt, y_pv], dim=0)
+        else:
+            ids = torch.cat([ids_pairs, ids_eq, ids_cnt], dim=0)
+            mask = torch.cat([mask_pairs, mask_eq, mask_cnt], dim=0)
+            y = torch.cat([y_pairs, y_eq, y_cnt], dim=0)
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
 
         loss_seq = torch.nn.functional.cross_entropy(
@@ -569,10 +698,14 @@ def train(args):
                 torch.tensor(1, device=device),
             )
 
+        # place-value tasks -> assume 1 step
+        steps_pv = torch.ones(0, dtype=torch.long, device=device)
+
         # assign into targets/mask for concatenated batch
         off_pairs = 0
         off_eq = ids_pairs.size(0)
         off_cnt = ids_pairs.size(0) + ids_eq.size(0)
+        off_pv = ids_pairs.size(0) + ids_eq.size(0) + ids_cnt.size(0)
         for i, s in enumerate(steps_pairs.tolist()):
             s = int(max(1, min(s, max_steps)))
             stop_targets[off_pairs + i, s - 1] = 1.0
@@ -585,6 +718,12 @@ def train(args):
             s = int(max(1, min(s, max_steps)))
             stop_targets[off_cnt + i, s - 1] = 1.0
             stop_mask[off_cnt + i, :s] = 1.0
+        if use_pv:
+            steps_pv = torch.ones(ids_pv.size(0), dtype=torch.long, device=device)
+            for i, s in enumerate(steps_pv.tolist()):
+                s = int(max(1, min(s, max_steps)))
+                stop_targets[off_pv + i, s - 1] = 1.0
+                stop_mask[off_pv + i, :s] = 1.0
 
         # masked BCE across valid steps only
         stop_per = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -634,6 +773,7 @@ def train(args):
                 eval_batches=10,
                 max_len=seq_len,
                 num_numbers=num_numbers,
+                relations=getattr(args, "relations", None),
             )
             # quick counting eval
             model.eval()
@@ -1048,6 +1188,16 @@ def main():
         action="store_true",
         help="Force base-10 rendering only (min_base=max_base=10)",
     )
+    pt.add_argument(
+        "--relations",
+        type=str,
+        default="all",
+        help=(
+            "Comma-separated relation names or ids to train on (or 'all'). "
+            "Pair relations: same_parity, successor, predecessor, add_2, same_tens, same_ones, makes_ten, greater, smaller. "
+            "Special: place_value, face_value (controls inclusion of place/face value tasks)."
+        ),
+    )
 
     pe = sub.add_parser("eval", help="Evaluate from a checkpoint")
     add_shared(pe)
@@ -1086,9 +1236,47 @@ def main():
     ce.add_argument("--max_len", type=int, default=18)
     ce.add_argument("--eval_batches", type=int, default=100)
 
+    # Free-form question
+    ask = sub.add_parser("ask", help="Ask a free-form question")
+    ask.add_argument("--device", type=str, default=None)
+    ask.add_argument("--d_model", type=int, default=128)
+    ask.add_argument("--max_number", type=int, default=100, help="Number classes (0..N-1) + {YES,NO}")
+    ask.add_argument("--checkpoint", type=str, required=True)
+    ask.add_argument("--max_len", type=int, default=32)
+    ask.add_argument("--text", type=str, required=True, help="Question text to ask")
+
     args = p.parse_args()
     if args.cmd == "eval":
         evaluate(args)
+        return
+    if args.cmd == "ask":
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        tok = HFTokenizerWrapper("bert-base-cased")
+        vocab_size = tok.vocab_size
+        num_numbers = args.max_number
+        YES_IDX = num_numbers
+        NO_IDX = num_numbers + 1
+        model = CLModel(
+            vocab_size=vocab_size,
+            d_model=args.d_model,
+            num_classes=num_numbers + 2,
+            pad_id=0,
+            cls_id=1,
+            max_len=args.max_len,
+        ).to(device)
+        assert args.checkpoint and os.path.isfile(args.checkpoint), "--checkpoint required"
+        load_checkpoint(args.checkpoint, model, opt=None, map_location=device)
+        model.eval()
+        ids, mask = _pack_text_batch([args.text], tok, args.max_len, device)
+        with torch.no_grad():
+            _, logits_seq, _, _, _, _ = model(ids, mask)
+            probs = torch.softmax(logits_seq, dim=-1)[0]
+            p_yes = float(probs[YES_IDX].item())
+            p_no = float(probs[NO_IDX].item())
+            num_probs = probs[:num_numbers]
+            num_pred = int(num_probs.argmax().item())
+            print(f"Q: {args.text}")
+            print(f"p(YES)={p_yes:.3f} p(NO)={p_no:.3f}  number_pred={num_pred}")
         return
     if args.cmd == "count-train":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
