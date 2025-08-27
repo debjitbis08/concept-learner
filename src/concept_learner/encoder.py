@@ -17,6 +17,7 @@ class TinyEncoderConfig:
     dropout: float = 0.0  # keep 0.0 for deterministic tests
     cls_id: int = 1  # reserve an explicit [CLS]
     pad_id: int = 0  # reserve PAD=0 by convention
+    use_modulo_pos: bool = True  # add a small modulo position embedding (e.g., mod 10)
 
 
 class SinusoidalPositionalEncoding(nn.Module):
@@ -49,6 +50,11 @@ class TinyEncoder(nn.Module):
         self.cfg = cfg
         self.tok_emb = nn.Embedding(cfg.vocab_size, cfg.d_model, padding_idx=cfg.pad_id)
         self.pos = SinusoidalPositionalEncoding(cfg.d_model, cfg.max_len)
+        # small learned modulo-position embedding to help periodic patterns (e.g., carry)
+        if cfg.use_modulo_pos:
+            self.pos_mod10 = nn.Embedding(10, cfg.d_model)
+        else:
+            self.pos_mod10 = None
         enc_layer = nn.TransformerEncoderLayer(
             d_model=cfg.d_model,
             nhead=cfg.nhead,
@@ -74,6 +80,11 @@ class TinyEncoder(nn.Module):
         x = self.pos(x)  # add sin/cos PE
 
         key_padding_mask = attn_mask == 0  # True where pad
+        # add modulo-10 positional hints if enabled
+        if self.pos_mod10 is not None:
+            B, T, _ = x.shape
+            pos_ids = torch.arange(T, device=x.device).remainder(10)
+            x = x + self.pos_mod10(pos_ids).unsqueeze(0)
         H = self.encoder(x, src_key_padding_mask=key_padding_mask)  # (B,T,d)
         H = self.out_ln(H)
 

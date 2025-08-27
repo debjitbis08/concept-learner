@@ -873,6 +873,32 @@ def train(args):
         mask = torch.cat([mask, mask_cmp], dim=0)
         y = torch.cat([y, y_cmp], dim=0)
 
+        # Edge-case oversampling for comparisons (near-boundary and equality)
+        try:
+            B_edge = max(1, int(0.15 * cmp_bsz))
+            a_edge = torch.randint(0, gen.n_items, (B_edge,), device=device)
+            # choose pattern among equal, +1, -1
+            mode = torch.randint(0, 3, (B_edge,), device=device)
+            b_edge = a_edge.clone()
+            b_edge = torch.where(mode == 0, a_edge, b_edge)
+            b_edge = torch.where(mode == 1, (a_edge + 1).clamp(max=gen.n_items - 1), b_edge)
+            b_edge = torch.where(mode == 2, (a_edge - 1).clamp(min=0), b_edge)
+            # build a>b? and a<b? variants evenly
+            op_edge = torch.randint(0, 2, (B_edge,), device=device)
+            # labels
+            y_bin_edge = torch.where(op_edge == 0, (a_edge > b_edge).long(), (a_edge < b_edge).long())
+            ids_cmp2, mask_cmp2 = _pack_symbolic_compare_text(a_edge, b_edge, op_edge, tok, max_len=seq_len)
+            y_cmp2 = torch.where(
+                y_bin_edge > 0,
+                torch.full((B_edge,), YES_IDX, dtype=torch.long, device=device),
+                torch.full((B_edge,), NO_IDX, dtype=torch.long, device=device),
+            )
+            ids = torch.cat([ids, ids_cmp2], dim=0)
+            mask = torch.cat([mask, mask_cmp2], dim=0)
+            y = torch.cat([y, y_cmp2], dim=0)
+        except Exception:
+            pass
+
         # addition batch (a+b=?) -> numeric class
         add_bsz = args.batch_size
         data_add = gen.sample_addition(batch=add_bsz, idx_range=train_idx_range)
@@ -912,6 +938,83 @@ def train(args):
         loss_seq = torch.nn.functional.cross_entropy(
             logits_seq, y, label_smoothing=args.label_smoothing
         )
+
+        # ---- Auxiliary: margin-aware BCE for YES/NO near boundary ----
+        # apply only on symbolic compares where |a-b|<=1 or a==b
+        try:
+            a_cmp = data_cmp["a"].to(device)
+            b_cmp = data_cmp["b"].to(device)
+            y_cmp_bin = data_cmp["label"].float().to(device)
+            # recompute logits for compare-only subset to select YES/NO channels
+            with torch.no_grad():
+                ids_c, mask_c = ids_cmp, mask_cmp
+            logits_cmp = model(ids_c, mask_c)[1]
+            yes_no = logits_cmp[:, [YES_IDX, NO_IDX]]  # (B,2)
+            # convert to a single logit for p(yes)
+            logit_yes = yes_no[:, 0] - yes_no[:, 1]
+            w = torch.where((a_cmp == b_cmp) | ((a_cmp - b_cmp).abs() <= 1), 1.3, 1.0)
+            bce_margin = torch.nn.functional.binary_cross_entropy_with_logits(
+                logit_yes, y_cmp_bin, weight=w
+            )
+        except Exception:
+            bce_margin = torch.tensor(0.0, device=device)
+
+        # ---- Auxiliary: ranking loss to encourage monotone number line ----
+        # Use symbolic compare pairs for supervision
+        try:
+            # pack numbers alone so the numeric head reads only digits
+            def _pack_numbers(nums: torch.Tensor):
+                texts = [str(int(v.item())) for v in nums]
+                return _pack_text_batch(texts, tok, max_len=seq_len, device=device)
+
+            a_rank = data_cmp["a"]
+            b_rank = data_cmp["b"]
+            # Counterfactual pairing near boundary: flip by +/-1 when possible
+            try:
+                a_cf = a_rank.clone()
+                b_cf = b_rank.clone()
+                # move the right-hand side by +1 or -1 to cross boundary occasionally
+                delta = torch.randint_like(b_cf, low=0, high=2)
+                delta = torch.where(delta == 0, torch.tensor(-1, device=device), torch.tensor(1, device=device))
+                b_cf = (b_cf + delta).clamp_min(0)
+                a_rank = torch.cat([a_rank, a_cf], dim=0)
+                b_rank = torch.cat([b_rank, b_cf], dim=0)
+            except Exception:
+                pass
+            ids_a, mask_a = _pack_numbers(a_rank)
+            ids_b, mask_b = _pack_numbers(b_rank)
+            v_a = model.predict_scalar(ids_a, mask_a).squeeze(-1)
+            v_b = model.predict_scalar(ids_b, mask_b).squeeze(-1)
+            # sign = +1 when a<b, -1 when a>b
+            sign = torch.where(a_rank < b_rank, 1.0, -1.0).to(device)
+            margin = 1.0
+            rank_loss = torch.nn.functional.relu(margin - sign * (v_b - v_a)).mean()
+        except Exception:
+            rank_loss = torch.tensor(0.0, device=device)
+
+        # ---- Auxiliary: numeric regression on digits (20% of steps) ----
+        try:
+            if step % 5 == 0:
+                nums = []
+                for t in [
+                    data_add.get("a"), data_add.get("b"), data_add.get("target"),
+                    data_off.get("a"), data_off.get("target"),
+                    data_cnt.get("a"), data_cnt.get("target"),
+                ]:
+                    if t is not None:
+                        nums.append(t.to(device))
+                if len(nums) > 0:
+                    nums_cat = torch.unique(torch.cat(nums))
+                    ids_n, mask_n = _pack_numbers(nums_cat)
+                    v_pred = model.predict_scalar(ids_n, mask_n).squeeze(-1)
+                    v_tgt = torch.log1p(nums_cat.float())
+                    num_loss = torch.nn.functional.mse_loss(v_pred, v_tgt)
+                else:
+                    num_loss = torch.tensor(0.0, device=device)
+            else:
+                num_loss = torch.tensor(0.0, device=device)
+        except Exception:
+            num_loss = torch.tensor(0.0, device=device)
 
         # Build stop targets per-example using simple heuristics from episode metadata
         max_steps = getattr(model.reasoner, "max_steps", 1)
@@ -1009,7 +1112,31 @@ def train(args):
             stop_logits, stop_targets, reduction="none"
         )
         stop_loss = (stop_per * stop_mask).sum() / stop_mask.sum().clamp_min(1.0)
-        loss = loss_seq + args.lambda_vq * vq_loss + args.lambda_stop * stop_loss
+
+        # tiny OpAdd stabilization regularizer (encourage integer-like k)
+        reg_k = 0.0
+        try:
+            for op in getattr(model.reasoner, "ops", []):
+                if getattr(op, "name", "") == "add":
+                    reg_k = reg_k + op.regularization()
+            reg_k = float(reg_k) if isinstance(reg_k, (int, float)) else reg_k
+        except Exception:
+            reg_k = torch.tensor(0.0, device=device)
+
+        lambda_rank = 0.1
+        lambda_num = 0.05
+        lambda_margin = 1.0
+        lambda_k = 1e-3
+
+        loss = (
+            loss_seq
+            + args.lambda_vq * vq_loss
+            + args.lambda_stop * stop_loss
+            + lambda_rank * rank_loss
+            + lambda_num * num_loss
+            + lambda_margin * bce_margin
+            + lambda_k * reg_k
+        )
 
         opt.zero_grad(set_to_none=True)
         loss.backward()

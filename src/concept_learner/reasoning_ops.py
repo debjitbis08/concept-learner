@@ -172,12 +172,33 @@ class OpAdd(OpBase):
         alpha = F.softplus(self.alpha_raw) + 1e-6
         if self.use_z:
             k = self.k_head(z)  # (B,1)
+            # cache for optional regularization
+            self._last_k = k
         else:
             # broadcast scalar parameter to (B,1)
             B = state.val.size(0)
             k = self.k.expand(B, 1)
         val = beta * state.val + alpha * k
         return state.mask, val, state.boolean
+
+    def regularization(self, z: torch.Tensor | None = None) -> torch.Tensor:
+        """Soft penalty to discourage fractional drift of k.
+
+        Encourages k toward {-1, +1, +10} by minimizing min(|k-1|, |k+1|, |k-10|).
+        Returns a scalar tensor.
+        """
+        if self.use_z:
+            if z is not None:
+                k = self.k_head(z)
+            else:
+                k = getattr(self, "_last_k", None)
+                if k is None:
+                    return torch.tensor(0.0, device=self.beta_raw.device)
+        else:
+            k = self.k
+        targets = torch.stack([(k - 1.0).abs(), (k + 1.0).abs(), (k - 10.0).abs()], dim=-1)
+        pen = targets.min(dim=-1).values
+        return pen.mean()
 
 
 # ------------------------------ GENERIC COMPARE --------------------------

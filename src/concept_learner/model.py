@@ -81,6 +81,12 @@ class CLModel(nn.Module):
             temperature=1.0,
         )
         self.decoder = UnifiedDecoder(d_model, num_classes)  # NEW
+        # Auxiliary numeric head (scalar) for ranking/regression losses
+        self.num_head = nn.Sequential(
+            nn.Linear(d_model, max(32, d_model // 2)),
+            nn.GELU(),
+            nn.Linear(max(32, d_model // 2), 1),
+        )
 
     def forward(self, ids: torch.Tensor, mask: torch.Tensor):
         # ids: (B,T) long, mask: (B,T) long (1=real, 0=pad)
@@ -94,6 +100,18 @@ class CLModel(nn.Module):
         val_final = getattr(self.reasoner, "_last_val", None)
         logits_tok, logits_seq = self.decoder(H_reasoned, mask, val=val_final)
         return logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits
+
+    def predict_scalar(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Predict a scalar numeric value from a token sequence.
+
+        Uses encoder pooled state passed through a small MLP. This head is
+        intentionally separate from the main classifier so it can be used for
+        ranking/regression auxiliary losses without affecting decoder shapes.
+        Returns tensor of shape (B,1).
+        """
+        h, _ = self.enc(ids, mask)
+        v = self.num_head(h)
+        return v
 
 
 class FiLM(nn.Module):
