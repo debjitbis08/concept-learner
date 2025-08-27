@@ -17,31 +17,31 @@ build-backend = "hatchling.build"
 name = "concept-learner"
 version = "0.1.0"
 description = ""
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 authors = [{ name = "Debjit Biswas" }]
 license = "BSD-3-Clause"
 readme = "README.md"
 dependencies = [
-    "pyrootutils",
-    "loguru",
-    "torch>=2.8.0",
-    "tokenizers>=0.21.4",
-    "transformers>=4.55.4",
-    "vector-quantize-pytorch>=1.23.1",
+  "pyrootutils",
+  "loguru",
+  "torch>=2.8.0",
+  "tokenizers>=0.21.4",
+  "transformers>=4.55.4",
+  "vector-quantize-pytorch>=1.23.1",
 ]
 
 [dependency-groups]
 dev = [
-    "mypy",
-    "ruff",
-    "pytest",
-    "pytest-cov",
-    "pytest-mock",
-    "pytest-pylint",
-    "pytest-mypy",
-    "pytest-testmon",
-    "pytest-xdist",
-    "nbmake",
+  "mypy",
+  "ruff",
+  "pytest",
+  "pytest-cov",
+  "pytest-mock",
+  "pytest-pylint",
+  "pytest-mypy",
+  "pytest-testmon",
+  "pytest-xdist",
+  "nbmake",
 ]
 
 [tool.uv]
@@ -58,6 +58,6 @@ explicit = true
 
 [tool.uv.sources]
 torch = [
-    { index = "pytorch", marker = "sys_platform == 'linux'" },
-    { index = "pypi", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch", marker = "sys_platform == 'linux'" },
+  { index = "pypi", marker = "sys_platform == 'darwin'" },
 ]
