@@ -169,13 +169,15 @@ def _quick_eval(
     max_len: int,
     num_numbers: int,
     relations: str | None = None,
+    idx_range: tuple[int, int] | None = None,
+    template_filter: dict | None = None,
 ) -> float:
     model.eval()
     total, correct = 0, 0
     for _ in range(eval_batches):
         rel_ids = _parse_relations_arg(relations)
-        batch = gen.sample_posneg_pairs(batch=batch_size, allowed_relations=rel_ids)
-        ids, mask = _pack_pair_questions_text(batch, tok, max_len)
+        batch = gen.sample_posneg_pairs(batch=batch_size, allowed_relations=rel_ids, idx_range=idx_range)
+        ids, mask = _pack_pair_questions_text(batch, tok, max_len, template_filter=template_filter)
         y = batch["label"].to(device)
         _, logits_seq, _, _, _, _ = model(ids, mask)
         NO_IDX = num_numbers + 1
@@ -223,16 +225,65 @@ def _pair_templates(a: int, b: int, r: int) -> List[str]:
     return [f"Do {a} and {b} satisfy the relation?"]
 
 
-def _pack_pair_questions_text(batch, tok: HFTokenizerWrapper, max_len: int):
+def _pack_pair_questions_text(batch, tok: HFTokenizerWrapper, max_len: int, template_filter: dict | None = None):
     import random
 
     a = batch["a_idx"].tolist()
     b = batch["b_idx"].tolist()
     r = batch["rel"].tolist()
     texts = []
+    tf = template_filter
     for ai, bi, ri in zip(a, b, r):
         tpls = _pair_templates(ai, bi, ri)
-        texts.append(random.choice(tpls))
+        if isinstance(tf, dict) and ri in tf and len(tf[ri]) > 0:
+            idxs = [i for i in tf[ri] if 0 <= i < len(tpls)]
+            if len(idxs) == 0:
+                choice = random.choice(tpls)
+            else:
+                choice = tpls[random.choice(idxs)]
+        else:
+            choice = random.choice(tpls)
+        texts.append(choice)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_parity_text(a: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    texts = []
+    for ai in a.tolist():
+        texts.append(
+            random.choice(
+                [
+                    f"Is {ai} even or odd?",
+                    f"Parity of {ai}?",
+                    f"Is the number {ai} even or odd?",
+                ]
+            )
+        )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_offset_text(a: torch.Tensor, off: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    texts = []
+    for ai, oi in zip(a.tolist(), off.tolist()):
+        if int(oi) >= 0:
+            k = int(oi)
+            choices = [
+                f"What is {ai}+{k}?",
+                f"{ai} + {k} = ?",
+                f"Compute {ai} + {k}.",
+            ]
+        else:
+            k = abs(int(oi))
+            choices = [
+                f"What is {ai}-{k}?",
+                f"{ai} - {k} = ?",
+                f"Compute {ai} - {k}.",
+            ]
+        texts.append(random.choice(choices))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return _pack_text_batch(texts, tok, max_len, device)
 
@@ -321,6 +372,64 @@ def _pack_place_value_text(kind, a, tok: HFTokenizerWrapper, max_len: int, face_
                 f"Face value of the {place} digit in {ai}?",
                 f"What is the face value for the {place} place in {ai}?",
             ]))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_num_equality_text(a: torch.Tensor, b: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    a_l = a.tolist()
+    b_l = b.tolist()
+    texts = []
+    for ai, bi in zip(a_l, b_l):
+        texts.append(
+            random.choice(
+                [
+                    f"Is {ai} equal to {bi}?",
+                    f"Are {ai} and {bi} equal?",
+                    f"{ai} = {bi}?",
+                    f"{ai} == {bi}?",
+                    f"Does {ai} equal {bi}?",
+                ]
+            )
+        )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_symbolic_compare_text(a: torch.Tensor, b: torch.Tensor, op: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    a_l = a.tolist(); b_l = b.tolist(); op_l = op.tolist()
+    texts = []
+    for ai, bi, oi in zip(a_l, b_l, op_l):
+        sym = '>' if oi == 0 else '<'
+        candidates = [
+            f"{ai}{sym}{bi}?",
+            f"{ai} {sym} {bi}?",
+            f"Is {ai}{sym}{bi}?",
+            f"Is {ai} {sym} {bi}?",
+            f"Is {ai} {sym} {bi} true?",
+        ]
+        texts.append(random.choice(candidates))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return _pack_text_batch(texts, tok, max_len, device)
+
+
+def _pack_addition_text(a: torch.Tensor, b: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
+    import random
+    a_l = a.tolist(); b_l = b.tolist()
+    texts = []
+    for ai, bi in zip(a_l, b_l):
+        candidates = [
+            f"{ai}+{bi}=?",
+            f"{ai} + {bi} = ?",
+            f"What is {ai}+{bi}?",
+            f"What is {ai} + {bi}?",
+            f"What is the sum of {ai} and {bi}?",
+            f"Compute {ai} + {bi}.",
+            f"{ai} plus {bi} equals ?",
+        ]
+        texts.append(random.choice(candidates))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return _pack_text_batch(texts, tok, max_len, device)
 
@@ -451,6 +560,26 @@ class ExponentialMovingAverage:
             if param.requires_grad:
                 self.shadow[name] = param.detach().clone()
 
+    @torch.no_grad()
+    def reconcile(self, model: torch.nn.Module):
+        """
+        Align EMA shadow tensors to current model parameter shapes/devices.
+        If a shadow entry is missing or has a mismatched shape, reinitialize it
+        from the current parameter value to avoid shape errors after architecture changes.
+        Removes shadow entries that no longer correspond to any parameter.
+        """
+        new_shadow = {}
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            cur = self.shadow.get(name)
+            if cur is None or tuple(cur.shape) != tuple(param.shape):
+                new_shadow[name] = param.detach().clone()
+            else:
+                # ensure device matches
+                new_shadow[name] = cur.detach().to(param.device).clone()
+        self.shadow = new_shadow
+
 
 def train(args):
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -467,14 +596,16 @@ def train(args):
 
     tok = HFTokenizerWrapper("bert-base-cased")
     vocab_size = tok.vocab_size
-    # unified head: numbers (0..N-1) + {YES, NO}
+    # unified head: numbers (0..N-1) + {YES, NO, EVEN, ODD}
     num_numbers = ecfg.max_number
     YES_IDX = num_numbers
     NO_IDX = num_numbers + 1
+    EVEN_IDX = num_numbers + 2
+    ODD_IDX = num_numbers + 3
     model = CLModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
-        num_classes=num_numbers + 2,
+        num_classes=num_numbers + 4,
         pad_id=0,
         cls_id=1,
         max_len=args.max_len,
@@ -520,6 +651,14 @@ def train(args):
             best_acc = float(ckpt_best)
             print(f"Loaded best_acc from checkpoint: {best_acc:.3f}")
         else:
+            def parse_range(s):
+                if not s:
+                    return None
+                try:
+                    lo, hi = s.split("-")
+                    return (int(lo), int(hi))
+                except Exception:
+                    return None
             best_acc = _quick_eval(
                 model,
                 gen,
@@ -530,6 +669,8 @@ def train(args):
                 max_len=args.max_len,
                 num_numbers=num_numbers,
                 relations=getattr(args, "relations", None),
+                idx_range=parse_range(getattr(args, "train_range", None)),
+                template_filter=tmpl_train,
             )
             print(f"Computed baseline val_acc after resume: {best_acc:.3f}")
 
@@ -542,6 +683,8 @@ def train(args):
                 ck = torch.load(args.resume, map_location=device)
                 if isinstance(ck.get("ema"), dict):
                     ema.load_state_dict(ck["ema"])
+                    # reconcile shadow shapes with current model (e.g., class count changed)
+                    ema.reconcile(model)
                 else:
                     ema.reset(model)
             except Exception:
@@ -572,6 +715,21 @@ def train(args):
         )
 
     best_acc = -1.0 if not (args.resume and os.path.isfile(args.resume)) else best_acc
+    # Template holdout split (for template-OOD)
+    def build_template_filters(holdout_ratio: float = 0.0):
+        train_filt, ood_filt = {}, {}
+        for r in range(9):
+            tlist = _pair_templates(3, 5, r)
+            k = len(tlist)
+            if k <= 1:
+                train_filt[r] = [0]
+                ood_filt[r] = []
+                continue
+            k_tr = max(1, int(k * (1.0 - holdout_ratio)))
+            train_filt[r] = list(range(0, k_tr))
+            ood_filt[r] = list(range(k_tr, k))
+        return train_filt, ood_filt
+    tmpl_train, tmpl_ood = build_template_filters(getattr(args, "template_holdout", 0.0))
     model.train()
     seq_len = args.max_len
     for step in range(start_step, args.steps):
@@ -579,20 +737,35 @@ def train(args):
             set_cosine_lr(step)
         rel_arg = getattr(args, "relations", None)
         rel_ids = _parse_relations_arg(rel_arg)
+        # Remove training for same_parity (0), same_tens (4), same_ones (5), makes_ten (6)
+        if rel_ids is None:
+            rel_ids = [1, 2, 3, 7, 8]
+        else:
+            rel_ids = [r for r in rel_ids if r not in (0, 4, 5, 6)]
         include_pairs = True
         if rel_arg and rel_arg.strip().lower() != "all" and (rel_ids is None or len(rel_ids) == 0):
             include_pairs = False
 
         if include_pairs:
+            # optional restriction to training range for in-distribution sampling
+            def parse_range(s):
+                if not s:
+                    return None
+                try:
+                    lo, hi = s.split("-")
+                    return (int(lo), int(hi))
+                except Exception:
+                    return None
+            train_idx_range = parse_range(getattr(args, "train_range", None))
             if args.overfit_batch is not None and step == start_step:
                 cached = gen.sample_posneg_pairs(
-                    batch=args.overfit_batch, allowed_relations=rel_ids
+                    batch=args.overfit_batch, allowed_relations=rel_ids, idx_range=train_idx_range
                 )
             batch = (
                 cached
                 if args.overfit_batch is not None
                 else gen.sample_posneg_pairs(
-                    batch=args.batch_size, allowed_relations=rel_ids
+                    batch=args.batch_size, allowed_relations=rel_ids, idx_range=train_idx_range
                 )
             )
         else:
@@ -606,7 +779,9 @@ def train(args):
                 "label": torch.empty(B0, dtype=torch.long, device=device0),
             }
         # natural-language pair questions
-        ids_pairs, mask_pairs = _pack_pair_questions_text(batch, tok, max_len=seq_len)
+        ids_pairs, mask_pairs = _pack_pair_questions_text(
+            batch, tok, max_len=seq_len, template_filter=tmpl_train
+        )
         y_pairs_bin = batch["label"].to(device)
         y_pairs = torch.where(
             y_pairs_bin > 0,
@@ -624,7 +799,7 @@ def train(args):
 
         # counting batch
         cnt_bsz = args.batch_size
-        data_cnt = gen.sample_counting(batch=cnt_bsz)
+        data_cnt = gen.sample_counting(batch=cnt_bsz, idx_range=train_idx_range)
         ids_cnt, mask_cnt = _pack_count_examples_text(
             data_cnt["kind"], data_cnt["a"], data_cnt["c"], tok, max_len=seq_len
         )
@@ -646,7 +821,7 @@ def train(args):
         use_pv = len(allowed_kinds) > 0
         if use_pv:
             pv_bsz = args.batch_size
-            data_pv = gen.sample_place_value(batch=pv_bsz, allowed_kinds=allowed_kinds)
+            data_pv = gen.sample_place_value(batch=pv_bsz, allowed_kinds=allowed_kinds, idx_range=train_idx_range)
             ids_pv, mask_pv = _pack_place_value_text(
                 data_pv["kind"], data_pv["a"], tok, max_len=seq_len, face_place=data_pv.get("face_place")
             )
@@ -658,6 +833,72 @@ def train(args):
             ids = torch.cat([ids_pairs, ids_eq, ids_cnt], dim=0)
             mask = torch.cat([mask_pairs, mask_eq, mask_cnt], dim=0)
             y = torch.cat([y_pairs, y_eq, y_cnt], dim=0)
+
+        # numeric equality batch (true/false on a == b)
+        eqnum_bsz = args.batch_size
+        data_eqn = gen.sample_number_equality(batch=eqnum_bsz, idx_range=train_idx_range)
+        ids_eqn, mask_eqn = _pack_num_equality_text(
+            data_eqn["a"], data_eqn["b"], tok, max_len=seq_len
+        )
+        y_eqn = torch.where(
+            data_eqn["label"].to(device) > 0,
+            torch.full((eqnum_bsz,), YES_IDX, dtype=torch.long, device=device),
+            torch.full((eqnum_bsz,), NO_IDX, dtype=torch.long, device=device),
+        )
+
+        ids = torch.cat([ids, ids_eqn], dim=0)
+        mask = torch.cat([mask, mask_eqn], dim=0)
+        y = torch.cat([y, y_eqn], dim=0)
+
+        # symbolic comparison batch (a>b? a<b?) -> YES/NO
+        cmp_bsz = args.batch_size
+        data_cmp = gen.sample_symbolic_compare(batch=cmp_bsz, idx_range=train_idx_range)
+        ids_cmp, mask_cmp = _pack_symbolic_compare_text(
+            data_cmp["a"], data_cmp["b"], data_cmp["op"], tok, max_len=seq_len
+        )
+        y_cmp = torch.where(
+            data_cmp["label"].to(device) > 0,
+            torch.full((cmp_bsz,), YES_IDX, dtype=torch.long, device=device),
+            torch.full((cmp_bsz,), NO_IDX, dtype=torch.long, device=device),
+        )
+        ids = torch.cat([ids, ids_cmp], dim=0)
+        mask = torch.cat([mask, mask_cmp], dim=0)
+        y = torch.cat([y, y_cmp], dim=0)
+
+        # addition batch (a+b=?) -> numeric class
+        add_bsz = args.batch_size
+        data_add = gen.sample_addition(batch=add_bsz, idx_range=train_idx_range)
+        ids_add, mask_add = _pack_addition_text(
+            data_add["a"], data_add["b"], tok, max_len=seq_len
+        )
+        y_add = data_add["target"].to(device)
+        ids = torch.cat([ids, ids_add], dim=0)
+        mask = torch.cat([mask, mask_add], dim=0)
+        y = torch.cat([y, y_add], dim=0)
+
+        # parity batch -> outputs EVEN/ODD classes
+        par_bsz = args.batch_size
+        data_par = gen.sample_parity(batch=par_bsz, idx_range=train_idx_range)
+        ids_par, mask_par = _pack_parity_text(data_par["a"], tok, max_len=seq_len)
+        y_par = torch.where(
+            (data_par["target"].to(device) % 2) > 0,
+            torch.full((par_bsz,), ODD_IDX, dtype=torch.long, device=device),
+            torch.full((par_bsz,), EVEN_IDX, dtype=torch.long, device=device),
+        )
+        ids = torch.cat([ids, ids_par], dim=0)
+        mask = torch.cat([mask, mask_par], dim=0)
+        y = torch.cat([y, y_par], dim=0)
+
+        # simple +/- k tasks with k in {1,2,3}
+        off_bsz = args.batch_size
+        data_off = gen.sample_offset(batch=off_bsz, idx_range=train_idx_range)
+        ids_off, mask_off = _pack_offset_text(
+            data_off["a"], data_off["offset"], tok, max_len=seq_len
+        )
+        y_off = data_off["target"].to(device)
+        ids = torch.cat([ids, ids_off], dim=0)
+        mask = torch.cat([mask, mask_off], dim=0)
+        y = torch.cat([y, y_off], dim=0)
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
 
         loss_seq = torch.nn.functional.cross_entropy(
@@ -706,6 +947,11 @@ def train(args):
         off_eq = ids_pairs.size(0)
         off_cnt = ids_pairs.size(0) + ids_eq.size(0)
         off_pv = ids_pairs.size(0) + ids_eq.size(0) + ids_cnt.size(0)
+        off_eqn = off_pv + (ids_pv.size(0) if 'ids_pv' in locals() and use_pv else 0)
+        off_cmp = off_eqn + ids_eqn.size(0)
+        off_add = off_cmp + ids_cmp.size(0)
+        off_par = off_add + ids_add.size(0)
+        off_off = off_par + ids_par.size(0)
         for i, s in enumerate(steps_pairs.tolist()):
             s = int(max(1, min(s, max_steps)))
             stop_targets[off_pairs + i, s - 1] = 1.0
@@ -724,6 +970,31 @@ def train(args):
                 s = int(max(1, min(s, max_steps)))
                 stop_targets[off_pv + i, s - 1] = 1.0
                 stop_mask[off_pv + i, :s] = 1.0
+        # equality of numbers: treat as compare -> 2 steps
+        steps_eqn = torch.full((ids_eqn.size(0),), 2, dtype=torch.long, device=device)
+        for i, s in enumerate(steps_eqn.tolist()):
+            s = int(max(1, min(s, max_steps)))
+            stop_targets[off_eqn + i, s - 1] = 1.0
+            stop_mask[off_eqn + i, :s] = 1.0
+        # symbolic compare: also 2 steps
+        steps_cmp = torch.full((ids_cmp.size(0),), 2, dtype=torch.long, device=device)
+        for i, s in enumerate(steps_cmp.tolist()):
+            s = int(max(1, min(s, max_steps)))
+            stop_targets[off_cmp + i, s - 1] = 1.0
+            stop_mask[off_cmp + i, :s] = 1.0
+        # addition: 2 steps (parse + add)
+        steps_add = torch.full((ids_add.size(0),), 2, dtype=torch.long, device=device)
+        for i, s in enumerate(steps_add.tolist()):
+            s = int(max(1, min(s, max_steps)))
+            stop_targets[off_add + i, s - 1] = 1.0
+            stop_mask[off_add + i, :s] = 1.0
+        # parity and +/-k are 1-step
+        for i in range(ids_par.size(0)):
+            stop_targets[off_par + i, 0] = 1.0
+            stop_mask[off_par + i, 0] = 1.0
+        for i in range(ids_off.size(0)):
+            stop_targets[off_off + i, 0] = 1.0
+            stop_mask[off_off + i, 0] = 1.0
 
         # masked BCE across valid steps only
         stop_per = torch.nn.functional.binary_cross_entropy_with_logits(
@@ -797,10 +1068,114 @@ def train(args):
             if plateau_scheduler is not None:
                 plateau_scheduler.step(val_acc)
             cur_lr = opt.param_groups[0]["lr"]
-            extra = f" vq_util={vq_util:.3f}" if vq_util is not None else ""
+            # VQ diagnostics
+            vq_diag_str = ""
+            try:
+                ks = [model.rvq.codebook_size] * int(args.parallel_heads) + [
+                    model.rvq.serial_codebook_size
+                ] * int(args.serial_heads)
+                parts = []
+                for h, (idx_t, K) in enumerate(zip(indices, ks)):
+                    u = len(torch.unique(idx_t)) / max(1, K)
+                    counts = torch.bincount(idx_t.view(-1), minlength=K).float()
+                    p = counts / counts.sum().clamp_min(1.0)
+                    H = -(p * (p + 1e-8).log()).sum().item()
+                    ppl = float(torch.exp(torch.tensor(H)).item() / max(1, K))
+                    parts.append(f"h{h}:util={u:.2f},ppl={ppl:.2f}")
+                vq_diag_str = " ".join(parts)
+                # stability: eval twice deterministically
+                model.eval()
+                probe_ids = ids[: min(128, ids.size(0))]
+                probe_mask = mask[: min(128, mask.size(0))]
+                _, _, _, ind1, _, _ = model(probe_ids, probe_mask)
+                _, _, _, ind2, _, _ = model(probe_ids, probe_mask)
+                stab = []
+                for h in range(min(len(ind1), len(ks))):
+                    a1 = ind1[h].view(-1)
+                    a2 = ind2[h].view(-1)
+                    changed = (a1 != a2).float().mean().item()
+                    stab.append(f"h{h}:chg={changed:.3f}")
+                vq_diag_str += " | stab " + " ".join(stab)
+                model.train()
+            except Exception:
+                pass
+
+            # OOD evaluations
+            def parse_range(s):
+                if not s:
+                    return None
+                try:
+                    lo, hi = s.split("-")
+                    return (int(lo), int(hi))
+                except Exception:
+                    return None
+            in_range = parse_range(getattr(args, "train_range", None))
+            ood_range = parse_range(getattr(args, "ood_range", None))
+            val_in = _quick_eval(
+                model,
+                gen,
+                tok,
+                device,
+                batch_size=min(args.batch_size, 128),
+                eval_batches=5,
+                max_len=seq_len,
+                num_numbers=num_numbers,
+                relations=getattr(args, "relations", None),
+                idx_range=in_range,
+                template_filter=tmpl_train,
+            )
+            val_range = (
+                _quick_eval(
+                    model,
+                    gen,
+                    tok,
+                    device,
+                    batch_size=min(args.batch_size, 128),
+                    eval_batches=5,
+                    max_len=seq_len,
+                    num_numbers=num_numbers,
+                    relations=getattr(args, "relations", None),
+                    idx_range=ood_range,
+                    template_filter=tmpl_train,
+                )
+                if ood_range is not None
+                else float("nan")
+            )
+            val_tood = _quick_eval(
+                model,
+                gen,
+                tok,
+                device,
+                batch_size=min(args.batch_size, 128),
+                eval_batches=5,
+                max_len=seq_len,
+                num_numbers=num_numbers,
+                relations=getattr(args, "relations", None),
+                idx_range=in_range,
+                template_filter=tmpl_ood,
+            )
+            # boundary-OOD
+            b_batch = gen.sample_posneg_pairs_boundary(
+                batch=min(args.batch_size, 128), idx_range=in_range
+            )
+            ids_b, mask_b = _pack_pair_questions_text(
+                b_batch, tok, max_len=seq_len, template_filter=tmpl_train
+            )
+            with torch.no_grad():
+                _, logits_b, _, _, _, _ = model(ids_b, mask_b)
+                pred_b = logits_b[:, [NO_IDX, YES_IDX]].argmax(dim=-1)
+                acc_b = (
+                    (pred_b == b_batch["label"].to(device)).float().mean().item()
+                )
+
             print(
                 f"step {step + 1}/{args.steps} loss={loss.item():.4f} seq={loss_seq.item():.4f} "
-                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}{extra}"
+                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}"
+            )
+            if vq_diag_str:
+                print(f"  VQ: {vq_diag_str}")
+            print(
+                f"  eval in-dist={val_in:.3f} range-OOD={val_range:.3f} template-OOD={val_tood:.3f} boundary-OOD={acc_b:.3f}"
             )
             if args.save_dir and val_acc > best_acc:
                 best_acc = val_acc
@@ -849,10 +1224,12 @@ def evaluate(args):
     num_numbers = ecfg.max_number
     YES_IDX = num_numbers
     NO_IDX = num_numbers + 1
+    EVEN_IDX = num_numbers + 2
+    ODD_IDX = num_numbers + 3
     model = CLModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
-        num_classes=num_numbers + 2,
+        num_classes=num_numbers + 4,
         pad_id=0,
         cls_id=1,
         max_len=args.max_len,
@@ -1171,6 +1548,9 @@ def main():
     pt.add_argument("--save_dir", type=str, default="runs/episodes")
     pt.add_argument("--ckpt_every", type=int, default=200)
     pt.add_argument("--log_every", type=int, default=50)
+    pt.add_argument("--train_range", type=str, default=None, help="Train in-distribution range lo-hi (e.g., 0-79)")
+    pt.add_argument("--ood_range", type=str, default=None, help="Range-OOD range lo-hi (e.g., 80-99)")
+    pt.add_argument("--template_holdout", type=float, default=0.0, help="Fraction of NL templates per relation held out for template-OOD (0..1)")
     pt.add_argument("--resume", type=str, default=None)
     pt.add_argument(
         "--same_base",
@@ -1240,7 +1620,7 @@ def main():
     ask = sub.add_parser("ask", help="Ask a free-form question")
     ask.add_argument("--device", type=str, default=None)
     ask.add_argument("--d_model", type=int, default=128)
-    ask.add_argument("--max_number", type=int, default=100, help="Number classes (0..N-1) + {YES,NO}")
+    ask.add_argument("--max_number", type=int, default=100, help="Number classes (0..N-1) + {YES,NO,EVEN,ODD}")
     ask.add_argument("--checkpoint", type=str, required=True)
     ask.add_argument("--max_len", type=int, default=32)
     ask.add_argument("--text", type=str, required=True, help="Question text to ask")
@@ -1256,10 +1636,12 @@ def main():
         num_numbers = args.max_number
         YES_IDX = num_numbers
         NO_IDX = num_numbers + 1
+        EVEN_IDX = num_numbers + 2
+        ODD_IDX = num_numbers + 3
         model = CLModel(
             vocab_size=vocab_size,
             d_model=args.d_model,
-            num_classes=num_numbers + 2,
+            num_classes=num_numbers + 4,
             pad_id=0,
             cls_id=1,
             max_len=args.max_len,
@@ -1270,13 +1652,20 @@ def main():
         ids, mask = _pack_text_batch([args.text], tok, args.max_len, device)
         with torch.no_grad():
             _, logits_seq, _, _, _, _ = model(ids, mask)
-            probs = torch.softmax(logits_seq, dim=-1)[0]
-            p_yes = float(probs[YES_IDX].item())
-            p_no = float(probs[NO_IDX].item())
-            num_probs = probs[:num_numbers]
-            num_pred = int(num_probs.argmax().item())
-            print(f"Q: {args.text}")
-            print(f"p(YES)={p_yes:.3f} p(NO)={p_no:.3f}  number_pred={num_pred}")
+            pred = logits_seq.argmax(dim=-1)[0].item()
+            if pred < num_numbers:
+                ans = str(int(pred))
+            elif pred == YES_IDX:
+                ans = "yes"
+            elif pred == NO_IDX:
+                ans = "no"
+            elif pred == EVEN_IDX:
+                ans = "even"
+            elif pred == ODD_IDX:
+                ans = "odd"
+            else:
+                ans = str(int(pred))
+            print(ans)
         return
     if args.cmd == "count-train":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")

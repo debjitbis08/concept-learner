@@ -38,7 +38,7 @@ class ReasonerV2(nn.Module):
         self.d = d_model
         self.ops = nn.ModuleList(ops)
         self.max_steps = max_steps
-        self.temperature = temperature
+        self.temperature = float(temperature)
 
         # token featurizer for initial state
         self.phi = nn.Sequential(
@@ -58,6 +58,12 @@ class ReasonerV2(nn.Module):
         )
         self.to_gate = nn.Linear(2 * d_model, d_model)
 
+        # small head to read an initial scalar value from the question tokens
+        # val0 = read_number_from_tokens(H, mask)
+        self.read_number = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, 1)
+        )
+
     def forward(
         self, H: torch.Tensor, z: torch.Tensor, mask: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -75,29 +81,34 @@ class ReasonerV2(nn.Module):
         H_phi = self.phi(H)
         s = (H_phi * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
 
-        # initial typed state scalars
+        # initialize typed scalar streams
         mask_float = mask.float().clamp(0.0, 1.0)  # start with the input padding mask
-        val = H.new_zeros(B, 1)  # no count yet
+        # read initial number (scalar) from the question tokens
+        h_pool = (H_phi * m).sum(dim=1) / m.sum(dim=1).clamp_min(1.0)
+        val0 = self.read_number(h_pool)  # (B,1)
+        val = val0
         boolean = H.new_zeros(B, 1)  # no boolean decision yet
 
         stop_logits_all = []
         action_logits_all = []
+        # track per-example STOP
+        done = torch.zeros(B, dtype=torch.bool, device=H.device)
 
         for step in range(self.max_steps):
             x = torch.cat([s, z], dim=-1)  # (B,2d)
 
-            # operator mixture (softmax over ops)
-            # ----- action gating over ops -----
+            # ----- action logits over ops -----
             logits_action = self.to_action(x)  # (B, num_ops)
-            probs = F.softmax(logits_action / self.temperature, dim=-1)  # (B, num_ops)
+            # Discrete operator selection per step
+            if self.training:
+                pick = F.gumbel_softmax(
+                    logits_action, tau=self.temperature, hard=True, dim=-1
+                )  # (B, num_ops) one-hot
+            else:
+                idx = logits_action.argmax(-1)  # (B,)
+                pick = F.one_hot(idx, num_classes=len(self.ops)).float()
 
             # ----- run all typed-state ops -----
-            # maintain typed scalars; start the first step with neutral values
-            if step == 0:
-                mask_float = mask.float().clamp(0.0, 1.0)  # (B, T)
-                val = H.new_zeros(B, 1)  # (B, 1)
-                boolean = H.new_zeros(B, 1)  # (B, 1)
-
             ts = TypedState(H=H, mask=mask_float, val=val, boolean=boolean)
 
             cand_masks, cand_vals, cand_bools = [], [], []
@@ -111,48 +122,46 @@ class ReasonerV2(nn.Module):
             V = torch.stack(cand_vals, dim=-1)  # (B, 1, num_ops)
             Bv = torch.stack(cand_bools, dim=-1)  # (B, 1, num_ops)
 
-            # ----- mix operator outputs -----
-            mix_mask = torch.einsum("btn,bn->bt", M, probs)  # (B, T)
-            mix_val = torch.einsum("bin,bn->bi", V, probs)  # (B, 1)
-            mix_bool = torch.einsum("bin,bn->bi", Bv, probs)  # (B, 1)
+            # ----- select operator outputs (discrete one-hot) -----
+            new_mask = torch.einsum("btn,bn->bt", M, pick)  # (B, T)
+            new_val = torch.einsum("bin,bn->bi", V, pick)  # (B, 1)
+            new_bool = torch.einsum("bin,bn->bi", Bv, pick)  # (B, 1)
 
-            # monotone mask update (cannot increase selection)
-            mask_float = torch.minimum(mask_float, mix_mask).clamp(0.0, 1.0)
-            val = mix_val
-            boolean = mix_bool
+            # freeze items that are already done
+            if done.any():
+                mask_float = torch.where(done.unsqueeze(-1), mask_float, new_mask)
+                val = torch.where(done.unsqueeze(-1), val, new_val)
+                boolean = torch.where(done.unsqueeze(-1), boolean, new_bool)
+            else:
+                mask_float = new_mask
+                val = new_val
+                boolean = new_bool
 
             # ----- recompute pooled state s from updated mask -----
             H_phi = self.phi(H)  # (B, T, d)
             denom = mask_float.sum(dim=1, keepdim=True).clamp_min(1.0)
-            s = (H_phi * mask_float.unsqueeze(-1)).sum(dim=1) / denom  # (B, d)
+            s_new = (H_phi * mask_float.unsqueeze(-1)).sum(dim=1) / denom  # (B, d)
+            if done.any():
+                s = torch.where(done.unsqueeze(-1), s, s_new)
+            else:
+                s = s_new
 
-            # STOP head
+            # STOP head (per-example)
             stop_logit = self.to_stop(torch.cat([s, z], dim=-1))  # (B,1)
             stop_logits_all.append(stop_logit)
             action_logits_all.append(logits_action.unsqueeze(1))  # (B,1,num_ops)
 
-            if (not self.training) and (torch.sigmoid(stop_logit) > 0.5).all():
-                break
+            p_stop = torch.sigmoid(stop_logit).squeeze(-1)  # (B,)
+            done = done | (p_stop > 0.5)
 
-        stop_logits = torch.cat(stop_logits_all, dim=1)  # (B, steps_done)
-        action_logits = torch.cat(action_logits_all, dim=1)  # (B, steps_done, num_ops)
-
-        # pad to max_steps if we broke early in eval
-        if stop_logits.size(1) < self.max_steps:
-            pad_s = self.max_steps - stop_logits.size(1)
-            stop_logits = torch.cat(
-                [stop_logits, stop_logits.new_zeros(B, pad_s)], dim=1
-            )
-            action_logits = torch.cat(
-                [
-                    action_logits,
-                    action_logits.new_zeros(B, pad_s, action_logits.size(-1)),
-                ],
-                dim=1,
-            )
+        stop_logits = torch.cat(stop_logits_all, dim=1)  # (B, max_steps)
+        action_logits = torch.cat(action_logits_all, dim=1)  # (B, max_steps, num_ops)
 
         # broadcast final state to tokens
         s_rep = s.unsqueeze(1).expand(B, T, d)
         H_reasoned = H + self.broadcast(torch.cat([H, s_rep], dim=-1))
+
+        # expose final scalar value stream for downstream decoders
+        self._last_val = val
 
         return H_reasoned, s, stop_logits, action_logits

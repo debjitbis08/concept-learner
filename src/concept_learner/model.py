@@ -91,7 +91,8 @@ class CLModel(nn.Module):
         H_reasoned, s_final, stop_logits, action_logits = self.reasoner(
             H_cond, z_q, mask
         )
-        logits_tok, logits_seq = self.decoder(H_reasoned, mask)
+        val_final = getattr(self.reasoner, "_last_val", None)
+        logits_tok, logits_seq = self.decoder(H_reasoned, mask, val=val_final)
         return logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits
 
 

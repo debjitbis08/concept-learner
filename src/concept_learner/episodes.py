@@ -65,7 +65,12 @@ class EpisodeGenerator:
             "domain": torch.zeros(batch, dtype=torch.long, device=device),
         }
 
-    def sample_posneg_pairs(self, batch: int, allowed_relations: List[int] | None = None) -> Dict[str, torch.Tensor]:
+    def sample_posneg_pairs(
+        self,
+        batch: int,
+        allowed_relations: List[int] | None = None,
+        idx_range: tuple[int, int] | None = None,
+    ) -> Dict[str, torch.Tensor]:
         """Binary classification pairs on simple kindergarten-friendly relations.
 
         Positive if pair (a,b) satisfies one randomly chosen relation from:
@@ -82,7 +87,15 @@ class EpisodeGenerator:
         """
         device = self.cfg.device
         n = batch
-        a = torch.randint(0, self.n_items, (n,), device=device)
+        if idx_range is None:
+            a = torch.randint(0, self.n_items, (n,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, self.n_items - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, self.n_items - 1
+            a = torch.randint(lo, hi + 1, (n,), device=device)
         b = torch.empty_like(a)
         # choose relations uniformly from allowed set (default: all 0..8)
         if allowed_relations is None or len(allowed_relations) == 0:
@@ -203,7 +216,75 @@ class EpisodeGenerator:
             "domain": torch.zeros(n, dtype=torch.long, device=self.cfg.device),
         }
 
-    def sample_place_value(self, batch: int, allowed_kinds: List[int] | None = None) -> Dict[str, torch.Tensor]:
+    def sample_posneg_pairs_boundary(
+        self,
+        batch: int,
+        diffs: Tuple[int, int, int] = (0, 1, 2),
+        relations: Tuple[int, int] = (7, 8),
+        idx_range: tuple[int, int] | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        device = self.cfg.device
+        n = batch
+        if idx_range is None:
+            a = torch.randint(0, self.n_items, (n,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, self.n_items - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, self.n_items - 1
+            a = torch.randint(lo, hi + 1, (n,), device=device)
+        rel_choices = torch.tensor(list(relations), device=device)
+        sel = torch.randint(0, len(rel_choices), (n,), device=device)
+        rel = rel_choices[sel]
+        diff_choices = torch.tensor(list(diffs), device=device)
+        sel_d = torch.randint(0, len(diff_choices), (n,), device=device)
+        d = diff_choices[sel_d]
+        y = torch.zeros(n, dtype=torch.long, device=device)
+        b = torch.zeros_like(a)
+        pos_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        pos_mask[: n // 2] = True
+        pos_mask = pos_mask[torch.randperm(n, device=device)]
+        for i in range(n):
+            ai = int(a[i].item())
+            ri = int(rel[i].item())
+            di = int(d[i].item())
+            if ri == 7:  # greater
+                if pos_mask[i]:
+                    di = max(1, di)
+                    bi = max(0, ai - di)
+                    y[i] = 1
+                else:
+                    bi = min(self.n_items - 1, ai + di)
+                    y[i] = 0
+            else:  # smaller
+                if pos_mask[i]:
+                    di = max(1, di)
+                    bi = min(self.n_items - 1, ai + di)
+                    y[i] = 1
+                else:
+                    bi = max(0, ai - di)
+                    y[i] = 0
+            b[i] = bi
+        a_desc, a_mask, a_base = self._render_batch(a)
+        b_desc, b_mask, b_base = self._render_batch(b)
+        return {
+            "a_idx": a,
+            "b_idx": b,
+            "rel": rel,
+            "a_desc": a_desc,
+            "a_mask": a_mask,
+            "a_base": a_base,
+            "b_desc": b_desc,
+            "b_mask": b_mask,
+            "b_base": b_base,
+            "label": y,
+            "domain": torch.zeros(n, dtype=torch.long, device=self.cfg.device),
+        }
+
+    def sample_place_value(
+        self, batch: int, allowed_kinds: List[int] | None = None, idx_range: tuple[int, int] | None = None
+    ) -> Dict[str, torch.Tensor]:
         """
         Returns questions about digits and place values with numeric targets.
         kind encodes the task type:
@@ -220,7 +301,15 @@ class EpisodeGenerator:
             kind_choices = torch.tensor(allowed_kinds, dtype=torch.long, device=device)
         sel = torch.randint(0, len(kind_choices), (batch,), device=device)
         kind = kind_choices[sel]
-        a = torch.randint(0, N, (batch,), device=device)
+        if idx_range is None:
+            a = torch.randint(0, N, (batch,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, N - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, N - 1
+            a = torch.randint(lo, hi + 1, (batch,), device=device)
         y = torch.zeros_like(a)
         face_place = torch.full_like(a, -1)  # -1: N/A, 0: ones, 1: tens
         for i in range(batch):
@@ -586,8 +675,153 @@ class EpisodeGenerator:
         }
         return gold
 
+    def sample_number_equality(
+        self, batch: int, idx_range: tuple[int, int] | None = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Generate simple numeric equality questions over integers.
+        Returns a, b, and binary label (1 if a == b else 0).
+        """
+        device = self.cfg.device
+        N = self.n_items
+        if idx_range is None:
+            a = torch.randint(0, N, (batch,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, N - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, N - 1
+            a = torch.randint(lo, hi + 1, (batch,), device=device)
+        y = torch.zeros(batch, dtype=torch.long, device=device)
+        b = torch.zeros_like(a)
+        # half positives where b == a
+        pos_mask = torch.zeros(batch, dtype=torch.bool, device=device)
+        pos_mask[: batch // 2] = True
+        pos_mask = pos_mask[torch.randperm(batch, device=device)]
+        for i in range(batch):
+            ai = int(a[i].item())
+            if pos_mask[i]:
+                b[i] = ai
+                y[i] = 1
+            else:
+                # pick a different value
+                if ai + 1 < N:
+                    b[i] = ai + 1
+                else:
+                    b[i] = max(0, ai - 1)
+                y[i] = 0
+        return {"a": a, "b": b, "label": y}
+
+    def sample_symbolic_compare(
+        self, batch: int, idx_range: tuple[int, int] | None = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Generate symbolic comparison questions a>b? or a<b? with binary labels.
+        Returns a, b, op (0: '>', 1: '<'), label (1 if expression true else 0).
+        """
+        device = self.cfg.device
+        N = self.n_items
+        if idx_range is None:
+            a = torch.randint(0, N, (batch,), device=device)
+            b = torch.randint(0, N, (batch,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, N - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, N - 1
+            a = torch.randint(lo, hi + 1, (batch,), device=device)
+            b = torch.randint(lo, hi + 1, (batch,), device=device)
+        op = torch.randint(0, 2, (batch,), device=device)  # 0:'>', 1:'<'
+        y = torch.zeros(batch, dtype=torch.long, device=device)
+        for i in range(batch):
+            if op[i] == 0:
+                y[i] = 1 if a[i] > b[i] else 0
+            else:
+                y[i] = 1 if a[i] < b[i] else 0
+        return {"a": a, "b": b, "op": op, "label": y}
+
+    def sample_addition(
+        self, batch: int, idx_range: tuple[int, int] | None = None
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Generate addition questions a+b=? with numeric targets within range [0, N-1].
+        Ensures a+b < N by sampling b accordingly.
+        Returns a, b, target=a+b.
+        """
+        device = self.cfg.device
+        N = self.n_items
+        if idx_range is None:
+            a = torch.randint(0, N, (batch,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, N - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, N - 1
+            a = torch.randint(lo, hi + 1, (batch,), device=device)
+        b = torch.zeros_like(a)
+        y = torch.zeros_like(a)
+        for i in range(batch):
+            ai = int(a[i].item())
+            max_b = max(0, N - 1 - ai)
+            bi = int(torch.randint(0, max_b + 1, (1,), device=device).item())
+            b[i] = bi
+            y[i] = ai + bi
+        return {"a": a, "b": b, "target": y}
+
+    def sample_parity(
+        self, batch: int, idx_range: tuple[int, int] | None = None
+    ) -> Dict[str, torch.Tensor]:
+        """Parity classification for a single number: target 0=even, 1=odd."""
+        device = self.cfg.device
+        N = self.n_items
+        if idx_range is None:
+            a = torch.randint(0, N, (batch,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, N - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, N - 1
+            a = torch.randint(lo, hi + 1, (batch,), device=device)
+        y = (a % 2).long()
+        return {"a": a, "target": y}
+
+    def sample_offset(
+        self,
+        batch: int,
+        allowed_offsets: Tuple[int, ...] = (-3, -2, -1, 1, 2, 3),
+        idx_range: tuple[int, int] | None = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Simple +/- k tasks: choose offset o in allowed_offsets, pick a so that a+o in [0,N-1].
+        Returns a, offset o, target=a+o.
+        """
+        device = self.cfg.device
+        N = self.n_items
+        offs = torch.tensor(list(allowed_offsets), dtype=torch.long, device=device)
+        sel = torch.randint(0, len(offs), (batch,), device=device)
+        o = offs[sel]
+        a = torch.zeros(batch, dtype=torch.long, device=device)
+        y = torch.zeros(batch, dtype=torch.long, device=device)
+        for i in range(batch):
+            oi = int(o[i].item())
+            lo = max(0, -oi)
+            hi = min(N - 1, N - 1 - oi)
+            if idx_range is not None:
+                lo = max(lo, int(idx_range[0]))
+                hi = min(hi, int(idx_range[1]))
+            if hi < lo:
+                lo, hi = 0, N - 1 - abs(oi)
+            ai = int(torch.randint(lo, hi + 1, (1,), device=device).item())
+            a[i] = ai
+            y[i] = ai + oi
+        return {"a": a, "offset": o, "target": y}
+
     # ----- Counting tasks (next / previous / between) -----
-    def sample_counting(self, batch: int) -> Dict[str, torch.Tensor]:
+    def sample_counting(self, batch: int, idx_range: tuple[int, int] | None = None) -> Dict[str, torch.Tensor]:
         """
         Returns counting questions with numeric targets (classification over 0..max_number-1):
           kind=0 successor/next:      input=a,          target=(a+1)%N
@@ -597,7 +831,15 @@ class EpisodeGenerator:
         device = self.cfg.device
         N = self.n_items
         kind = torch.randint(0, 3, (batch,), device=device)
-        a = torch.randint(0, N, (batch,), device=device)
+        if idx_range is None:
+            a = torch.randint(0, N, (batch,), device=device)
+        else:
+            lo, hi = int(idx_range[0]), int(idx_range[1])
+            hi = min(hi, N - 1)
+            lo = max(0, lo)
+            if hi < lo:
+                lo, hi = 0, N - 1
+            a = torch.randint(lo, hi + 1, (batch,), device=device)
         c = torch.full_like(a, -1)
         y = torch.zeros_like(a)
         for i in range(batch):
