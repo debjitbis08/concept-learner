@@ -52,17 +52,25 @@ class _SimpleTokenizer:
 
     def __call__(
         self,
-        text: str,
+        text,
         max_length: int = 64,
         padding: str = "max_length",
         truncation: bool = True,
         return_attention_mask: bool = True,
+        is_split_into_words: bool | None = None,
+        add_special_tokens: bool = True,
     ):
-        # simple whitespace split; keep case to preserve test content
-        toks = text.strip().split()
-        ids = [self.cls_token_id] + [self._tok2id(t) for t in toks] + [
-            self.sep_token_id
-        ]
+        # accept either a raw string or a pretokenized list of strings
+        if isinstance(text, list):
+            toks = list(text)
+        else:
+            toks = text.strip().split()
+        ids = []
+        if add_special_tokens:
+            ids.append(self.cls_token_id)
+        ids.extend([self._tok2id(t) for t in toks])
+        if add_special_tokens:
+            ids.append(self.sep_token_id)
         if truncation and len(ids) > max_length:
             ids = ids[:max_length]
         if padding == "max_length" and len(ids) < max_length:
@@ -87,11 +95,19 @@ class HFTokenizerWrapper:
         if AutoTokenizer is not None:
             try:
                 tok = AutoTokenizer.from_pretrained(name)
+                self.backend = "hf"
+                self.backend_name = name
             except Exception:
                 tok = None
+                self.backend = "simple"
+                self.backend_name = "_simple_fallback"
         # fallback to simple offline tokenizer
         if tok is None:
             tok = _SimpleTokenizer()
+            # set backend indicators if not set above
+            if not hasattr(self, "backend"):
+                self.backend = "simple"
+                self.backend_name = "_simple_fallback"
         self.tok = tok
         # expose IDs for special tokens (with robust defaults)
         self.pad_id = getattr(self.tok, "pad_token_id", 0)
@@ -100,9 +116,47 @@ class HFTokenizerWrapper:
         self.unk_id = getattr(self.tok, "unk_token_id", 3)
         self.vocab_size = getattr(self.tok, "vocab_size", None) or 30522
 
+    def _digit_aware_pretokenize(self, text: str) -> list[str]:
+        # Split into tokens such that sequences of digits become per-digit tokens,
+        # alphabetic sequences stay grouped, and punctuation becomes separate tokens.
+        import string
+        out: list[str] = []
+        buf = ""
+        mode = None  # 'alpha'
+        def flush():
+            nonlocal buf
+            if buf:
+                out.append(buf)
+                buf = ""
+        for ch in text:
+            if ch.isdigit():
+                flush()
+                out.append(ch)
+                mode = None
+            elif ch.isspace():
+                flush()
+                mode = None
+            elif ch in string.punctuation:
+                flush()
+                out.append(ch)
+                mode = None
+            else:
+                if mode != 'alpha':
+                    flush()
+                    buf = ch
+                    mode = 'alpha'
+                else:
+                    buf += ch
+        flush()
+        return out
+
     def encode(self, text: str, max_len: int = 64) -> EncodeOutput:
+        toks = self._digit_aware_pretokenize(text)
+        # Prefer HF backend with pretokenized input; fallback tokenizer also supports lists
         enc = self.tok(
-            text,
+            toks,
+            is_split_into_words=True,
+            add_special_tokens=True,
             max_length=max_len,
             padding="max_length",
             truncation=True,

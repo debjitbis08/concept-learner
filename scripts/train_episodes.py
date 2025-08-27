@@ -595,6 +595,14 @@ def train(args):
     gen = EpisodeGenerator(ecfg)
 
     tok = HFTokenizerWrapper("bert-base-cased")
+    try:
+        print(f"Tokenizer backend: {getattr(tok, 'backend', 'unknown')} ({getattr(tok, 'backend_name', 'n/a')}), vocab_size={tok.vocab_size}")
+    except Exception:
+        pass
+    try:
+        print(f"Tokenizer backend: {getattr(tok, 'backend', 'unknown')} ({getattr(tok, 'backend_name', 'n/a')}), vocab_size={tok.vocab_size}")
+    except Exception:
+        pass
     vocab_size = tok.vocab_size
     # unified head: numbers (0..N-1) + {YES, NO, EVEN, ODD}
     num_numbers = ecfg.max_number
@@ -1083,12 +1091,14 @@ def train(args):
                     ppl = float(torch.exp(torch.tensor(H)).item() / max(1, K))
                     parts.append(f"h{h}:util={u:.2f},ppl={ppl:.2f}")
                 vq_diag_str = " ".join(parts)
-                # stability: eval twice deterministically
-                model.eval()
+                # stability under stochastic training noise: run twice in TRAIN mode
+                prev_mode = model.training
+                model.train()
                 probe_ids = ids[: min(128, ids.size(0))]
                 probe_mask = mask[: min(128, mask.size(0))]
-                _, _, _, ind1, _, _ = model(probe_ids, probe_mask)
-                _, _, _, ind2, _, _ = model(probe_ids, probe_mask)
+                with torch.no_grad():
+                    _, _, _, ind1, _, _ = model(probe_ids, probe_mask)
+                    _, _, _, ind2, _, _ = model(probe_ids, probe_mask)
                 stab = []
                 for h in range(min(len(ind1), len(ks))):
                     a1 = ind1[h].view(-1)
@@ -1096,7 +1106,8 @@ def train(args):
                     changed = (a1 != a2).float().mean().item()
                     stab.append(f"h{h}:chg={changed:.3f}")
                 vq_diag_str += " | stab " + " ".join(stab)
-                model.train()
+                if not prev_mode:
+                    model.eval()
             except Exception:
                 pass
 
