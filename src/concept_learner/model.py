@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from concept_learner.encoder import TinyEncoder, TinyEncoderConfig
 from concept_learner.vq_layer import ResidualVQLayer
-from concept_learner.reasoning import Reasoner
 from concept_learner.reasoning_v2 import ReasonerV2
 from concept_learner.decoder import UnifiedDecoder
 
