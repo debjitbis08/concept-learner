@@ -843,22 +843,39 @@ def train(args):
         return w
 
     def _sample_by_width(n: int, widths: list[int], idx_range: tuple[int, int] | None):
+        """Sample exactly n indices, roughly balanced by digit width.
+        Falls back to uniform sampling within idx_range if a width has no candidates.
+        """
         lo, hi = (0, gen.n_items - 1) if idx_range is None else (int(idx_range[0]), int(idx_range[1]))
+        lo = max(0, lo); hi = min(gen.n_items - 1, hi)
         all_idx = torch.arange(lo, hi + 1, device=device)
+        if all_idx.numel() <= 0:
+            return torch.randint(0, max(1, gen.n_items), (n,), device=device)
         ws = _digit_widths(all_idx)
         # allocate counts evenly across given widths
         m = max(1, len(widths))
         counts = [n // m + (1 if i < (n % m) else 0) for i in range(m)]
-        out = []
+        parts = []
         for w, c in zip(widths, counts):
-            cand = all_idx[ws == w]
-            if len(cand) == 0:
+            if c <= 0:
                 continue
-            idxs = cand[torch.randint(0, len(cand), (c,), device=device)]
-            out.append(idxs)
-        if len(out) == 0:
-            return torch.randint(lo, hi + 1, (n,), device=device)
-        return torch.cat(out, dim=0)[:n]
+            cand = all_idx[ws == w]
+            if cand.numel() == 0:
+                continue
+            sel = cand[torch.randint(0, cand.numel(), (c,), device=device)]
+            parts.append(sel)
+        if len(parts) == 0:
+            # fallback: sample uniformly from the allowed range
+            base = all_idx
+            return base[torch.randint(0, base.numel(), (n,), device=device)]
+        out = torch.cat(parts, dim=0)
+        if out.numel() < n:
+            # pad with uniform samples from range
+            extra = all_idx[torch.randint(0, all_idx.numel(), (n - out.numel(),), device=device)]
+            out = torch.cat([out, extra], dim=0)
+        # shuffle and trim to n
+        perm = torch.randperm(out.numel(), device=device)
+        return out[perm][:n]
 
     def _build_compare_subset(n: int, kind: str, idx_range: tuple[int, int] | None):
         # kind: 'id' | 'bd' | 'ood' | 'cf'
@@ -923,7 +940,9 @@ def train(args):
             b = bb[idx_sel]
             op = oo[idx_sel]
             y_bin = yb[idx_sel]
-        ids, mask = ids, mask
+        # Pack texts if not mined above
+        if 'ids' not in locals() or 'mask' not in locals():
+            ids, mask = _pack_symbolic_compare_text(a, b, op, tok, max_len=seq_len)
         y = torch.where(
             y_bin > 0,
             torch.full((y_bin.size(0),), YES_IDX, dtype=torch.long, device=device),
