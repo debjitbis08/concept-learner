@@ -5,7 +5,6 @@ from typing import List, Tuple, Literal, Dict, Any
 from concept_learner.reasoning_ops import (
     TypedState,
     OpBase,
-    OpFilterMLP,
     OpCount,
     OpCompareGeneric,
     OpNAC,
