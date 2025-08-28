@@ -320,12 +320,12 @@ class ReasonerV2(nn.Module):
 
             # logging usage and tracing
             if self.wake_sleep and self.use_functions and self.op_function is not None and self.num_fn_slots > 0:
-                # usage ema update: per-slot probability mass picked (or hard pick in eval)
+                # usage ema update: estimate per-slot base probability mass (pre-micro)
+                # Note: using probs over base logits to avoid micro interpreter zeroing function mass
                 with torch.no_grad():
-                    fn_pick = pick[:, len(self.prims) :]
-                    mass = fn_pick.mean(dim=0)  # (num_fn,)
-                    if self._slot_usage_ema is not None and mass.numel() == self._slot_usage_ema.numel():
-                        self._slot_usage_ema.mul_(0.95).add_(0.05 * mass)
+                    fn_mass = probs_action[:, len(self.prims) :].mean(dim=0)  # (num_fn,)
+                    if self._slot_usage_ema is not None and fn_mass.numel() == self._slot_usage_ema.numel():
+                        self._slot_usage_ema.mul_(0.95).add_(0.05 * fn_mass)
                 if traces is not None:
                     # append greedy action id per example
                     with torch.no_grad():
@@ -517,6 +517,9 @@ class ReasonerV2(nn.Module):
     def sleep_abstraction(self, mdl_gain_threshold: float | None = None) -> List[int]:
         if not self.use_functions or self.op_function is None:
             return []
+        # track number of sleep cycles to allow a short warmup before pruning
+        if not hasattr(self, "_sleep_calls"):
+            self._sleep_calls = 0
         traces = []
         if getattr(self, "_last_traces", None) is not None:
             for t in self._last_traces:
@@ -531,10 +534,14 @@ class ReasonerV2(nn.Module):
             existing_patterns=existing,
         )
         installed = self.op_function.install(cands)
-        # prune based on usage ema
-        if self._slot_usage_ema is not None:
+        # Increment sleep counter and (optionally) prune based on usage ema
+        self._sleep_calls += 1
+        if self._slot_usage_ema is not None and self._sleep_calls >= 2:
             usage = self._slot_usage_ema.detach().cpu().tolist()
-            self.op_function.prune(usage, self.prune_threshold)
+            try:
+                self.op_function.prune(usage, self.prune_threshold)
+            except Exception:
+                pass
         return installed
 
     def _existing_primitive_patterns(self) -> List[Tuple[int, ...]]:
