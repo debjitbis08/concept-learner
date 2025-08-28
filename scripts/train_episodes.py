@@ -1483,14 +1483,33 @@ def train(args):
                     installed = []
                 # Telemetry each sleep cycle
                 telem = getattr(model.reasoner, "_telemetry", {}) or {}
-                telem_fmt = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in telem.items()}
+                # Build a compact telemetry summary
+                fn_nonempty = telem.get("fn_nonempty", None)
+                avg_len = telem.get("avg_flat_len", None)
+                max_stack = telem.get("max_stack_depth", None)
+                usage = telem.get("slot_usage_ema", None)
+                if hasattr(usage, "tolist"):
+                    usage = usage.tolist()
+                usage_mean = (
+                    float(sum(usage) / max(1, len(usage))) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
+                )
+                usage_max = (
+                    float(max(usage)) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
+                )
+                def _r(x):
+                    return None if x is None else round(float(x), 3)
+                compact = {
+                    "fn_nonempty": fn_nonempty,
+                    "avg_len": _r(avg_len),
+                    "max_stack": max_stack,
+                    "usage_mean": _r(usage_mean),
+                    "usage_max": _r(usage_max),
+                }
                 try:
                     rb_len = len(rb)
                 except Exception:
                     rb_len = 0
-                print(
-                    f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={telem_fmt}"
-                )
+                print(f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={compact}")
                 # Dream-MAP from replay buffer
                 if len(rb) > 0:
                     dream_bs = min(args.batch_size, len(rb))
