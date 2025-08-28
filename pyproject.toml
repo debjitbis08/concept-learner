@@ -74,7 +74,8 @@ python scripts/train_episodes.py train \
   --lr 8e-5 --sched cosine --warmup_ratio 0.03 --min_lr 1e-6 \
   --ema_decay 0.995 --weight_decay 0.003 --label_smoothing 0.03 \
   --lambda_vq 0.25 --lambda_stop 0.3 \
-  --max_number 100 --train_range 0-79 --ood_range 80-99
+  --max_number 100 --train_range 0-79 --ood_range 80-99 \
+  --resume runs/episodes_b10/latest.pt
 """
 setup = """
 apt update && sudo apt upgrade -y
