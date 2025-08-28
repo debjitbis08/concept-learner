@@ -24,7 +24,7 @@ readme = "README.md"
 dependencies = [
   "pyrootutils",
   "loguru",
-  "torch>=2.8.0",
+  "torch>=2.6.0",
   "tokenizers>=0.21.4",
   "transformers>=4.55.4",
   "vector-quantize-pytorch>=1.23.1",
@@ -54,7 +54,7 @@ default = true
 
 [[tool.uv.index]]
 name = "pytorch"
-url = "https://download.pytorch.org/whl/cpu"
+url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
 [tool.uv.sources]
@@ -76,10 +76,11 @@ python scripts/train_episodes.py train \
   --lambda_vq 0.25 --lambda_stop 0.3
 """
 setup = """
-sudo apt update && sudo apt upgrade -y
-sudo apt install tmux -y
+apt update && sudo apt upgrade -y
+apt install tmux vim -y
 cd /workspace/concept-learner
 tmux new -s train
+uv sync
 uv run task train | tee /var/log/train.log
 """
 attach = "tmux attach -t train"
