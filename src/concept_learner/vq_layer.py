@@ -208,4 +208,7 @@ class ResidualVQLayer(nn.Module):
                 for t in indices_list
             ]
 
+        # Ensure scalar loss (0-dim) for compatibility with tests
+        if total_loss.ndim != 0:
+            total_loss = total_loss.mean()
         return z_q, indices_list, total_loss
