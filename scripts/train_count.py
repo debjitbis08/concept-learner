@@ -106,6 +106,11 @@ def main():
     p.add_argument("--resume", type=str, default=None)
     p.add_argument("--max_len", type=int, default=18)
     p.add_argument("--eval_batches", type=int, default=50)
+    p.add_argument(
+        "--save_all_checkpoints",
+        action="store_true",
+        help="Also save step-indexed checkpoints (ckpt_step_*.pt). By default only best.pt and latest.pt are kept.",
+    )
 
     args = p.parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -145,7 +150,15 @@ def main():
                 print(f"  Saved best checkpoint: {os.path.join(args.save_dir, 'best.pt')} (val_acc={val_acc:.3f})")
 
         if args.save_dir and (step + 1) % args.ckpt_every == 0:
-            save_checkpoint(os.path.join(args.save_dir, f"ckpt_step_{step+1}.pt"), model, opt, step + 1)
+            # Always maintain rolling latest.pt
+            if args.save_all_checkpoints:
+                # Optionally archive per-step checkpoint
+                save_checkpoint(
+                    os.path.join(args.save_dir, f"ckpt_step_{step+1}.pt"),
+                    model,
+                    opt,
+                    step + 1,
+                )
             save_checkpoint(os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1)
 
     # final eval and a few samples
@@ -176,4 +189,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

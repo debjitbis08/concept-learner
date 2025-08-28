@@ -1624,9 +1624,10 @@ def train(args):
                 print(f"  Saved best checkpoint: {best_path} (val_acc={val_acc:.3f})")
 
         if args.save_dir and (step + 1) % args.ckpt_every == 0:
-            ckpt_path = os.path.join(args.save_dir, f"ckpt_step_{step + 1}.pt")
             ema_state = ema.state_dict() if ema is not None else None
-            save_checkpoint(ckpt_path, model, opt, step + 1, ema_state=ema_state)
+            if args.save_all_checkpoints:
+                ckpt_path = os.path.join(args.save_dir, f"ckpt_step_{step + 1}.pt")
+                save_checkpoint(ckpt_path, model, opt, step + 1, ema_state=ema_state)
             latest = os.path.join(args.save_dir, "latest.pt")
             save_checkpoint(
                 latest,
@@ -2018,6 +2019,11 @@ def main():
     pt.add_argument("--template_holdout", type=float, default=0.0, help="Fraction of NL templates per relation held out for template-OOD (0..1)")
     pt.add_argument("--resume", type=str, default=None)
     pt.add_argument(
+        "--save_all_checkpoints",
+        action="store_true",
+        help="Also save step-indexed checkpoints (ckpt_step_*.pt). By default only best.pt and latest.pt are kept.",
+    )
+    pt.add_argument(
         "--same_base",
         action="store_true",
         help="Render both items with the same base per pair (easier task)",
@@ -2088,6 +2094,11 @@ def main():
     ct.add_argument("--max_len", type=int, default=18)
     ct.add_argument("--eval_batches", type=int, default=50)
     ct.add_argument("--weight_decay", type=float, default=0.0)
+    ct.add_argument(
+        "--save_all_checkpoints",
+        action="store_true",
+        help="Also save step-indexed checkpoints (ckpt_step_*.pt). By default only best.pt and latest.pt are kept.",
+    )
 
     ce = sub.add_parser("count-eval", help="Evaluate a counting checkpoint")
     ce.add_argument("--device", type=str, default=None)
@@ -2234,12 +2245,14 @@ def main():
                         f"  Saved best checkpoint: {os.path.join(args.save_dir, 'best.pt')} (val_acc={val_acc:.3f})"
                     )
             if args.save_dir and (step + 1) % args.ckpt_every == 0:
-                save_checkpoint(
-                    os.path.join(args.save_dir, f"ckpt_step_{step + 1}.pt"),
-                    model,
-                    opt,
-                    step + 1,
-                )
+                # Always maintain rolling latest.pt; optionally archive per-step checkpoint
+                if args.save_all_checkpoints:
+                    save_checkpoint(
+                        os.path.join(args.save_dir, f"ckpt_step_{step + 1}.pt"),
+                        model,
+                        opt,
+                        step + 1,
+                    )
                 save_checkpoint(
                     os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1
                 )
