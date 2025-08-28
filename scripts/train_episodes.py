@@ -6,6 +6,14 @@ from typing import List
 from concept_learner.episodes import EpisodeConfig, EpisodeGenerator
 from concept_learner.model import CLModel
 from concept_learner.tokenizer import HFTokenizerWrapper
+from concept_learner.trainer import (
+    ReplayBuffer,
+    extract_primitive_patterns_from_library,
+    compress_trace_with_patterns,
+    build_composite_from_replays,
+    make_stop_targets_from_traces,
+    train_step_with_trace_supervision,
+)
 
 
 def _pack_pairs(a_desc, a_mask, b_desc, b_mask, device):
@@ -627,6 +635,13 @@ def train(args):
         vq_orth_weight=args.vq_orth_weight,
         vq_entropy_weight=args.vq_entropy_weight,
     ).to(device)
+    # Enable wake/sleep by default, micro-exec as default training mode
+    if int(getattr(args, "wake_sleep", 1)) > 0:
+        try:
+            model.reasoner.wake_sleep = True
+            model.reasoner.exec_mode = getattr(args, "exec_mode", "micro")
+        except Exception:
+            pass
     # opt = torch.optim.AdamW(
     #     model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     # )
@@ -747,6 +762,8 @@ def train(args):
     tmpl_train, tmpl_ood = build_template_filters(getattr(args, "template_holdout", 0.0))
     model.train()
     seq_len = args.max_len
+    # Wake/Sleep/Dream replay buffer
+    rb = ReplayBuffer(max_items=getattr(args, "replay_max_items", 512))
     # per-task dynamic weights
     lambda_bd = 1.0
     lambda_ood = 1.0
@@ -1439,6 +1456,75 @@ def train(args):
                 for p_t, p_s in zip(model.num_head_teacher.parameters(), model.num_head.parameters()):
                     p_t.copy_(m * p_t + (1.0 - m) * p_s)
 
+        # ---------------- Wake: collect traces into replay buffer ----------------
+        try:
+            if int(getattr(args, "wake_sleep", 1)) > 0 and getattr(model.reasoner, "_last_traces", None) is not None:
+                traces = model.reasoner._last_traces
+                total_prims = len(getattr(model.reasoner, "prims", []))
+                for bi, tr in enumerate(traces):
+                    seq_ids = []
+                    for kind, idx in tr:
+                        if kind == "prim":
+                            seq_ids.append(int(idx))
+                        else:
+                            seq_ids.append(total_prims + int(idx))
+                    if bi < ids.size(0):
+                        rb.add(ids[bi].detach().cpu(), mask[bi].detach().cpu(), seq_ids)
+        except Exception:
+            pass
+
+        # ---------------- Sleep: abstraction + Dreaming (MAP over traces) --------
+        try:
+            if int(getattr(args, "wake_sleep", 1)) > 0 and (step + 1) % int(getattr(args, "sleep_every", 50)) == 0:
+                installed = []
+                try:
+                    installed = model.reasoner.sleep_abstraction()
+                except Exception:
+                    installed = []
+                # Optional: print brief telemetry
+                telem = getattr(model.reasoner, "_telemetry", {}) or {}
+                if len(installed) > 0:
+                    print(f"[sleep] installed {len(installed)} new slot(s); telem={{{k: (v.tolist() if hasattr(v, 'tolist') else v) for k,v in telem.items()}}}")
+                # Dream-MAP from replay buffer
+                if len(rb) > 0:
+                    dream_bs = min(args.batch_size, len(rb))
+                    replays = rb.sample(dream_bs)
+                    if replays:
+                        ids_rep = torch.stack([x.ids for x in replays], dim=0).to(device)
+                        mask_rep = torch.stack([x.mask for x in replays], dim=0).to(device)
+                        traces_rep = [x.trace for x in replays]
+                        # compress to macro using current library
+                        patterns = extract_primitive_patterns_from_library(model.reasoner)
+                        traces_canon = [
+                            compress_trace_with_patterns(tr, patterns, len(getattr(model.reasoner, 'prims', [])))
+                            for tr in traces_rep
+                        ]
+                        y_tok = torch.zeros(ids_rep.size(0), seq_len, dtype=torch.long, device=device)
+                        y_seq = torch.zeros(ids_rep.size(0), dtype=torch.long, device=device)
+                        y_stop = make_stop_targets_from_traces(traces_canon, max_steps=getattr(model.reasoner, 'max_steps', 1), device=device)
+                        _ = train_step_with_trace_supervision(
+                            model, (ids_rep, mask_rep, y_tok, y_seq, y_stop), traces_canon, opt
+                        )
+                        # structured combos to diversify
+                        combos = build_composite_from_replays(
+                            replays, target_count=max(1, dream_bs // 2), T=seq_len, device=device
+                        )
+                        if combos is not None and combos[0].size(0) > 0:
+                            ids_c, mask_c, traces_c = combos
+                            traces_c_canon = [
+                                compress_trace_with_patterns(tr, patterns, len(getattr(model.reasoner, 'prims', [])))
+                                for tr in traces_c
+                            ]
+                            y_tok_c = torch.zeros(ids_c.size(0), seq_len, dtype=torch.long, device=device)
+                            y_seq_c = torch.zeros(ids_c.size(0), dtype=torch.long, device=device)
+                            y_stop_c = make_stop_targets_from_traces(traces_c_canon, max_steps=getattr(model.reasoner, 'max_steps', 1), device=device)
+                            _ = train_step_with_trace_supervision(
+                                model, (ids_c, mask_c, y_tok_c, y_seq_c, y_stop_c), traces_c_canon, opt
+                            )
+        except Exception:
+            # keep training even if dreaming fails
+            pass
+
         if (step + 1) % args.log_every == 0:
             with torch.no_grad():
                 lp = logits_seq[:, [NO_IDX, YES_IDX]]
@@ -1667,6 +1753,7 @@ def evaluate(args):
         cls_id=1,
         max_len=args.max_len,
     ).to(device)
+    # For evaluation we don't change wake/sleep or exec mode
 
     assert args.checkpoint and os.path.isfile(args.checkpoint), "--checkpoint required"
     load_checkpoint(args.checkpoint, model, opt=None, map_location=device)
@@ -2014,6 +2101,24 @@ def main():
     pt.add_argument("--save_dir", type=str, default="runs/episodes")
     pt.add_argument("--ckpt_every", type=int, default=200)
     pt.add_argument("--log_every", type=int, default=50)
+    # Wake/Sleep/Dream (enabled by default)
+    pt.add_argument(
+        "--wake_sleep", type=int, default=1, help="Enable wake/sleep/dream cycle (1=on, 0=off)"
+    )
+    pt.add_argument(
+        "--sleep_every", type=int, default=50, help="Run sleep-abstraction + dreaming every N steps"
+    )
+    # Execution granularity for function calls
+    pt.add_argument(
+        "--exec_mode",
+        type=str,
+        choices=["micro", "macro"],
+        default="micro",
+        help="Reasoner execution mode during training (default: micro)",
+    )
+    pt.add_argument(
+        "--replay_max_items", type=int, default=512, help="Max items in dream replay buffer"
+    )
     pt.add_argument("--train_range", type=str, default=None, help="Train in-distribution range lo-hi (e.g., 0-79)")
     pt.add_argument("--ood_range", type=str, default=None, help="Range-OOD range lo-hi (e.g., 80-99)")
     pt.add_argument("--template_holdout", type=float, default=0.0, help="Fraction of NL templates per relation held out for template-OOD (0..1)")
