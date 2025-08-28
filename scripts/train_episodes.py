@@ -682,7 +682,10 @@ def train(args):
                     return (int(lo), int(hi))
                 except Exception:
                     return None
-            best_acc = _quick_eval(
+            # Compute baseline components for selection metric
+            tr_range = parse_range(getattr(args, "train_range", None))
+            od_range = parse_range(getattr(args, "ood_range", None))
+            val_pair0 = _quick_eval(
                 model,
                 gen,
                 tok,
@@ -692,10 +695,60 @@ def train(args):
                 max_len=args.max_len,
                 num_numbers=num_numbers,
                 relations=getattr(args, "relations", None),
-                idx_range=parse_range(getattr(args, "train_range", None)),
+                idx_range=tr_range,
                 template_filter=tmpl_train,
             )
-            print(f"Computed baseline val_acc after resume: {best_acc:.3f}")
+            # quick counting eval baseline
+            model.eval()
+            tot0, hit0 = 0, 0
+            with torch.no_grad():
+                for _ in range(5):
+                    d2 = gen.sample_counting(batch=min(args.batch_size, 128), idx_range=tr_range)
+                    i2, m2 = _pack_count_examples_text(
+                        d2["kind"], d2["a"], d2["c"], tok, max_len=args.max_len
+                    )
+                    y2 = d2["target"].to(device)
+                    _, ls2, _, _, _, _ = model(i2, m2)
+                    pred2 = ls2[:, :num_numbers].argmax(dim=-1)
+                    hit0 += (pred2 == y2).sum().item()
+                    tot0 += y2.numel()
+            model.train()
+            val_cnt0 = hit0 / max(1, tot0)
+            avg0 = 0.5 * (val_pair0 + val_cnt0)
+            # optional OOD slice
+            try:
+                import math as _m
+                if od_range is not None:
+                    val_range0 = _quick_eval(
+                        model,
+                        gen,
+                        tok,
+                        device,
+                        batch_size=min(args.batch_size, 128),
+                        eval_batches=5,
+                        max_len=args.max_len,
+                        num_numbers=num_numbers,
+                        relations=getattr(args, "relations", None),
+                        idx_range=od_range,
+                        template_filter=tmpl_train,
+                    )
+                else:
+                    val_range0 = float("nan")
+            except Exception:
+                val_range0 = float("nan")
+            sel0 = avg0
+            if od_range is not None and not (isinstance(val_range0, float) and (val_range0 != val_range0)):
+                sel0 = (val_pair0 + val_cnt0 + float(val_range0)) / 3.0
+            best_acc = float(sel0)
+            try:
+                msg = f"Computed baseline selection after resume: sel={best_acc:.3f} (avg={avg0:.3f}"
+                if od_range is not None:
+                    msg += f", range={float(val_range0):.3f})"
+                else:
+                    msg += ")"
+                print(msg)
+            except Exception:
+                print(f"Computed baseline selection after resume: {best_acc:.3f}")
 
     # optional EMA of parameters
     ema = None
@@ -1604,6 +1657,7 @@ def train(args):
             if _using_ema:
                 ema.restore(model)
             val_acc_cnt = hit / max(1, tot)
+            # avg used for telemetry and LR scheduling
             val_acc = 0.5 * (val_acc_pair + val_acc_cnt)
             if plateau_scheduler is not None:
                 plateau_scheduler.step(val_acc)
@@ -1720,8 +1774,16 @@ def train(args):
             print(
                 f"  eval in-dist={val_in:.3f} range-OOD={val_range:.3f} template-OOD={val_tood:.3f} boundary-OOD={acc_b:.3f}"
             )
-            if args.save_dir and val_acc > best_acc:
-                best_acc = val_acc
+            # Selection metric: if an OOD range is specified and evaluated, include it.
+            sel_metric = val_acc
+            try:
+                import math as _m
+                if ood_range is not None and not _m.isnan(float(val_range)):
+                    sel_metric = (val_acc_pair + val_acc_cnt + float(val_range)) / 3.0
+            except Exception:
+                sel_metric = val_acc
+            if args.save_dir and sel_metric > best_acc:
+                best_acc = sel_metric
                 best_path = os.path.join(args.save_dir, "best.pt")
                 ema_state = ema.state_dict() if ema is not None else None
                 save_checkpoint(
@@ -1729,10 +1791,12 @@ def train(args):
                     model,
                     opt,
                     step + 1,
-                    best_acc=val_acc,
+                    best_acc=best_acc,
                     ema_state=ema_state,
                 )
-                print(f"  Saved best checkpoint: {best_path} (val_acc={val_acc:.3f})")
+                print(
+                    f"  Saved best checkpoint: {best_path} (sel={best_acc:.3f}, avg={val_acc:.3f})"
+                )
 
         if args.save_dir and (step + 1) % args.ckpt_every == 0:
             ema_state = ema.state_dict() if ema is not None else None
