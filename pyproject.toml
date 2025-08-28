@@ -78,7 +78,9 @@ python scripts/train_episodes.py train \
 setup = """
 sudo apt update && sudo apt upgrade -y
 sudo apt install tmux -y
-cd /workspace/concept-learner/
+cd /workspace/
+git clone https://github.com/debjitbis08/concept-learner.git
+cd concept-learner/
 tmux new -s train
 uv run task train | tee /var/log/train.log
 """
