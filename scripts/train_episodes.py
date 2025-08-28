@@ -1481,10 +1481,16 @@ def train(args):
                     installed = model.reasoner.sleep_abstraction()
                 except Exception:
                     installed = []
-                # Optional: print brief telemetry
+                # Telemetry each sleep cycle
                 telem = getattr(model.reasoner, "_telemetry", {}) or {}
-                if len(installed) > 0:
-                    print(f"[sleep] installed {len(installed)} new slot(s); telem={{{k: (v.tolist() if hasattr(v, 'tolist') else v) for k,v in telem.items()}}}")
+                telem_fmt = {k: (v.tolist() if hasattr(v, "tolist") else v) for k, v in telem.items()}
+                try:
+                    rb_len = len(rb)
+                except Exception:
+                    rb_len = 0
+                print(
+                    f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={telem_fmt}"
+                )
                 # Dream-MAP from replay buffer
                 if len(rb) > 0:
                     dream_bs = min(args.batch_size, len(rb))
