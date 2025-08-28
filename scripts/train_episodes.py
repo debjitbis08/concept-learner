@@ -1367,11 +1367,17 @@ def train(args):
             7: 2,  # greater
             8: 2,  # smaller
         }
-        rel = batch.get("rel")
-        if rel is not None:
+        # Determine steps for compare/pair items.
+        # When using natural-language pair batches (no frozen_mix), we have `batch['rel']`.
+        # Under frozen_mix, we don't have `batch`; treat all compare prompts as 2 steps (gt/lt).
+        if 'batch' in locals() and isinstance(batch, dict):
+            rel = batch.get("rel")
+        else:
+            rel = None
+        if rel is not None and rel.numel() > 0:
             steps_pairs = torch.tensor([rel_steps_map[int(r.item())] for r in rel], device=device)
         else:
-            steps_pairs = torch.ones(ids_pairs.size(0), dtype=torch.long, device=device)
+            steps_pairs = torch.full((ids_pairs.size(0),), 2, dtype=torch.long, device=device) if ids_pairs is not None else torch.zeros(0, dtype=torch.long, device=device)
         # equality statements -> 1 step
         steps_eq = torch.ones(ids_eq.size(0), dtype=torch.long, device=device)
         # counting mapping: successor/pred=1, between=2
