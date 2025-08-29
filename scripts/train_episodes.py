@@ -2205,47 +2205,47 @@ def train(args):
 
         # ---------------- Sleep: abstraction + Dreaming (MAP over traces) --------
         try:
-    if int(getattr(args, "wake_sleep", 1)) > 0 and (step + 1) % int(getattr(args, "sleep_every", 300)) == 0:
-        installed = []
-        try:
-            installed = model.reasoner.sleep_abstraction()
-        except Exception:
-            installed = []
-        # Telemetry each sleep cycle
-        telem = getattr(model.reasoner, "_telemetry", {}) or {}
-        # Build a compact telemetry summary
-        fn_nonempty = telem.get("fn_nonempty", None)
-        avg_len = telem.get("avg_flat_len", None)
-        max_stack = telem.get("max_stack_depth", None)
-        usage = telem.get("slot_usage_ema", None)
-        pct_used_fn = telem.get("pct_used_fn", None)
-        pct_depth_ge2 = telem.get("pct_depth_ge2", None)
-        dlogp = telem.get("delta_logp_fn_vs_prim", None)
-        if hasattr(usage, "tolist"):
-            usage = usage.tolist()
-        usage_mean = (
-            float(sum(usage) / max(1, len(usage))) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
-        )
-        usage_max = (
-            float(max(usage)) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
-        )
-        def _r(x):
-            return None if x is None else round(float(x), 3)
-        compact = {
-            "fn_nonempty": fn_nonempty,
-            "avg_len": _r(avg_len),
-            "max_stack": max_stack,
-            "usage_mean": _r(usage_mean),
-            "usage_max": _r(usage_max),
-            "%fn_used": _r(pct_used_fn),
-            "%depth>=2": _r(pct_depth_ge2),
-            "Δlogp_fn": _r(dlogp),
-        }
-        try:
-            rb_len = len(rb)
-        except Exception:
-            rb_len = 0
-        print(f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={compact}")
+            if int(getattr(args, "wake_sleep", 1)) > 0 and (step + 1) % int(getattr(args, "sleep_every", 300)) == 0:
+                installed = []
+                try:
+                    installed = model.reasoner.sleep_abstraction()
+                except Exception:
+                    installed = []
+                # Telemetry each sleep cycle
+                telem = getattr(model.reasoner, "_telemetry", {}) or {}
+                # Build a compact telemetry summary
+                fn_nonempty = telem.get("fn_nonempty", None)
+                avg_len = telem.get("avg_flat_len", None)
+                max_stack = telem.get("max_stack_depth", None)
+                usage = telem.get("slot_usage_ema", None)
+                pct_used_fn = telem.get("pct_used_fn", None)
+                pct_depth_ge2 = telem.get("pct_depth_ge2", None)
+                dlogp = telem.get("delta_logp_fn_vs_prim", None)
+                if hasattr(usage, "tolist"):
+                    usage = usage.tolist()
+                usage_mean = (
+                    float(sum(usage) / max(1, len(usage))) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
+                )
+                usage_max = (
+                    float(max(usage)) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
+                )
+                def _r(x):
+                    return None if x is None else round(float(x), 3)
+                compact = {
+                    "fn_nonempty": fn_nonempty,
+                    "avg_len": _r(avg_len),
+                    "max_stack": max_stack,
+                    "usage_mean": _r(usage_mean),
+                    "usage_max": _r(usage_max),
+                    "%fn_used": _r(pct_used_fn),
+                    "%depth>=2": _r(pct_depth_ge2),
+                    "Δlogp_fn": _r(dlogp),
+                }
+                try:
+                    rb_len = len(rb)
+                except Exception:
+                    rb_len = 0
+                print(f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={compact}")
                 # Dream-MAP from replay buffer (replayed experiences)
                 if len(rb) > 0:
                     dream_bs = min(args.batch_size, len(rb))

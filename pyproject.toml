@@ -79,12 +79,13 @@ python scripts/train_episodes.py train \
   --resume runs/episodes_b10/best.pt
 """
 setup = """
-apt update && sudo apt upgrade -y
+apt update && apt upgrade -y
 apt install tmux vim -y
 cd /workspace/concept-learner
 tmux new -s train
+pip install uv
 uv sync
-uv run task train | tee /var/log/train.log
+PYTHONUNBUFFERED=1 uv run task train 2>&1 | tee -a /var/log/train.log
 """
 attach = "tmux attach -t train"
 logs = "tail -f /var/log/train.log"
