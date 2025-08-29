@@ -1437,7 +1437,8 @@ def train(args):
         allowed_kinds = []
         if include_face:
             allowed_kinds += [0, 1, 3]
-        if include_place:
+        # Guard: place value (kind=2) produces targets up to 90; require N>=100
+        if include_place and ecfg.max_number >= 100:
             allowed_kinds += [2]
         use_pv = len(allowed_kinds) > 0
         if use_pv:
