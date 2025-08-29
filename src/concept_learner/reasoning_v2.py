@@ -213,6 +213,9 @@ class ReasonerV2(nn.Module):
         traces: List[List[Tuple[str, int]]] = [[] for _ in range(B)] if self.wake_sleep else None
         # micro-exec stacks (per-example), only used if exec_mode=="micro"
         stacks: List[list] = [[] for _ in range(B)] if (self.use_functions and self.exec_mode == "micro") else None
+        max_depth_seen = [0 for _ in range(B)] if stacks is not None else None
+        # per-batch function call histogram (base controller selections)
+        fn_call_hist = torch.zeros(self.num_fn_slots, device=H.device) if (self.use_functions and self.num_fn_slots > 0) else None
         micro_noop_flag = None
 
         # track average primitive effect from this forward pass (for mining filters)
@@ -341,6 +344,8 @@ class ReasonerV2(nn.Module):
                         if sel >= len(self.prims):
                             sid = sel - len(self.prims)
                             stacks[bi].append({"sid": sid, "pc": 0, "depth": 1})
+                            if max_depth_seen is not None:
+                                max_depth_seen[bi] = max(max_depth_seen[bi], 1)
                             pick[bi].zero_()
                             micro_noop[bi] = True
                         # else: leave pick as-is
@@ -361,7 +366,10 @@ class ReasonerV2(nn.Module):
                     if spec.kind == "function":
                         callee = int(spec.idx) if spec.idx is not None else -1
                         if callee >= 0 and (callee != sid or self.op_function.allow_self_call) and self.op_function.allow_higher_order:
-                            st.append({"sid": callee, "pc": 0, "depth": frame.get("depth", 1) + 1})
+                            new_depth = frame.get("depth", 1) + 1
+                            st.append({"sid": callee, "pc": 0, "depth": new_depth})
+                            if max_depth_seen is not None:
+                                max_depth_seen[bi] = max(max_depth_seen[bi], new_depth)
                         pick[bi].zero_(); micro_noop[bi] = True
                         continue
                     if spec.kind == "primitive":
@@ -379,6 +387,17 @@ class ReasonerV2(nn.Module):
             new_val = torch.einsum("bin,bn->bi", V, pick)  # (B, 1)
             new_bool = torch.einsum("bin,bn->bi", Bv, pick)  # (B, 1)
             new_env = torch.einsum("bkn,bn->bk", E, pick)  # (B, K)
+
+            # accumulate per-slot calls from base pick (functions only)
+            if fn_call_hist is not None:
+                with torch.no_grad():
+                    sel_idx = pick.argmax(dim=-1)  # (B,)
+                    for bi in range(B):
+                        a = int(sel_idx[bi].item())
+                        if a >= len(self.prims):
+                            sid = a - len(self.prims)
+                            if 0 <= sid < fn_call_hist.numel():
+                                fn_call_hist[sid] += 1.0
 
             # freeze items that are already done
             if done.any():
@@ -507,11 +526,64 @@ class ReasonerV2(nn.Module):
             except Exception:
                 telem["avg_flat_len"] = 0.0
             if self._slot_usage_ema is not None:
-                telem["slot_usage_ema"] = self._slot_usage_ema.detach().cpu()
+                su = self._slot_usage_ema.detach().cpu()
+                telem["slot_usage_ema"] = su
+                try:
+                    telem["slot_usage_mean"] = float(su.mean().item())
+                    telem["slot_usage_max"] = float(su.max().item())
+                except Exception:
+                    pass
+            # function call histogram this batch
+            if fn_call_hist is not None:
+                telem["fn_call_hist"] = fn_call_hist.detach().cpu().tolist()
+            # function body length histogram (by steps count until return)
+            try:
+                lengths = []
+                for sl in self.op_function.slots:
+                    L = 0
+                    for st in sl.steps:
+                        if st.kind == "return":
+                            break
+                        L += 1
+                    if L > 0:
+                        lengths.append(L)
+                hist = {}
+                for L in lengths:
+                    hist[L] = hist.get(L, 0) + 1
+                telem["fn_body_len_hist"] = hist
+            except Exception:
+                pass
         if self.use_functions and self.exec_mode == "micro" and stacks is not None:
             depths = [len(s_) for s_ in stacks]
             telem["stack_depths"] = depths
             telem["max_stack_depth"] = max(depths) if len(depths) > 0 else 0
+            # percent of episodes with depth >= 2 (max during run)
+            try:
+                if max_depth_seen is not None and len(max_depth_seen) > 0:
+                    pct_d2 = sum(1 for v in max_depth_seen if v >= 2) / max(1, len(max_depth_seen))
+                    telem["pct_depth_ge2"] = float(pct_d2)
+            except Exception:
+                pass
+        # percent of episodes using at least one function (via traces)
+        try:
+            if traces is not None:
+                used = 0
+                for tr in traces:
+                    if any((k == "func") for (k, _) in tr):
+                        used += 1
+                telem["pct_used_fn"] = float(used / max(1, len(traces)))
+        except Exception:
+            pass
+        # delta logp advantage at final step (fn vs primitive-only)
+        try:
+            last_logits = action_logits[:, -1, :]
+            logp = F.log_softmax(last_logits, dim=-1)
+            lp_prim = logp[:, : len(self.prims)].max(dim=-1).values
+            if self.num_fn_slots > 0:
+                lp_fn = logp[:, len(self.prims) :].max(dim=-1).values
+                telem["delta_logp_fn_vs_prim"] = float((lp_fn - lp_prim).mean().item())
+        except Exception:
+            pass
         # expose primitive effects (avg over steps) for mining filters
         if effects_accum is not None:
             with torch.no_grad():

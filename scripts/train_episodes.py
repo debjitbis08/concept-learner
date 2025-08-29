@@ -1816,41 +1816,47 @@ def train(args):
 
         # ---------------- Sleep: abstraction + Dreaming (MAP over traces) --------
         try:
-            if int(getattr(args, "wake_sleep", 1)) > 0 and (step + 1) % int(getattr(args, "sleep_every", 300)) == 0:
-                installed = []
-                try:
-                    installed = model.reasoner.sleep_abstraction()
-                except Exception:
-                    installed = []
-                # Telemetry each sleep cycle
-                telem = getattr(model.reasoner, "_telemetry", {}) or {}
-                # Build a compact telemetry summary
-                fn_nonempty = telem.get("fn_nonempty", None)
-                avg_len = telem.get("avg_flat_len", None)
-                max_stack = telem.get("max_stack_depth", None)
-                usage = telem.get("slot_usage_ema", None)
-                if hasattr(usage, "tolist"):
-                    usage = usage.tolist()
-                usage_mean = (
-                    float(sum(usage) / max(1, len(usage))) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
-                )
-                usage_max = (
-                    float(max(usage)) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
-                )
-                def _r(x):
-                    return None if x is None else round(float(x), 3)
-                compact = {
-                    "fn_nonempty": fn_nonempty,
-                    "avg_len": _r(avg_len),
-                    "max_stack": max_stack,
-                    "usage_mean": _r(usage_mean),
-                    "usage_max": _r(usage_max),
-                }
-                try:
-                    rb_len = len(rb)
-                except Exception:
-                    rb_len = 0
-                print(f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={compact}")
+    if int(getattr(args, "wake_sleep", 1)) > 0 and (step + 1) % int(getattr(args, "sleep_every", 300)) == 0:
+        installed = []
+        try:
+            installed = model.reasoner.sleep_abstraction()
+        except Exception:
+            installed = []
+        # Telemetry each sleep cycle
+        telem = getattr(model.reasoner, "_telemetry", {}) or {}
+        # Build a compact telemetry summary
+        fn_nonempty = telem.get("fn_nonempty", None)
+        avg_len = telem.get("avg_flat_len", None)
+        max_stack = telem.get("max_stack_depth", None)
+        usage = telem.get("slot_usage_ema", None)
+        pct_used_fn = telem.get("pct_used_fn", None)
+        pct_depth_ge2 = telem.get("pct_depth_ge2", None)
+        dlogp = telem.get("delta_logp_fn_vs_prim", None)
+        if hasattr(usage, "tolist"):
+            usage = usage.tolist()
+        usage_mean = (
+            float(sum(usage) / max(1, len(usage))) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
+        )
+        usage_max = (
+            float(max(usage)) if isinstance(usage, (list, tuple)) and len(usage) > 0 else None
+        )
+        def _r(x):
+            return None if x is None else round(float(x), 3)
+        compact = {
+            "fn_nonempty": fn_nonempty,
+            "avg_len": _r(avg_len),
+            "max_stack": max_stack,
+            "usage_mean": _r(usage_mean),
+            "usage_max": _r(usage_max),
+            "%fn_used": _r(pct_used_fn),
+            "%depth>=2": _r(pct_depth_ge2),
+            "Δlogp_fn": _r(dlogp),
+        }
+        try:
+            rb_len = len(rb)
+        except Exception:
+            rb_len = 0
+        print(f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={compact}")
                 # Dream-MAP from replay buffer (replayed experiences)
                 if len(rb) > 0:
                     dream_bs = min(args.batch_size, len(rb))
@@ -2351,6 +2357,22 @@ def evaluate(args):
         "smaller",
     ]
 
+    # Optional: Template-OOD per relation (using simple holdout split)
+    def build_template_filters(holdout_ratio: float = 0.0):
+        train_filt, ood_filt = {}, {}
+        for r in range(9):
+            tlist = _pair_templates(3, 5, r)
+            k = len(tlist)
+            if k <= 1:
+                train_filt[r] = [0]
+                ood_filt[r] = []
+                continue
+            k_tr = max(1, int(k * (1.0 - holdout_ratio)))
+            train_filt[r] = list(range(0, k_tr))
+            ood_filt[r] = list(range(k_tr, k))
+        return train_filt, ood_filt
+    tmpl_train, tmpl_ood = build_template_filters(getattr(args, "template_holdout", 0.0))
+
     # Helper to compute macro-F1 at a threshold
     def macro_f1_at(thr: float) -> float:
         preds = (probs_all >= thr).long()
@@ -2389,6 +2411,24 @@ def evaluate(args):
     print("Threshold sweep (Brier-bin):")
     for t in nb_br:
         print(f"  thr={t:.2f}  brier={brier_bin_at(t):.3f}")
+
+    # Template-OOD accuracy per relation (if holdout > 0)
+    if getattr(args, "template_holdout", 0.0) and args.template_holdout > 0.0:
+        print("\nTemplate-OOD per relation (held-out templates):")
+        with torch.no_grad():
+            for ridx, rname in enumerate(rel_names):
+                # skip if no OOD templates
+                if ridx not in tmpl_ood or len(tmpl_ood[ridx]) == 0:
+                    print(f"  {rname:12s}: (no OOD templates)")
+                    continue
+                batch = gen.sample_posneg_pairs(batch=min(256, args.batch_size), allowed_relations=[ridx])
+                ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len, template_filter=tmpl_ood)
+                y = batch["label"].to(device)
+                _, logits_seq_r, _, _, _, _ = model(ids, mask)
+                logits_pair_r = logits_seq_r[:, [NO_IDX, YES_IDX]] / T
+                pred_r = logits_pair_r.argmax(dim=-1)
+                acc_r = (pred_r == y).float().mean().item()
+                print(f"  {rname:12s}: acc={acc_r:.3f}")
 
     # Build rows for eval report at best_thr_f1
     used_thr = float(round(best_thr_f1, 2))
@@ -2466,6 +2506,22 @@ def evaluate(args):
                 print(
                     f"{name} far   (|a-b|>1):  {int(far.sum())} ex, acc={acc_far:.3f}"
                 )
+
+    # Boundary-OOD confusion matrix for greater/smaller at |a-b|<=1
+    def confusion(y_true, y_pred):
+        tp = int(((y_true == 1) & (y_pred == 1)).sum().item())
+        tn = int(((y_true == 0) & (y_pred == 0)).sum().item())
+        fp = int(((y_true == 0) & (y_pred == 1)).sum().item())
+        fn = int(((y_true == 1) & (y_pred == 0)).sum().item())
+        return tp, fp, fn, tn
+    for r, name in [(7, "greater"), (8, "smaller")]:
+        sel = rel_all == r
+        close = sel & (eq_diff <= 1)
+        if close.any():
+            y_c = labels_all[close]
+            p_c = pred_all[close]
+            tp, fp, fn, tn = confusion(y_c, p_c)
+            print(f"{name} boundary confusion (|a-b|<=1): TP={tp} FP={fp} FN={fn} TN={tn}")
 
     # Print a few sample predictions with canonical questions and answers
     batch = gen.sample_posneg_pairs(batch=4)
@@ -2797,6 +2853,7 @@ def main():
         help="Force base-10 rendering only (min_base=max_base=10)",
     )
     pe.add_argument("--temp_fit", action="store_true", help="Fit a scalar temperature on a held-out split for calibration")
+    pe.add_argument("--template_holdout", type=float, default=0.0, help="Fraction of NL templates per relation held out for template-OOD (0..1)")
 
     # Counting subcommands (unified CLI)
     ct = sub.add_parser(
