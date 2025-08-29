@@ -5,6 +5,10 @@ import torch
 from contextlib import nullcontext
 from typing import List
 from concept_learner.episodes import EpisodeConfig, EpisodeGenerator
+from concept_learner.compositions import (
+    make_numeric_compositions,
+    make_equality_compositions,
+)
 from concept_learner.model import CLModel
 from concept_learner.proto_router import ProtoRouter
 from concept_learner.tokenizer import HFTokenizerWrapper
@@ -1551,6 +1555,37 @@ def train(args):
         ids = torch.cat([ids, ids_off], dim=0)
         mask = torch.cat([mask, mask_off], dim=0)
         y = torch.cat([y, y_off], dim=0)
+
+        # compositional numeric targets (e.g., succ(ones(a)), pred(pred(a)))
+        try:
+            comp_num_bsz = max(1, args.batch_size // 8)
+            comp_texts_num, comp_y_num = make_numeric_compositions(
+                n_items=ecfg.max_number, batch=comp_num_bsz, device=device
+            )
+            ids_cnum, mask_cnum = _pack_text_batch(comp_texts_num, tok, seq_len, device)
+            y = torch.cat([y, comp_y_num.to(device)], dim=0)
+            ids = torch.cat([ids, ids_cnum], dim=0)
+            mask = torch.cat([mask, mask_cnum], dim=0)
+        except Exception:
+            pass
+
+        # compositional equality yes/no (e.g., Is succ(succ(a)) == b?)
+        try:
+            comp_yn_bsz = max(1, args.batch_size // 8)
+            comp_texts_yn, comp_y_yn_bin = make_equality_compositions(
+                n_items=ecfg.max_number, batch=comp_yn_bsz, device=device
+            )
+            ids_cyn, mask_cyn = _pack_text_batch(comp_texts_yn, tok, seq_len, device)
+            y_cyn = torch.where(
+                comp_y_yn_bin.to(device) > 0,
+                torch.full((comp_yn_bsz,), YES_IDX, dtype=torch.long, device=device),
+                torch.full((comp_yn_bsz,), NO_IDX, dtype=torch.long, device=device),
+            )
+            ids = torch.cat([ids, ids_cyn], dim=0)
+            mask = torch.cat([mask, mask_cyn], dim=0)
+            y = torch.cat([y, y_cyn], dim=0)
+        except Exception:
+            pass
 
         # Oversample successor/pred around carries/borrows: …9 + 1 and …0 − 1
         try:
