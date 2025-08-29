@@ -1782,16 +1782,38 @@ def train(args):
         except Exception:
             n_seq_valid, y_min, y_max = 0, 0, -1
         if seq_mask.any():
+            # CE on masked rows
+            logits_m = logits_seq[seq_mask]
+            y_m = y_safe[seq_mask]
+            # quick diagnostic: check finiteness pre-CE
+            try:
+                nf_all = int((~torch.isfinite(logits_m)).sum().item())
+                if nf_all > 0:
+                    print(f"[warn] logits contained {nf_all} non-finite values before CE (masked subset)")
+            except Exception:
+                pass
             loss_seq = torch.nn.functional.cross_entropy(
-                logits_seq[seq_mask], y_safe[seq_mask], label_smoothing=cur_ls
+                logits_m, y_m, label_smoothing=cur_ls
             )
-            # If CE still returns non-finite, skip this step's seq loss
+            # If CE still returns non-finite, attempt manual smoothed CE
             if not torch.isfinite(loss_seq):
                 try:
-                    print("[warn] non-finite seq CE; skipping seq loss this step")
+                    eps = float(cur_ls)
+                    lsm = torch.log_softmax(logits_m, dim=-1)
+                    nll = -lsm.gather(1, y_m.view(-1, 1)).squeeze(1)
+                    if eps > 0.0:
+                        smooth = -lsm.mean(dim=-1)
+                        loss_seq = ((1.0 - eps) * nll + eps * smooth).mean()
+                    else:
+                        loss_seq = nll.mean()
+                    if not torch.isfinite(loss_seq):
+                        print("[warn] non-finite seq CE even after manual; skipping seq loss this step")
+                        loss_seq = logits_seq.new_zeros(())
+                    else:
+                        print("[info] used manual smoothed CE due to non-finite from F.cross_entropy")
                 except Exception:
-                    pass
-                loss_seq = logits_seq.new_zeros(())
+                    print("[warn] CE fallback failed; skipping seq loss this step")
+                    loss_seq = logits_seq.new_zeros(())
         else:
             fb = str(getattr(args, "seq_fallback", "skip")).lower()
             w_fb = float(getattr(args, "seq_fallback_weight", 0.1))
