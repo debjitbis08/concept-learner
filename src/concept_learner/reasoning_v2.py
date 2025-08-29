@@ -51,6 +51,19 @@ class ReasonerV2(nn.Module):
         prune_threshold: float = 0.02,
         mdl_alpha: float = 1.0,
         dream_replay_mix: float = 0.5,
+        # action selection knobs
+        epsilon: float = 0.03,
+        topk_actions: int = 4,
+        action_entropy_weight: float = 1e-3,
+        stop_bias: float = -0.5,
+        # function install filters
+        mine_min_body_len: int = 2,
+        mine_min_effect: float = 1e-3,
+        mine_cosine_max: float = 0.90,
+        mine_overlap_max: float = 0.70,
+        # post-install bias
+        fn_bias_init: float = 1.0,
+        fn_bias_decay: float = 0.995,
     ):
         super().__init__()
         # primitives
@@ -74,6 +87,11 @@ class ReasonerV2(nn.Module):
         self.temperature = float(temperature)
         self.lambda_sparse = float(lambda_sparse)
         self.lambda_halt = float(lambda_halt)
+        # new knobs
+        self.epsilon = float(epsilon)
+        self.topk_actions = int(topk_actions)
+        self.action_entropy_weight = float(action_entropy_weight)
+        self.stop_bias = float(stop_bias)
 
         # optional function library
         self.use_functions = bool(use_functions)
@@ -127,6 +145,11 @@ class ReasonerV2(nn.Module):
         self.prune_threshold = float(prune_threshold)
         self.mdl_alpha = float(mdl_alpha)
         self.dream_replay_mix = float(dream_replay_mix)
+        # install filters
+        self.mine_min_body_len = int(mine_min_body_len)
+        self.mine_min_effect = float(mine_min_effect)
+        self.mine_cosine_max = float(mine_cosine_max)
+        self.mine_overlap_max = float(mine_overlap_max)
         # slot usage EMA
         if self.use_functions:
             self.register_buffer(
@@ -136,6 +159,17 @@ class ReasonerV2(nn.Module):
             )
         else:
             self._slot_usage_ema = None
+        # post-install function action logit bias (decays over time)
+        if self.use_functions:
+            self.register_buffer(
+                "_fn_post_bias",
+                torch.zeros(self.num_fn_slots),
+                persistent=False,
+            )
+        else:
+            self._fn_post_bias = None  # type: ignore
+        self.fn_bias_init = float(fn_bias_init)
+        self.fn_bias_decay = float(fn_bias_decay)
 
     def forward(
         self, H: torch.Tensor, z: torch.Tensor, mask: torch.Tensor
@@ -173,12 +207,16 @@ class ReasonerV2(nn.Module):
         # sparsity and over-halt penalties accumulators
         pen_sparse = []
         pen_halt = []
+        ent_list = []
 
         # trace per example
         traces: List[List[Tuple[str, int]]] = [[] for _ in range(B)] if self.wake_sleep else None
         # micro-exec stacks (per-example), only used if exec_mode=="micro"
         stacks: List[list] = [[] for _ in range(B)] if (self.use_functions and self.exec_mode == "micro") else None
         micro_noop_flag = None
+
+        # track average primitive effect from this forward pass (for mining filters)
+        effects_accum = None  # (num_prims,) tensor on device
 
         for step in range(self.max_steps):
             x = torch.cat([s, z], dim=-1)  # (B,2d)
@@ -199,17 +237,48 @@ class ReasonerV2(nn.Module):
                 pad_fn = (fn_mask.view(1, -1).expand(B, -1) - 1).clamp(max=0) * 1e9
                 pad = torch.cat([pad_prim, pad_fn], dim=-1)
                 logits_action = logits_action + pad
+            # add post-install function bias (encourage fresh functions)
+            if self.use_functions and self._fn_post_bias is not None and self.num_fn_slots > 0:
+                bias = self._fn_post_bias.view(1, -1).expand(B, -1)
+                pad_prim = torch.zeros(B, len(self.prims), device=H.device)
+                logits_action = logits_action + torch.cat([pad_prim, bias], dim=-1)
+
+            # top-k candidate mask (keep best-k actions)
+            if self.topk_actions is not None and self.topk_actions > 0 and self.topk_actions < logits_action.size(-1):
+                k = int(self.topk_actions)
+                topk_vals, topk_idx = torch.topk(logits_action, k=min(k, logits_action.size(-1)), dim=-1)
+                mask_keep = torch.zeros_like(logits_action, dtype=torch.bool)
+                mask_keep.scatter_(dim=-1, index=topk_idx, src=torch.ones_like(topk_idx, dtype=torch.bool))
+                logits_action = torch.where(mask_keep, logits_action, logits_action.new_full(logits_action.shape, -1e9))
 
             probs_action = torch.softmax(logits_action, dim=-1)
             # sparsity penalty: encourage peaky distribution (L1-like)
             pen_sparse.append((probs_action.sum(dim=-1) - probs_action.max(dim=-1).values).mean())
-            # Discrete operator selection per step (base pick)
-            if self.training:
-                pick_base = F.gumbel_softmax(
-                    logits_action, tau=self.temperature, hard=True, dim=-1
-                )  # (B, total_actions) one-hot
+            # small action entropy bonus (for trainer via aux)
+            act_entropy = -(probs_action * (probs_action.clamp_min(1e-9).log())).sum(dim=-1).mean()
+            ent_list.append(act_entropy)
+            # Discrete operator selection per step (epsilon-greedy + gumbel)
+            if self.training and self.epsilon > 0:
+                # sample exploration mask per example
+                explore = (torch.rand(B, device=H.device) < self.epsilon)
             else:
-                idx = logits_action.argmax(-1)  # (B,)
+                explore = torch.zeros(B, dtype=torch.bool, device=H.device)
+            pick_base = torch.zeros_like(logits_action)
+            if self.training:
+                # exploitation via Gumbel
+                exp_pick = F.gumbel_softmax(logits_action, tau=self.temperature, hard=True, dim=-1)
+                pick_base = exp_pick.clone()
+                # exploration: uniform among currently unmasked actions (top-k mask already applied)
+                if explore.any():
+                    valid = (logits_action > -1e8).float()  # 1 where allowed
+                    # normalize to uniform where valid
+                    valid = valid / valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                    # sample categorical by argmax over Gumbel(0,1) + log probs
+                    g = -torch.log(-torch.log(torch.rand_like(valid) + 1e-9) + 1e-9)
+                    u_pick = F.one_hot((torch.argmax((valid.clamp_min(1e-9).log() + g), dim=-1)), num_classes=valid.size(-1)).float()
+                    pick_base[explore] = u_pick[explore]
+            else:
+                idx = logits_action.argmax(-1)
                 pick_base = F.one_hot(idx, num_classes=logits_action.size(-1)).float()
 
             # ----- run all typed-state ops -----
@@ -217,6 +286,7 @@ class ReasonerV2(nn.Module):
 
             cand_masks, cand_vals, cand_bools, cand_envs = [], [], [], []
             # primitives
+            prim_effects_step = []
             for op in self.prims:
                 m_i, v_i, b_i = op(ts, z)  # m_i:(B,T), v_i:(B,1), b_i:(B,1)
                 cand_masks.append(m_i)
@@ -230,6 +300,16 @@ class ReasonerV2(nn.Module):
                 else:
                     e_i = env
                 cand_envs.append(e_i)
+                # primitive effect estimate (norm of delta state vs input ts)
+                with torch.no_grad():
+                    d_mask = (m_i - ts.mask).pow(2).mean(dim=1).sqrt().mean()
+                    d_val = (v_i - ts.val).pow(2).mean().sqrt()
+                    d_bool = (b_i - ts.boolean).pow(2).mean().sqrt()
+                    try:
+                        d_env = (e_i - (ts.env if ts.env is not None else e_i.new_zeros(e_i.shape))).pow(2).mean().sqrt()
+                    except Exception:
+                        d_env = torch.tensor(0.0, device=H.device)
+                    prim_effects_step.append((d_mask + d_val + d_bool + 0.1 * d_env).detach())
             # functions as macro actions
             if self.use_functions and self.op_function is not None and self.num_fn_slots > 0:
                 for k in range(self.num_fn_slots):
@@ -243,6 +323,10 @@ class ReasonerV2(nn.Module):
             V = torch.stack(cand_vals, dim=-1)  # (B, 1, num_ops)
             Bv = torch.stack(cand_bools, dim=-1)  # (B, 1, num_ops)
             E = torch.stack(cand_envs, dim=-1)  # (B, K, num_ops)
+            # accumulate primitive effects
+            if len(prim_effects_step) > 0:
+                step_vec = torch.stack(prim_effects_step, dim=0)  # (num_prims,)
+                effects_accum = step_vec if effects_accum is None else (effects_accum + step_vec)
 
             # ----- select operator outputs -----
             pick = pick_base
@@ -363,6 +447,8 @@ class ReasonerV2(nn.Module):
 
             # STOP head (per-example)
             stop_logit = self.to_stop(torch.cat([s, z], dim=-1))  # (B,1)
+            if self.stop_bias != 0.0:
+                stop_logit = stop_logit + self.stop_bias
             stop_logits_all.append(stop_logit)
             action_logits_all.append(logits_action.unsqueeze(1))  # (B,1,total_actions)
 
@@ -382,9 +468,23 @@ class ReasonerV2(nn.Module):
         # expose final scalar value stream for downstream decoders
         self._last_val = val
         # expose auxiliary losses for trainer
+        # function advantage bonus: when max function logit > max primitive logit
+        try:
+            last_logits = action_logits[:, -1, :]
+            if self.use_functions and self.num_fn_slots > 0:
+                max_prim = last_logits[:, : len(self.prims)].max(dim=-1).values
+                max_fn = last_logits[:, len(self.prims) :].max(dim=-1).values
+                fn_adv = (max_fn - max_prim).clamp_min(0.0).mean()
+            else:
+                fn_adv = torch.tensor(0.0, device=H.device)
+        except Exception:
+            fn_adv = torch.tensor(0.0, device=H.device)
+
         self._aux_loss = {
             "sparse": (torch.stack(pen_sparse).mean() if len(pen_sparse) > 0 else torch.tensor(0.0, device=H.device)),
             "halt_over": (torch.stack(pen_halt).mean() if len(pen_halt) > 0 else torch.tensor(0.0, device=H.device)),
+            "act_entropy": (torch.stack(ent_list).mean() if len(ent_list) > 0 else torch.tensor(0.0, device=H.device)),
+            "fn_adv": fn_adv,
         }
 
         # expose traces for wake/sleep
@@ -412,6 +512,16 @@ class ReasonerV2(nn.Module):
             depths = [len(s_) for s_ in stacks]
             telem["stack_depths"] = depths
             telem["max_stack_depth"] = max(depths) if len(depths) > 0 else 0
+        # expose primitive effects (avg over steps) for mining filters
+        if effects_accum is not None:
+            with torch.no_grad():
+                self._last_prim_effects = (effects_accum / float(max(1, self.max_steps)))
+        else:
+            self._last_prim_effects = None
+        # decay post-install bias
+        if self.use_functions and self._fn_post_bias is not None:
+            self._fn_post_bias.mul_(self.fn_bias_decay)
+
         self._telemetry = telem
 
         return H_reasoned, s, stop_logits, action_logits
@@ -533,7 +643,64 @@ class ReasonerV2(nn.Module):
             mdl_gain_threshold=(self.mdl_gain_threshold if mdl_gain_threshold is None else mdl_gain_threshold),
             existing_patterns=existing,
         )
-        installed = self.op_function.install(cands)
+        # Post-filter candidates by body length, effect, and diversity
+        def _prim_seq_from_steps(steps: List[StepSpec]) -> List[int]:
+            seq: List[int] = []
+            for st in steps:
+                if st.kind == "primitive" and st.idx is not None:
+                    seq.append(int(st.idx))
+                elif st.kind == "return":
+                    break
+                else:
+                    # disallow higher-order in mined bodies for now
+                    return []
+            return seq
+
+        prim_effects = getattr(self, "_last_prim_effects", None)
+        # build existing library vectors for cosine/overlap
+        existing_seqs = self._existing_primitive_patterns()
+        num_prims = len(self.prims)
+        def _vec_from_seq(seq: List[int]):
+            v = torch.zeros(num_prims)
+            for j in seq:
+                if 0 <= j < num_prims:
+                    v[j] += 1.0
+            return v
+        exist_vecs = [_vec_from_seq(list(p)) for p in existing_seqs]
+
+        filtered: List[FnCandidate] = []
+        for cand in cands:
+            seq = _prim_seq_from_steps(cand.steps)
+            if len(seq) < self.mine_min_body_len:
+                continue
+            # effect threshold: sum recent primitive effects along sequence
+            if isinstance(prim_effects, torch.Tensor):
+                eff = float(sum([float(prim_effects[min(j, prim_effects.numel()-1)].item()) for j in seq]))
+                if eff < self.mine_min_effect:
+                    continue
+            # diversity filters
+            if exist_vecs:
+                v = _vec_from_seq(seq)
+                keep = True
+                for ev, es in zip(exist_vecs, existing_seqs):
+                    # cosine similarity
+                    cos = 0.0
+                    if v.norm().item() > 0 and ev.norm().item() > 0:
+                        cos = float(torch.dot(v, ev) / (v.norm() * ev.norm() + 1e-9))
+                    if cos > self.mine_cosine_max:
+                        keep = False
+                        break
+                    # coverage overlap (Jaccard over sets of prim indices)
+                    s1, s2 = set(seq), set(es)
+                    jacc = len(s1 & s2) / max(1, len(s1 | s2))
+                    if jacc > self.mine_overlap_max:
+                        keep = False
+                        break
+                if not keep:
+                    continue
+            filtered.append(cand)
+
+        installed = self.op_function.install(filtered)
         # Increment sleep counter and (optionally) prune based on usage ema
         self._sleep_calls += 1
         if self._slot_usage_ema is not None and self._sleep_calls >= 2:
@@ -542,6 +709,11 @@ class ReasonerV2(nn.Module):
                 self.op_function.prune(usage, self.prune_threshold)
             except Exception:
                 pass
+        # Boost newly installed functions via logit bias (decaying)
+        if self.use_functions and self._fn_post_bias is not None and len(installed) > 0:
+            for sid in installed:
+                if 0 <= sid < self._fn_post_bias.numel():
+                    self._fn_post_bias[sid] = max(float(self._fn_post_bias[sid].item()), self.fn_bias_init)
         return installed
 
     def _existing_primitive_patterns(self) -> List[Tuple[int, ...]]:

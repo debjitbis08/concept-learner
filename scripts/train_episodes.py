@@ -802,6 +802,24 @@ def train(args):
         vq_orth_weight=args.vq_orth_weight,
         vq_entropy_weight=args.vq_entropy_weight,
     ).to(device)
+    # Wire reasoner knobs
+    try:
+        r = model.reasoner
+        r.max_steps = int(getattr(args, "max_steps", r.max_steps))
+        r.epsilon = float(getattr(args, "epsilon", r.epsilon))
+        r.topk_actions = int(getattr(args, "topk_actions", r.topk_actions))
+        r.action_entropy_weight = float(getattr(args, "lambda_act_entropy", r.action_entropy_weight))
+        r.stop_bias = float(getattr(args, "stop_bias", r.stop_bias))
+        r.mine_min_support = int(getattr(args, "mine_min_support", r.mine_min_support))
+        r.mine_max_len = int(getattr(args, "mine_max_len", r.mine_max_len))
+        r.mine_min_body_len = int(getattr(args, "mine_min_body_len", r.mine_min_body_len))
+        r.mine_min_effect = float(getattr(args, "mine_min_effect", r.mine_min_effect))
+        r.mine_cosine_max = float(getattr(args, "mine_cosine_max", r.mine_cosine_max))
+        r.mine_overlap_max = float(getattr(args, "mine_overlap_max", r.mine_overlap_max))
+        r.fn_bias_init = float(getattr(args, "fn_bias_init", r.fn_bias_init))
+        r.fn_bias_decay = float(getattr(args, "fn_bias_decay", r.fn_bias_decay))
+    except Exception:
+        pass
     # Enable wake/sleep by default, micro-exec as default training mode
     if int(getattr(args, "wake_sleep", 1)) > 0:
         try:
@@ -1722,6 +1740,8 @@ def train(args):
             + lambda_k * reg_k
             + 1e-3 * aux.get("sparse", torch.tensor(0.0, device=device))
             + 1e-3 * aux.get("halt_over", torch.tensor(0.0, device=device))
+            + float(getattr(args, "lambda_act_entropy", 1e-3)) * aux.get("act_entropy", torch.tensor(0.0, device=device))
+            - float(getattr(args, "lambda_fn_adv", 1e-4)) * aux.get("fn_adv", torch.tensor(0.0, device=device))
         )
 
         # Consistency loss with EMA teacher for numeric head (digit-dropout view)
@@ -2661,6 +2681,22 @@ def main():
     pt.add_argument("--save_dir", type=str, default="runs/episodes")
     pt.add_argument("--ckpt_every", type=int, default=200)
     pt.add_argument("--log_every", type=int, default=50)
+    # Reasoner/action-selection knobs
+    pt.add_argument("--max_steps", type=int, default=4, help="Reasoner max steps per episode")
+    pt.add_argument("--epsilon", type=float, default=0.03, help="Epsilon-greedy exploration (train only)")
+    pt.add_argument("--topk_actions", type=int, default=4, help="Top-K actions considered per step")
+    pt.add_argument("--lambda_act_entropy", type=float, default=1e-3, help="Weight for action entropy bonus")
+    pt.add_argument("--lambda_fn_adv", type=float, default=1e-4, help="Tiny credit when functions beat primitives on logits")
+    pt.add_argument("--stop_bias", type=float, default=-0.25, help="Additive bias on STOP logits (negative lowers STOP)")
+    # Function install filters & post-install bias
+    pt.add_argument("--mine_min_support", type=int, default=16, help="Minimum support for mined functions")
+    pt.add_argument("--mine_max_len", type=int, default=4, help="Maximum mined body length")
+    pt.add_argument("--mine_min_body_len", type=int, default=2, help="Minimum mined body length")
+    pt.add_argument("--mine_min_effect", type=float, default=1e-3, help="Minimum estimated effect for a function body")
+    pt.add_argument("--mine_cosine_max", type=float, default=0.90, help="Max cosine similarity vs existing bodies")
+    pt.add_argument("--mine_overlap_max", type=float, default=0.70, help="Max Jaccard overlap vs existing bodies")
+    pt.add_argument("--fn_bias_init", type=float, default=1.0, help="Initial logit bias for newly installed functions")
+    pt.add_argument("--fn_bias_decay", type=float, default=0.995, help="Exponential decay for post-install bias (per forward)")
     # Wake/Sleep/Dream (enabled by default)
     pt.add_argument(
         "--wake_sleep", type=int, default=1, help="Enable wake/sleep/dream cycle (1=on, 0=off)"
