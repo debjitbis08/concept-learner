@@ -45,7 +45,7 @@ def _pack_pairs(a_desc, a_mask, b_desc, b_mask, device):
 
 
 def save_checkpoint(
-    path, model, opt, step, best_acc: float | None = None, ema_state: dict | None = None, proto_state: dict | None = None
+    path, model, opt, step, best_acc: float | None = None, ema_state: dict | None = None, proto_state: dict | None = None, knn_state: dict | None = None
 ):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step}
@@ -55,10 +55,12 @@ def save_checkpoint(
         payload["ema"] = ema_state
     if proto_state is not None:
         payload["proto"] = proto_state
+    if knn_state is not None:
+        payload["knn"] = knn_state
     torch.save(payload, path)
 
 
-def load_checkpoint(path, model, opt, map_location=None, ema=None, proto: ProtoRouter | None = None):
+def load_checkpoint(path, model, opt, map_location=None, ema=None, proto: ProtoRouter | None = None, knn=None, expected_model_hash: str | None = None):
     ckpt = torch.load(path, map_location=map_location)
     sd = ckpt["model"]
     # expose best_acc to callers for resume logic
@@ -169,6 +171,15 @@ def load_checkpoint(path, model, opt, map_location=None, ema=None, proto: ProtoR
     try:
         if proto is not None and isinstance(ckpt.get("proto"), dict):
             proto.load_state_dict(ckpt["proto"])  # type: ignore[arg-type]
+    except Exception:
+        pass
+    # optionally restore kNN memory snapshot if hash matches
+    try:
+        if knn is not None and isinstance(ckpt.get("knn"), dict):
+            state = ckpt["knn"]
+            mh = state.get("model_hash", None)
+            if expected_model_hash is None or (mh is not None and mh == expected_model_hash):
+                knn.load_snapshot(state, expected_hash=expected_model_hash)
     except Exception:
         pass
     return int(ckpt.get("step", 0))
@@ -847,6 +858,22 @@ def train(args):
         vq_orth_weight=args.vq_orth_weight,
         vq_entropy_weight=args.vq_entropy_weight,
     ).to(device)
+    # Compute encoder/VQ hash for optional kNN snapshot validity
+    import hashlib as _hashlib
+    def _encoder_hash(m: CLModel) -> str:
+        h = _hashlib.sha256()
+        try:
+            sd = m.state_dict()
+            keys = [k for k in sd.keys() if k.startswith("enc.") or k.startswith("rvq.")]
+            for k in sorted(keys):
+                t = sd[k].detach().cpu().contiguous()
+                h.update(k.encode()); h.update(bytes(t.shape)); h.update(t.numpy().tobytes())
+        except Exception:
+            for n, p in m.named_parameters():
+                if n.startswith("enc.") or n.startswith("rvq."):
+                    h.update(n.encode()); h.update(str(float(p.detach().sum().item())).encode())
+        return h.hexdigest()
+    model_hash = _encoder_hash(model)
     # Wire reasoner knobs
     try:
         r = model.reasoner
@@ -908,7 +935,7 @@ def train(args):
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
         start_step = load_checkpoint(
-            args.resume, model, opt, map_location=device, ema=None, proto=None
+            args.resume, model, opt, map_location=device, ema=None, proto=None, knn=knn, expected_model_hash=model_hash
         )
         print(f"Resumed from {args.resume} at step {start_step}")
         # initialize best_acc from checkpoint if present; else from a quick eval
@@ -3156,6 +3183,9 @@ def main():
     pt.add_argument("--save_dir", type=str, default="runs/episodes")
     pt.add_argument("--ckpt_every", type=int, default=200)
     pt.add_argument("--log_every", type=int, default=50)
+    pt.add_argument("--save_knn", type=int, default=0, help="Include kNN snapshot in checkpoints (0=off,1=on)")
+    pt.add_argument("--save_knn_best", type=int, default=1, help="Save kNN snapshot with best.pt")
+    pt.add_argument("--save_knn_every", type=int, default=0, help="Also save kNN snapshot every N steps (0 disables)")
     # Reasoner/action-selection knobs
     pt.add_argument("--max_steps", type=int, default=4, help="Reasoner max steps per episode")
     pt.add_argument("--epsilon", type=float, default=0.03, help="Epsilon-greedy exploration (train only)")
@@ -3453,8 +3483,15 @@ def main():
                 if val_acc > best and args.save_dir:
                     best = val_acc
                     os.makedirs(args.save_dir, exist_ok=True)
+                    # Optional kNN snapshot with best
+                    knn_state = None
+                    try:
+                        if int(getattr(args, "save_knn", 0)) > 0 and int(getattr(args, "save_knn_best", 1)) > 0 and 'knn' in globals() and knn is not None:
+                            knn_state = knn.snapshot(model_hash)
+                    except Exception:
+                        knn_state = None
                     save_checkpoint(
-                        os.path.join(args.save_dir, "best.pt"), model, opt, step + 1
+                        os.path.join(args.save_dir, "best.pt"), model, opt, step + 1, knn_state=knn_state
                     )
                     print(
                         f"  Saved best checkpoint: {os.path.join(args.save_dir, 'best.pt')} (val_acc={val_acc:.3f})"
@@ -3467,9 +3504,11 @@ def main():
                         model,
                         opt,
                         step + 1,
+                        knn_state=(knn.snapshot(model_hash) if (int(getattr(args, 'save_knn', 0)) > 0 and int(getattr(args, 'save_knn_every', 0)) > 0 and ((step + 1) % int(getattr(args, 'save_knn_every', 0)) == 0) and 'knn' in globals() and knn is not None) else None),
                     )
                 save_checkpoint(
-                    os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1
+                    os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1,
+                    knn_state=(knn.snapshot(model_hash) if (int(getattr(args, 'save_knn', 0)) > 0 and int(getattr(args, 'save_knn_every', 0)) > 0 and ((step + 1) % int(getattr(args, 'save_knn_every', 0)) == 0) and 'knn' in globals() and knn is not None) else None),
                 )
         return
     if args.cmd == "count-eval":
