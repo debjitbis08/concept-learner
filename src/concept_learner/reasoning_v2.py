@@ -489,6 +489,12 @@ class ReasonerV2(nn.Module):
         H_reasoned = H + self.broadcast(torch.cat([H, s_rep], dim=-1))
 
         # expose final scalar value stream for downstream decoders
+        # Numerical safety: sanitize scalar stream to avoid propagating NaN/Inf
+        try:
+            val = torch.nan_to_num(val, nan=0.0, posinf=1e3, neginf=-1e3)
+            val = val.clamp(min=-100.0, max=100.0)
+        except Exception:
+            pass
         self._last_val = val
         # expose auxiliary losses for trainer
         # function advantage bonus: when max function logit > max primitive logit

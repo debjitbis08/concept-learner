@@ -73,6 +73,9 @@ class UnifiedDecoder(nn.Module):
         logits_seq = F.linear(self._last_h_pool, W_eff, self.seq_head.bias)
         if self._last_val is not None:
             logits_seq = logits_seq + self.num_head(self._last_val)
+        # Numerical safety: replace NaN/Inf and clamp range to keep CE stable
+        logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0)
+        logits_seq = logits_seq.clamp(min=-20.0, max=20.0)
         self._last_logits_seq = logits_seq
         return logits_seq
 
@@ -90,6 +93,9 @@ class UnifiedDecoder(nn.Module):
         logits_seq = F.linear(h_pool, W_eff, self.seq_head.bias)  # (B,C)
         if val is not None:
             logits_seq = logits_seq + self.num_head(val)
+        # Numerical safety: replace NaN/Inf and clamp range to keep CE stable
+        logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0)
+        logits_seq = logits_seq.clamp(min=-20.0, max=20.0)
         # cache for optional fast-weight update
         self._last_h_pool = h_pool
         self._last_val = val
