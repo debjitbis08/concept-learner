@@ -448,7 +448,7 @@ def _pack_count_examples_text(kind, a, c, tok: HFTokenizerWrapper, max_len: int)
                 random.choice(
                     [
                         f"What number comes between {ai} and {ci}?",
-                        f"Between {ai} and {ci}, which number comes in between?",
+                        f"Which number is between {ai} and {ci}?",
                     ]
                 )
             )
@@ -2492,7 +2492,7 @@ def evaluate(args):
             else:
                 phr = [
                     f"What number comes between {a[i]} and {c[i]}?",
-                    f"Between {a[i]} and {c[i]}, which number comes in between?",
+                    f"Which number is between {a[i]} and {c[i]}?",
                 ]
             q = phr[_r.randrange(len(phr))]
             print(f"  Q: {q}\n     gold={yshow[i]} pred={predshow[i]}")
@@ -2890,7 +2890,7 @@ def main():
                 else:
                     phr = [
                         f"What number comes between {a[i]} and {c[i]}?",
-                        f"Between {a[i]} and {c[i]}, which number comes in between?",
+                        f"Which number is between {a[i]} and {c[i]}?",
                     ]
                 q = phr[_r.randrange(len(phr))]
                 print(f"Q: {q}\n   gold={y[i]} pred={pred[i]}")
