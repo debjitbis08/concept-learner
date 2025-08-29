@@ -944,6 +944,9 @@ def train(args):
     amp_ctx = (lambda: torch.amp.autocast("cuda")) if use_amp else nullcontext
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
+    # Ensure knn is defined before potential checkpoint loading that may reference it
+    knn = None
+
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
         start_step = load_checkpoint(
