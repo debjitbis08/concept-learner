@@ -877,6 +877,9 @@ def train(args):
     seq_len = args.max_len
     # Wake/Sleep/Dream replay buffer
     rb = ReplayBuffer(max_items=getattr(args, "replay_max_items", 512))
+    # Eval history for on-demand sleep trigger
+    eval_hist: list[float] = []
+    prev_eval_avg: float | None = None
     # per-task dynamic weights
     lambda_bd = 1.0
     lambda_ood = 1.0
@@ -1610,7 +1613,7 @@ def train(args):
 
         # ---------------- Sleep: abstraction + Dreaming (MAP over traces) --------
         try:
-            if int(getattr(args, "wake_sleep", 1)) > 0 and (step + 1) % int(getattr(args, "sleep_every", 50)) == 0:
+            if int(getattr(args, "wake_sleep", 1)) > 0 and (step + 1) % int(getattr(args, "sleep_every", 300)) == 0:
                 installed = []
                 try:
                     installed = model.reasoner.sleep_abstraction()
@@ -1789,11 +1792,13 @@ def train(args):
             cur_lr = opt.param_groups[0]["lr"]
             # VQ diagnostics
             vq_diag_str = ""
+            avg_vq_chg = None
             try:
                 ks = [model.rvq.codebook_size] * int(args.parallel_heads) + [
                     model.rvq.serial_codebook_size
                 ] * int(args.serial_heads)
                 parts = []
+                changes_for_avg = []
                 for h, (idx_t, K) in enumerate(zip(indices, ks)):
                     u = len(torch.unique(idx_t)) / max(1, K)
                     counts = torch.bincount(idx_t.view(-1), minlength=K).float()
@@ -1816,10 +1821,61 @@ def train(args):
                     a2 = ind2[h].view(-1)
                     changed = (a1 != a2).float().mean().item()
                     stab.append(f"h{h}:chg={changed:.3f}")
+                    changes_for_avg.append(float(changed))
                 vq_diag_str += " | stab " + " ".join(stab)
+                if len(changes_for_avg) > 0:
+                    avg_vq_chg = float(sum(changes_for_avg) / len(changes_for_avg))
                 if not prev_mode:
                     model.eval()
             except Exception:
+                pass
+
+            # On-demand sleep trigger: if eval avg drops or VQ change spikes
+            try:
+                if int(getattr(args, "on_demand_sleep", 1)) > 0:
+                    # maintain moving average over last N evals
+                    N = max(1, int(getattr(args, "ods_window", 5)))
+                    eval_hist.append(float(val_acc))
+                    if len(eval_hist) > N:
+                        eval_hist = eval_hist[-N:]
+                    cur_avg = float(sum(eval_hist) / max(1, len(eval_hist)))
+                    drop_thr = float(getattr(args, "ods_avg_drop", 0.0175))
+                    vq_thr = float(getattr(args, "ods_vq_chg", 0.20))
+                    avg_drop = (prev_eval_avg - cur_avg) if (prev_eval_avg is not None) else 0.0
+                    drop_flag = prev_eval_avg is not None and (avg_drop > drop_thr)
+                    vq_flag = (avg_vq_chg is not None) and (avg_vq_chg > vq_thr)
+                    prev_eval_avg = cur_avg
+                    if (drop_flag or vq_flag) and len(rb) > 0 and int(getattr(args, "wake_sleep", 1)) > 0:
+                        print(
+                            f"[on-demand sleep] step={step + 1} reason={'drop' if drop_flag else ''}{'+' if drop_flag and vq_flag else ''}{'vq' if vq_flag else ''} avg_drop={avg_drop:.4f} avg_vq_chg={avg_vq_chg if avg_vq_chg is not None else float('nan'):.3f}"
+                        )
+                        try:
+                            _ = model.reasoner.sleep_abstraction()
+                        except Exception:
+                            pass
+                        # Short dream burst
+                        iters = max(1, int(getattr(args, "ods_sleep_iters", 50)))
+                        dream_bs = max(1, min(int(getattr(args, "ods_dream_bs", max(8, args.batch_size // 2))), len(rb)))
+                        for _it in range(iters):
+                            replays = rb.sample(dream_bs)
+                            if not replays:
+                                break
+                            ids_rep = torch.stack([x.ids for x in replays], dim=0).to(device)
+                            mask_rep = torch.stack([x.mask for x in replays], dim=0).to(device)
+                            traces_rep = [x.trace for x in replays]
+                            patterns = extract_primitive_patterns_from_library(model.reasoner)
+                            traces_canon = [
+                                compress_trace_with_patterns(tr, patterns, len(getattr(model.reasoner, 'prims', [])))
+                                for tr in traces_rep
+                            ]
+                            y_tok = torch.zeros(ids_rep.size(0), seq_len, dtype=torch.long, device=device)
+                            y_seq = torch.zeros(ids_rep.size(0), dtype=torch.long, device=device)
+                            y_stop = make_stop_targets_from_traces(traces_canon, max_steps=getattr(model.reasoner, 'max_steps', 1), device=device)
+                            _ = train_step_with_trace_supervision(
+                                model, (ids_rep, mask_rep, y_tok, y_seq, y_stop), traces_canon, opt
+                            )
+            except Exception:
+                # On-demand sleeps are best-effort and must not break training
                 pass
 
             # OOD evaluations
@@ -2320,8 +2376,15 @@ def main():
         "--wake_sleep", type=int, default=1, help="Enable wake/sleep/dream cycle (1=on, 0=off)"
     )
     pt.add_argument(
-        "--sleep_every", type=int, default=50, help="Run sleep-abstraction + dreaming every N steps"
+        "--sleep_every", type=int, default=300, help="Run sleep-abstraction + dreaming every N steps"
     )
+    # On-demand sleep trigger knobs
+    pt.add_argument("--on_demand_sleep", type=int, default=1, help="Enable on-demand short sleep when metrics regress (1=on, 0=off)")
+    pt.add_argument("--ods_window", type=int, default=5, help="Window size (N evals) for moving-average drop detection")
+    pt.add_argument("--ods_avg_drop", type=float, default=0.0175, help="Trigger if moving-average val acc drops by more than this absolute amount (e.g., 0.015=1.5 pts)")
+    pt.add_argument("--ods_vq_chg", type=float, default=0.20, help="Trigger if average VQ assignment change exceeds this threshold (0..1)")
+    pt.add_argument("--ods_sleep_iters", type=int, default=50, help="Number of short dream iterations to run on trigger")
+    pt.add_argument("--ods_dream_bs", type=int, default=32, help="Batch size for each on-demand dream iteration")
     # Execution granularity for function calls
     pt.add_argument(
         "--exec_mode",

@@ -116,7 +116,7 @@ def train_epoch_wake_sleep(
     steps: int = 100,
     batch_size: int = 8,
     T: int = 24,
-    sleep_every: int = 20,
+    sleep_every: int = 300,
     wake_micro: bool = False,
 ):
     """Wake/Sleep/Dream training loop (minimal yet complete).
