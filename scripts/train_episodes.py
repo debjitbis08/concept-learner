@@ -259,6 +259,8 @@ def _quick_eval(
                 # Use provided alpha (caller may pass decayed value)
                 p = (a * p_model + (1.0 - a) * p_knn).clamp_min(1e-8)
                 logits_seq = torch.log(p)
+                # safety: sanitize logits before downstream use
+                logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         if probe is not None and getattr(probe, "w", None) is not None:
             # Blend learned head with ridge probe
             with torch.no_grad():
@@ -1656,6 +1658,8 @@ def train(args):
                         logits_seq = logits_seq2
             except Exception:
                 pass
+        # Sanitize logits_seq after any fast-weight recompute, before optional biases/mixing
+        logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
 
         # kNN posterior mixing (train-time optional) and memory update
         try:
@@ -1732,6 +1736,8 @@ def train(args):
                 NO_IDX,
                 train_mode=True,
             )
+            # sanitize after bias
+            logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
 
         # If frozen mix is enabled, compute separate CE losses for each compare split and reweight
         # Label smoothing schedule: start -> final after step threshold
@@ -1743,6 +1749,8 @@ def train(args):
         )
         if getattr(args, "label_smoothing", 0.0) <= 0.0:
             cur_ls = ls_sched_start if step < ls_sched_after else ls_sched_final
+        # Final safety: sanitize logits before CE
+        logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         loss_seq = torch.nn.functional.cross_entropy(
             logits_seq, y, label_smoothing=cur_ls
         )
@@ -1757,6 +1765,7 @@ def train(args):
             for key, sz in offs:
                 ids_k, mask_k, y_k, _m = comp_splits[key]
                 _, logits_k, _, _, _, _ = model(ids_k, mask_k)
+                logits_k = torch.nan_to_num(logits_k, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
                 ce_k = torch.nn.functional.cross_entropy(logits_k, y_k, label_smoothing=cur_ls)
                 w = 1.0
                 if key == 'bd':
@@ -1791,6 +1800,7 @@ def train(args):
             with torch.no_grad():
                 ids_c, mask_c = ids_cmp, mask_cmp
             logits_cmp = model(ids_c, mask_c)[1]
+            logits_cmp = torch.nan_to_num(logits_cmp, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
             from concept_learner.utils import select_pair_columns_safe
             yes_no = select_pair_columns_safe(logits_cmp, YES_IDX, NO_IDX, order="ab")
             logit_yes = yes_no[:, 0] - yes_no[:, 1]
@@ -2192,6 +2202,7 @@ def train(args):
                 # forward
                 with torch.no_grad():
                     _, logits_seq_hnm, _, _, stop_logits_hnm, _ = model(ids_hnm, mask_hnm)
+                    logits_seq_hnm = torch.nan_to_num(logits_seq_hnm, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
                     loss_items = torch.nn.functional.cross_entropy(logits_seq_hnm, y_hnm, reduction='none')
                     # predicted stop step (0-based)
                     p_stop = torch.sigmoid(stop_logits_hnm)  # (B,S)
@@ -2237,6 +2248,7 @@ def train(args):
                     # one extra optimization step (sequence CE + VQ regularizer only)
                     with amp_ctx():
                         _lt, logits_seq_e, vq_loss_e, _, _sl, _ = model(ids_sel, mask_sel)
+                        logits_seq_e = torch.nan_to_num(logits_seq_e, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
                         loss_e = torch.nn.functional.cross_entropy(logits_seq_e, y_sel) + args.lambda_vq * vq_loss_e
                     opt.zero_grad(set_to_none=True)
                     if use_amp:
