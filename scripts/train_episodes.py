@@ -1761,6 +1761,13 @@ def train(args):
             loss_seq = torch.nn.functional.cross_entropy(
                 logits_seq[seq_mask], y_safe[seq_mask], label_smoothing=cur_ls
             )
+            # If CE still returns non-finite, skip this step's seq loss
+            if not torch.isfinite(loss_seq):
+                try:
+                    print("[warn] non-finite seq CE; skipping seq loss this step")
+                except Exception:
+                    pass
+                loss_seq = logits_seq.new_zeros(())
         else:
             loss_seq = logits_seq.new_zeros(())
             try:
