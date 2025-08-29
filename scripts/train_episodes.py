@@ -1840,6 +1840,94 @@ def train(args):
                 for p_t, p_s in zip(model.num_head_teacher.parameters(), model.num_head.parameters()):
                     p_t.copy_(m * p_t + (1.0 - m) * p_s)
 
+        # ---------------- Hard-negative mining (templates & steps) ---------------
+        try:
+            if int(getattr(args, "hnm_enable", 1)) > 0 and (step + 1) % int(getattr(args, "hnm_every", 200)) == 0:
+                rel_ids = _parse_relations_arg(getattr(args, "relations", None))
+                # in-distribution train range
+                def parse_range(s):
+                    if not s:
+                        return None
+                    try:
+                        lo, hi = s.split("-")
+                        return (int(lo), int(hi))
+                    except Exception:
+                        return None
+                train_idx_range = parse_range(getattr(args, "train_range", None))
+                pool_n = max(args.batch_size, int(getattr(args, "hnm_pool_mult", 2.0) * args.batch_size))
+                batch_pool = gen.sample_posneg_pairs(batch=pool_n, allowed_relations=rel_ids, idx_range=train_idx_range)
+                # Choose a template id for each example and build texts deterministically per (rel, tpl)
+                a_l = batch_pool["a_idx"].tolist(); b_l = batch_pool["b_idx"].tolist(); r_l = batch_pool["rel"].tolist()
+                tpl_ids: list[int] = []
+                texts: list[str] = []
+                for ai, bi, ri in zip(a_l, b_l, r_l):
+                    tpls = _pair_templates(ai, bi, int(ri))
+                    if len(tpls) == 0:
+                        tpls = [f"rel({ai},{bi}) ?"]
+                    # deterministic but diverse: use (ai+bi) mod len
+                    tidx = int((ai + bi) % len(tpls))
+                    tpl_ids.append(tidx)
+                    texts.append(tpls[tidx])
+                # pack
+                ids_hnm, mask_hnm = _pack_text_batch(texts, tok, max_len=seq_len, device=device)
+                y_hnm = batch_pool["label"].to(device)
+                # forward
+                with torch.no_grad():
+                    _, logits_seq_hnm, _, _, stop_logits_hnm, _ = model(ids_hnm, mask_hnm)
+                    loss_items = torch.nn.functional.cross_entropy(logits_seq_hnm, y_hnm, reduction='none')
+                    # predicted stop step (0-based)
+                    p_stop = torch.sigmoid(stop_logits_hnm)  # (B,S)
+                    step_pred = p_stop.argmax(dim=-1)
+                    multi_mask = step_pred >= max(0, int(getattr(args, "hnm_min_steps", 2)) - 1)
+                # group by (rel, tpl)
+                from collections import defaultdict
+                groups = defaultdict(list)
+                for i, (ri, ti) in enumerate(zip(r_l, tpl_ids)):
+                    groups[(int(ri), int(ti))].append(i)
+                cap = int(getattr(args, "hnm_cap_per_template", 32))
+                frac = float(getattr(args, "hnm_frac", 0.25))
+                target_total = max(1, int(frac * ids_hnm.size(0)))
+                # rank within groups
+                selected = []
+                for key, idxs in groups.items():
+                    li = loss_items[idxs]
+                    k = min(len(idxs), cap, max(1, int(frac * len(idxs))))
+                    topk = torch.topk(li, k=k).indices.tolist()
+                    selected.extend([idxs[j] for j in topk])
+                # trim globally to target_total by highest loss
+                if len(selected) > target_total:
+                    li_sel = loss_items[selected]
+                    ord_idx = torch.topk(li_sel, k=target_total).indices.tolist()
+                    selected = [selected[j] for j in ord_idx]
+                # enforce multi-step quota
+                target_multi = int(float(getattr(args, "hnm_multi_frac", 0.35)) * max(1, len(selected)))
+                sel_set = set(selected)
+                cur_multi = int(multi_mask[selected].sum().item()) if len(selected) > 0 else 0
+                if cur_multi < target_multi:
+                    # add more multi-step from remaining pool by loss
+                    rem = [i for i in range(ids_hnm.size(0)) if (i not in sel_set) and bool(multi_mask[i].item())]
+                    if len(rem) > 0:
+                        li_rem = loss_items[rem]
+                        need = target_multi - cur_multi
+                        add_idx = torch.topk(li_rem, k=min(need, len(rem))).indices.tolist()
+                        selected.extend([rem[j] for j in add_idx])
+                # build final tensors
+                if len(selected) > 0:
+                    ids_sel = ids_hnm[selected]
+                    mask_sel = mask_hnm[selected]
+                    y_sel = y_hnm[selected]
+                    # one extra optimization step (sequence CE + VQ regularizer only)
+                    logits_tok_e, logits_seq_e, vq_loss_e, _, stop_logits_e, _ = model(ids_sel, mask_sel)
+                    loss_e = torch.nn.functional.cross_entropy(logits_seq_e, y_sel) + args.lambda_vq * vq_loss_e
+                    opt.zero_grad(set_to_none=True)
+                    loss_e.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    opt.step()
+                    if ema is not None:
+                        ema.update(model)
+        except Exception:
+            pass
+
         # ---------------- Wake: collect traces into replay buffer ----------------
         try:
             if int(getattr(args, "wake_sleep", 1)) > 0 and getattr(model.reasoner, "_last_traces", None) is not None:
@@ -2894,6 +2982,14 @@ def main():
     pt.add_argument("--proto_weight_end", type=float, default=0.1, help="Final bias weight w_end for decay (set equal to keep constant)")
     pt.add_argument("--proto_decay_steps", type=int, default=0, help="Linear decay steps from w to w_end (0 disables decay)")
     pt.add_argument("--proto_warmup", type=int, default=50, help="Per-relation count warmup before applying bias")
+    # Hard-negative mining (templates & steps curriculum)
+    pt.add_argument("--hnm_enable", type=int, default=1, help="Enable hard-negative mining curriculum (1=on, 0=off)")
+    pt.add_argument("--hnm_every", type=int, default=200, help="Mine hard negatives every N steps")
+    pt.add_argument("--hnm_frac", type=float, default=0.25, help="Fraction of pool to keep as hard negatives")
+    pt.add_argument("--hnm_pool_mult", type=float, default=2.0, help="Pool size multiplier relative to batch_size")
+    pt.add_argument("--hnm_min_steps", type=int, default=2, help="Minimum predicted steps (via STOP head) for multi-step quota")
+    pt.add_argument("--hnm_multi_frac", type=float, default=0.35, help="Target fraction of multi-step items in mined batch (0..1)")
+    pt.add_argument("--hnm_cap_per_template", type=int, default=32, help="Max items selected per (relation, template) group to avoid overfocus")
 
     pe = sub.add_parser("eval", help="Evaluate from a checkpoint")
     add_shared(pe)
