@@ -170,6 +170,8 @@ class ReasonerV2(nn.Module):
             self._fn_post_bias = None  # type: ignore
         self.fn_bias_init = float(fn_bias_init)
         self.fn_bias_decay = float(fn_bias_decay)
+        # temp function TTLs
+        self._slot_ttl: dict[int, int] = {}
 
     def forward(
         self, H: torch.Tensor, z: torch.Tensor, mask: torch.Tensor
@@ -597,6 +599,47 @@ class ReasonerV2(nn.Module):
         self._telemetry = telem
 
         return H_reasoned, s, stop_logits, action_logits
+
+    # --- Temp function utilities (draft-by-demo) ---
+    def install_temp_functions(self, cands: List[FnCandidate], ttl: int = 1000, bias: float = 0.7) -> List[int]:
+        """Install candidates and tag as temporary with TTL and initial bias."""
+        if not (self.use_functions and self.op_function is not None):
+            return []
+        sids = self.op_function.install(cands)
+        for sid in sids:
+            self._slot_ttl[sid] = int(ttl)
+            if self._fn_post_bias is not None and 0 <= sid < self._fn_post_bias.numel():
+                self._fn_post_bias[sid] = max(float(self._fn_post_bias[sid].item()), float(bias))
+        return sids
+
+    def clear_slots(self, ids: List[int]) -> None:
+        if not (self.use_functions and self.op_function is not None):
+            return
+        try:
+            self.op_function.clear_slots(ids)
+        except Exception:
+            return
+        for sid in ids:
+            self._slot_ttl.pop(int(sid), None)
+            try:
+                if self._fn_post_bias is not None and 0 <= sid < self._fn_post_bias.numel():
+                    self._fn_post_bias[sid] = 0.0
+            except Exception:
+                pass
+
+    def ttl_tick(self, steps: int = 1) -> None:
+        if not (self.use_functions and self.op_function is not None):
+            return
+        to_clear: List[int] = []
+        for sid, t in list(self._slot_ttl.items()):
+            nt = t - int(steps)
+            if nt <= 0:
+                to_clear.append(int(sid))
+                self._slot_ttl.pop(int(sid), None)
+            else:
+                self._slot_ttl[sid] = nt
+        if to_clear:
+            self.clear_slots(to_clear)
 
     # --- Standard Library Installation ---
     def _install_std_lib(self):

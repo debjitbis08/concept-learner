@@ -993,6 +993,22 @@ class OpFunction(OpBase):
             self._flat_bodies[i] = self._flatten_slot(i)
             self._flat_versions[i] = self._slots[i].version
 
+    def clear_slots(self, ids: List[int]) -> None:
+        """Clear specific slots (make empty) and refresh caches."""
+        changed = False
+        for sid in ids:
+            if 0 <= sid < self.num_slots and len(self._slots[sid].steps) > 0:
+                self._slots[sid] = Slot(
+                    id=sid,
+                    steps=[],
+                    arg_templates=[],
+                    ret_policy="implicit",
+                    version=self._slots[sid].version + 1,
+                )
+                changed = True
+        if changed:
+            self._recompute_all_flat()
+
     # --- Convenience / Introspection ---
     @property
     def slots(self) -> List[Slot]:

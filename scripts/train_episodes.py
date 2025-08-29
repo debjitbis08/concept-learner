@@ -407,6 +407,32 @@ def _pack_pair_questions_text(batch, tok: HFTokenizerWrapper, max_len: int, temp
     return _pack_text_batch(texts, tok, max_len, device)
 
 
+def _pack_pair_questions_text_with_tpl(batch, tok: HFTokenizerWrapper, max_len: int, template_filter: dict | None = None):
+    """Same as _pack_pair_questions_text but also returns the chosen template id per item."""
+    import random
+    a = batch["a_idx"].tolist()
+    b = batch["b_idx"].tolist()
+    r = batch["rel"].tolist()
+    texts = []
+    tpl_ids = []
+    tf = template_filter
+    for ai, bi, ri in zip(a, b, r):
+        tpls = _pair_templates(ai, bi, ri)
+        if isinstance(tf, dict) and ri in tf and len(tf[ri]) > 0:
+            idxs = [i for i in tf[ri] if 0 <= i < len(tpls)]
+            if len(idxs) == 0:
+                tidx = random.randrange(len(tpls))
+            else:
+                tidx = random.choice(idxs)
+        else:
+            tidx = random.randrange(len(tpls))
+        texts.append(tpls[tidx])
+        tpl_ids.append(int(tidx))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    ids, mask = _pack_text_batch(texts, tok, max_len, device)
+    return ids, mask, torch.tensor(tpl_ids, dtype=torch.long, device=device)
+
+
 def _pack_parity_text(a: torch.Tensor, tok: HFTokenizerWrapper, max_len: int):
     import random
     texts = []
@@ -1307,7 +1333,7 @@ def train(args):
             y_pairs = torch.cat(y_cmp_list, dim=0) if len(y_cmp_list) > 0 else torch.empty(0, dtype=torch.long, device=device)
         # natural-language pair questions
         if not args.frozen_mix:
-            ids_pairs, mask_pairs = _pack_pair_questions_text(
+            ids_pairs, mask_pairs, tpl_ids_pairs = _pack_pair_questions_text_with_tpl(
                 batch, tok, max_len=seq_len, template_filter=tmpl_train
             )
             y_pairs_bin = batch["label"].to(device)
@@ -1873,6 +1899,90 @@ def train(args):
                 m = num_ema["decay"]
                 for p_t, p_s in zip(model.num_head_teacher.parameters(), model.num_head.parameters()):
                     p_t.copy_(m * p_t + (1.0 - m) * p_s)
+
+        # TTL tick for drafted temporary functions
+        try:
+            model.reasoner.ttl_tick(1)
+        except Exception:
+            pass
+
+        # ---------------- Draft-by-demonstration (1-shot function drafting) ------
+        try:
+            if int(getattr(args, "draft_enable", 1)) > 0 and 'ids_pairs' in locals() and ids_pairs.size(0) > 0 and not args.frozen_mix:
+                # Group by (rel, template) among the pair-front segment
+                rel_pairs = batch.get("rel")
+                if rel_pairs is not None:
+                    from collections import defaultdict
+                    groups = defaultdict(list)
+                    tpl_list = tpl_ids_pairs.detach().cpu().tolist()
+                    rel_list = rel_pairs.detach().cpu().tolist()
+                    for i in range(ids_pairs.size(0)):
+                        groups[(int(rel_list[i]), int(tpl_list[i]))].append(i)
+                    # pick up to N groups with support>=K
+                    K = int(getattr(args, "draft_min_support", 8))
+                    beam = int(getattr(args, "draft_beam", 3))
+                    max_len_d = int(getattr(args, "draft_max_len", 3))
+                    min_len_d = int(getattr(args, "draft_min_len", 2))
+                    min_margin = float(getattr(args, "draft_min_margin", 0.5))
+                    ttl = int(getattr(args, "draft_ttl", 1000))
+                    bias = float(getattr(args, "draft_bias", 0.7))
+                    todo = [k for k, v in groups.items() if len(v) >= K]
+                    todo = todo[: int(getattr(args, "draft_groups_per_step", 1))]
+                    # Prepare baseline margins for candidate evaluation
+                    YES_IDX = num_numbers; NO_IDX = num_numbers + 1
+                    def yes_no_margin(logits):
+                        return (logits[:, YES_IDX] - logits[:, NO_IDX])
+                    for gk in todo:
+                        idxs = groups[gk]
+                        ids_g = ids_pairs[idxs]
+                        mask_g = mask_pairs[idxs]
+                        with torch.no_grad():
+                            _, logits_g0, _, _, _, _ = model(ids_g, mask_g)
+                            base_margin = yes_no_margin(logits_g0).mean().item()
+                        # Build candidate sequences via simple beam over primitive indices
+                        P = len(getattr(model.reasoner, 'prims', []))
+                        # start with all length-2 candidates scored by improvement
+                        from concept_learner.reasoning_ops import StepSpec, FnCandidate
+                        def eval_seq(seq: list[int]) -> float:
+                            # install temp, run, measure improvement, then clear
+                            steps = [StepSpec(kind='primitive', idx=int(j)) for j in seq] + [StepSpec(kind='return')]
+                            cand = FnCandidate(steps=steps)
+                            sids = model.reasoner.install_temp_functions([cand], ttl=ttl, bias=bias)
+                            try:
+                                with torch.no_grad():
+                                    _, lg, _, _, _, _ = model(ids_g, mask_g)
+                                    marg = yes_no_margin(lg).mean().item()
+                                return float(marg - base_margin)
+                            finally:
+                                if sids:
+                                    model.reasoner.clear_slots(sids)
+                        scores2 = []
+                        for a0 in range(P):
+                            for a1 in range(P):
+                                sc = eval_seq([a0, a1])
+                                scores2.append(((a0, a1), sc))
+                        scores2.sort(key=lambda x: x[1], reverse=True)
+                        beamset = scores2[:beam]
+                        best_seq = list(beamset[0][0]) if beamset else []
+                        best_gain = beamset[0][1] if beamset else -1e9
+                        # try extending to length-3
+                        if max_len_d >= 3 and beamset:
+                            scores3 = []
+                            for (s2, _) in beamset:
+                                for a2 in range(P):
+                                    sc = eval_seq(list(s2) + [a2])
+                                    scores3.append((list(s2) + [a2], sc))
+                            scores3.sort(key=lambda x: x[1], reverse=True)
+                            if scores3 and scores3[0][1] > best_gain:
+                                best_seq, best_gain = list(scores3[0][0]), float(scores3[0][1])
+                        # decide install
+                        if len(best_seq) >= min_len_d and best_gain >= min_margin:
+                            steps_best = [StepSpec(kind='primitive', idx=int(j)) for j in best_seq] + [StepSpec(kind='return')]
+                            sid_new = model.reasoner.install_temp_functions([FnCandidate(steps=steps_best)], ttl=ttl, bias=bias)
+                            if sid_new:
+                                print(f"[draft] installed slot={sid_new[0]} seq={best_seq} gain={best_gain:.3f} support={len(idxs)} key={gk}")
+        except Exception:
+            pass
 
         # ---------------- Hard-negative mining (templates & steps) ---------------
         try:
@@ -2993,6 +3103,16 @@ def main():
             "Special: place_value, face_value (controls inclusion of place/face value tasks)."
         ),
     )
+    # Draft-by-demonstration (1-shot function drafting)
+    pt.add_argument("--draft_enable", type=int, default=1, help="Enable draft-by-demonstration installs (1=on, 0=off)")
+    pt.add_argument("--draft_min_support", type=int, default=8, help="Min batch support (same template) to trigger drafting")
+    pt.add_argument("--draft_beam", type=int, default=3, help="Beam width over primitive sequences")
+    pt.add_argument("--draft_max_len", type=int, default=3, help="Max primitive length for drafted function")
+    pt.add_argument("--draft_min_len", type=int, default=2, help="Min primitive length for drafted function")
+    pt.add_argument("--draft_min_margin", type=float, default=0.5, help="Required avg YES-NO margin improvement to accept draft")
+    pt.add_argument("--draft_ttl", type=int, default=1000, help="TTL (steps) for drafted functions")
+    pt.add_argument("--draft_bias", type=float, default=0.7, help="Initial action-logit bias for drafted functions")
+    pt.add_argument("--draft_groups_per_step", type=int, default=1, help="Max (rel,template) groups to process per step")
     # Frozen sampler mix (fixed ratios) for pair comparisons
     pt.add_argument("--frozen_mix", action="store_true", help="Use fixed-ratio batch composition for compare tasks")
     pt.add_argument("--mix_ratio_id", type=float, default=0.60)
