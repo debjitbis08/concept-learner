@@ -2306,8 +2306,10 @@ def train(args):
                     todo = todo[: int(getattr(args, "draft_groups_per_step", 1))]
                     # Prepare baseline margins for candidate evaluation
                     YES_IDX = num_numbers; NO_IDX = num_numbers + 1
+                    from concept_learner.utils import select_pair_columns_safe
                     def yes_no_margin(logits):
-                        return (logits[:, YES_IDX] - logits[:, NO_IDX])
+                        pair = select_pair_columns_safe(logits, YES_IDX, NO_IDX, order="ab")
+                        return (pair[:, 0] - pair[:, 1])
                     for gk in todo:
                         idxs = groups[gk]
                         ids_g = ids_pairs[idxs]

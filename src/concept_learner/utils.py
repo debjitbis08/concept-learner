@@ -36,4 +36,3 @@ def select_pair_columns_safe(
             return logits[:, [C - 1, C - 2]]
     # Degenerate case: no valid columns; return zeros
     return logits.new_zeros(B, 2)
-
