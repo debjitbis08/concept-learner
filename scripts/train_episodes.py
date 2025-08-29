@@ -2699,6 +2699,7 @@ def evaluate(args):
                 except Exception:
                     T = 1.0
 
+    _eval_knn = None  # local kNN memory for eval-only mixing
     for _ in range(args.eval_batches):
         batch = gen.sample_posneg_pairs(batch=args.batch_size)
         ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len)
