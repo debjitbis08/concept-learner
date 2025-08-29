@@ -1769,11 +1769,31 @@ def train(args):
                     pass
                 loss_seq = logits_seq.new_zeros(())
         else:
-            loss_seq = logits_seq.new_zeros(())
-            try:
-                print("[warn] zero seq labels in batch; skipping seq CE")
-            except Exception:
-                pass
+            fb = str(getattr(args, "seq_fallback", "skip")).lower()
+            w_fb = float(getattr(args, "seq_fallback_weight", 0.1))
+            if fb == "uniform":
+                # Cross-entropy to uniform target ≈ mean(-log_softmax)
+                loss_u = (-torch.log_softmax(logits_seq, dim=-1)).mean()
+                loss_seq = w_fb * torch.nan_to_num(loss_u, nan=0.0, posinf=0.0, neginf=0.0)
+                try:
+                    print("[info] zero seq labels; using uniform fallback")
+                except Exception:
+                    pass
+            elif fb == "self":
+                with torch.no_grad():
+                    y_pseudo = logits_seq.argmax(dim=-1).clamp(0, C - 1)
+                loss_p = torch.nn.functional.cross_entropy(logits_seq, y_pseudo)
+                loss_seq = w_fb * torch.nan_to_num(loss_p, nan=0.0, posinf=0.0, neginf=0.0)
+                try:
+                    print("[info] zero seq labels; using self-training fallback")
+                except Exception:
+                    pass
+            else:
+                loss_seq = logits_seq.new_zeros(())
+                try:
+                    print("[warn] zero seq labels in batch; skipping seq CE")
+                except Exception:
+                    pass
         if args.frozen_mix:
             # recompute logits for compare-only batch and split by sizes
             offs = []
@@ -3253,6 +3273,9 @@ def main():
         sp.add_argument("--min_base", type=int, default=10)
         sp.add_argument("--max_base", type=int, default=10)
         sp.add_argument("--batch_size", type=int, default=64)
+        # Fallback behavior when a batch has zero valid seq labels
+        sp.add_argument("--seq_fallback", type=str, default="skip", help="What to do when no valid seq labels in a batch: skip|uniform|self")
+        sp.add_argument("--seq_fallback_weight", type=float, default=0.1, help="Weight for fallback seq loss if used")
 
     pt = sub.add_parser("train", help="Train and save checkpoints")
     add_shared(pt)
