@@ -831,21 +831,34 @@ def train(args):
     #     model.parameters(), lr=args.lr, weight_decay=args.weight_decay
     # )
 
-    decay, no_decay = [], []
+    # Optimizer with separate group for controller heads (action/STOP)
+    head_decay, head_no_decay, decay, no_decay = [], [], [], []
+    head_param_ids = set()
     for n, p in model.named_parameters():
         if not p.requires_grad:
+            continue
+        is_head = n.startswith("reasoner.to_action") or n.startswith("reasoner.to_stop")
+        if is_head:
+            head_param_ids.add(id(p))
+            if n.endswith(".bias"):
+                head_no_decay.append(p)
+            else:
+                head_decay.append(p)
             continue
         if n.endswith(".bias") or "norm" in n.lower() or "codebook" in n.lower():
             no_decay.append(p)
         else:
             decay.append(p)
-    opt = torch.optim.AdamW(
-        [
-            {"params": decay, "weight_decay": args.weight_decay},
-            {"params": no_decay, "weight_decay": 0.0},
-        ],
-        lr=args.lr,
-    )
+    param_groups = []
+    if len(head_decay) > 0:
+        param_groups.append({"params": head_decay, "weight_decay": args.weight_decay, "is_head": True})
+    if len(head_no_decay) > 0:
+        param_groups.append({"params": head_no_decay, "weight_decay": 0.0, "is_head": True})
+    if len(decay) > 0:
+        param_groups.append({"params": decay, "weight_decay": args.weight_decay})
+    if len(no_decay) > 0:
+        param_groups.append({"params": no_decay, "weight_decay": 0.0})
+    opt = torch.optim.AdamW(param_groups, lr=args.lr)
 
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
@@ -1167,8 +1180,24 @@ def train(args):
             except Exception:
                 pass
     for step in range(start_step, args.steps):
-        if args.sched == "cosine":
-            set_cosine_lr(step)
+        # EMA decay schedule: increase after threshold
+        if ema is not None:
+            try:
+                thr = int(getattr(args, "ema_decay_after", 10000))
+                if step >= thr:
+                    ema.decay = float(getattr(args, "ema_decay_final", ema.decay))
+            except Exception:
+                pass
+    if args.sched == "cosine":
+        set_cosine_lr(step)
+    # Apply head LR multiplier during early steps
+    def _apply_head_lr(step_idx: int):
+        base_lr = opt.param_groups[0]["lr"] if len(opt.param_groups) > 0 else args.lr
+        mult = 2.0 if step_idx < int(getattr(args, "head_boost_steps", 5000)) else 1.0
+        for g in opt.param_groups:
+            is_head = bool(g.get("is_head", False))
+            g["lr"] = base_lr * (mult if is_head else 1.0)
+    _apply_head_lr(step)
         rel_arg = getattr(args, "relations", None)
         rel_ids = _parse_relations_arg(rel_arg)
         # If no --relations provided, train on all pair relations (0..8).
@@ -1488,8 +1517,17 @@ def train(args):
             )
 
         # If frozen mix is enabled, compute separate CE losses for each compare split and reweight
+        # Label smoothing schedule: start -> final after step threshold
+        ls_sched_start = float(getattr(args, "label_smoothing_start", 0.05))
+        ls_sched_final = float(getattr(args, "label_smoothing_final", 0.02))
+        ls_sched_after = int(getattr(args, "label_smoothing_after", 8000))
+        cur_ls = (
+            ls_sched_start if (getattr(args, "label_smoothing", 0.0) <= 0.0) else float(getattr(args, "label_smoothing"))
+        )
+        if getattr(args, "label_smoothing", 0.0) <= 0.0:
+            cur_ls = ls_sched_start if step < ls_sched_after else ls_sched_final
         loss_seq = torch.nn.functional.cross_entropy(
-            logits_seq, y, label_smoothing=args.label_smoothing
+            logits_seq, y, label_smoothing=cur_ls
         )
         if args.frozen_mix:
             # recompute logits for compare-only batch and split by sizes
@@ -1502,7 +1540,7 @@ def train(args):
             for key, sz in offs:
                 ids_k, mask_k, y_k, _m = comp_splits[key]
                 _, logits_k, _, _, _, _ = model(ids_k, mask_k)
-                ce_k = torch.nn.functional.cross_entropy(logits_k, y_k, label_smoothing=args.label_smoothing)
+                ce_k = torch.nn.functional.cross_entropy(logits_k, y_k, label_smoothing=cur_ls)
                 w = 1.0
                 if key == 'bd':
                     w = lambda_bd
@@ -1730,6 +1768,10 @@ def train(args):
 
         # include auxiliary sparsity and halting penalties from reasoner if present
         aux = getattr(model.reasoner, "_aux_loss", {}) or {}
+        telem = getattr(model.reasoner, "_telemetry", {}) or {}
+        # aux reward for using functions (percent of episodes using >=1 fn)
+        fn_use = float(telem.get("pct_used_fn", 0.0))
+        fn_use_term = torch.tensor(fn_use, device=device)
         loss = (
             loss_seq
             + args.lambda_vq * vq_loss
@@ -1742,6 +1784,7 @@ def train(args):
             + 1e-3 * aux.get("halt_over", torch.tensor(0.0, device=device))
             + float(getattr(args, "lambda_act_entropy", 1e-3)) * aux.get("act_entropy", torch.tensor(0.0, device=device))
             - float(getattr(args, "lambda_fn_adv", 1e-4)) * aux.get("fn_adv", torch.tensor(0.0, device=device))
+            - float(getattr(args, "lambda_fn_use", 0.05)) * fn_use_term
         )
 
         # Consistency loss with EMA teacher for numeric head (digit-dropout view)
@@ -2005,6 +2048,8 @@ def train(args):
             val_acc = 0.5 * (val_acc_pair + val_acc_cnt)
             if plateau_scheduler is not None:
                 plateau_scheduler.step(val_acc)
+                # Reapply head LR multiplier after scheduler update
+                _apply_head_lr(step)
             cur_lr = opt.param_groups[0]["lr"]
             # VQ diagnostics
             vq_diag_str = ""
@@ -2703,6 +2748,14 @@ def main():
     pt.add_argument("--lr", type=float, default=3e-4)
     pt.add_argument("--weight_decay", type=float, default=0.0)
     pt.add_argument("--label_smoothing", type=float, default=0.0)
+    # Schedules / stability tweaks
+    pt.add_argument("--head_boost_steps", type=int, default=5000, help="Multiply LR for action/STOP heads during first N steps")
+    pt.add_argument("--label_smoothing_start", type=float, default=0.05, help="Initial label smoothing before schedule kicks in")
+    pt.add_argument("--label_smoothing_after", type=int, default=8000, help="Step after which to lower label smoothing")
+    pt.add_argument("--label_smoothing_final", type=float, default=0.02, help="Final label smoothing after schedule step")
+    pt.add_argument("--ema_decay_after", type=int, default=10000, help="Step after which to increase EMA decay")
+    pt.add_argument("--ema_decay_final", type=float, default=0.997, help="Final EMA decay after schedule step")
+    pt.add_argument("--lambda_fn_use", type=float, default=0.05, help="Aux reward weight for using functions (percent of episodes)")
     pt.add_argument(
         "--sched",
         type=str,
