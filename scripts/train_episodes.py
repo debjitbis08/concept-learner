@@ -1751,9 +1751,19 @@ def train(args):
             cur_ls = ls_sched_start if step < ls_sched_after else ls_sched_final
         # Final safety: sanitize logits before CE
         logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        loss_seq = torch.nn.functional.cross_entropy(
-            logits_seq, y, label_smoothing=cur_ls
-        )
+        # Masked sequence CE: allow batches with no seq labels (ignore_index=-100)
+        ignore_index = -100
+        seq_mask = (y != ignore_index)
+        if seq_mask.any():
+            loss_seq = torch.nn.functional.cross_entropy(
+                logits_seq[seq_mask], y[seq_mask], label_smoothing=cur_ls
+            )
+        else:
+            loss_seq = logits_seq.new_zeros(())
+            try:
+                print("[warn] zero seq labels in batch; skipping seq CE")
+            except Exception:
+                pass
         if args.frozen_mix:
             # recompute logits for compare-only batch and split by sizes
             offs = []
@@ -2014,6 +2024,9 @@ def train(args):
             - float(getattr(args, "lambda_fn_adv", 1e-4)) * aux.get("fn_adv", torch.tensor(0.0, device=device))
             - float(getattr(args, "lambda_fn_use", 0.05)) * fn_use_term
         )
+
+        # Final guard: sanitize total loss to avoid inf/nan propagating into backward
+        loss = torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=-1e6)
 
         # Consistency loss with EMA teacher for numeric head (digit-dropout view)
         if getattr(model, 'num_head_teacher', None) is not None and args.lambda_consistency > 0:
