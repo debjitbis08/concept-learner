@@ -935,8 +935,8 @@ def train(args):
 
     # Optional AMP (mixed precision) for memory savings
     use_amp = bool(getattr(args, "amp", False)) and (str(device).startswith("cuda") and torch.cuda.is_available())
-    amp_ctx = torch.cuda.amp.autocast if use_amp else nullcontext
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    amp_ctx = (lambda: torch.amp.autocast("cuda")) if use_amp else nullcontext
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
@@ -3481,8 +3481,8 @@ def main():
         )
         # Optional AMP for memory savings
         use_amp_ct = bool(getattr(args, "amp", False)) and (str(device).startswith("cuda") and torch.cuda.is_available())
-        amp_ctx_ct = torch.cuda.amp.autocast if use_amp_ct else nullcontext
-        scaler_ct = torch.cuda.amp.GradScaler(enabled=use_amp_ct)
+        amp_ctx_ct = (lambda: torch.amp.autocast("cuda")) if use_amp_ct else nullcontext
+        scaler_ct = torch.amp.GradScaler("cuda", enabled=use_amp_ct)
 
         start = 0
         if args.resume and os.path.isfile(args.resume):
