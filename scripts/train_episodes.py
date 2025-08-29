@@ -1368,12 +1368,29 @@ def train(args):
                 "label": torch.empty(B0, dtype=torch.long, device=device0),
             }
         else:
-            # Frozen mix batch for pair compares
+            # Frozen mix batch for pair compares (robust exact partition with remainder)
             Bm = args.batch_size
-            n_id = int(args.mix_ratio_id * Bm)
-            n_bd = int(args.mix_ratio_bd * Bm)
-            n_ood = int(args.mix_ratio_ood * Bm)
-            n_cf = max(0, Bm - (n_id + n_bd + n_ood)) if args.mix_ratio_cf <= 0 else int(args.mix_ratio_cf * Bm)
+            r_id = float(getattr(args, 'mix_ratio_id', 0.45))
+            r_bd = float(getattr(args, 'mix_ratio_bd', 0.20))
+            r_ood = float(getattr(args, 'mix_ratio_ood', 0.25))
+            # If cf not provided (>0), derive it as the remainder; else use provided
+            if float(getattr(args, 'mix_ratio_cf', 0.0)) > 0.0:
+                r_cf = float(getattr(args, 'mix_ratio_cf', 0.0))
+            else:
+                r_cf = max(0.0, 1.0 - (r_id + r_bd + r_ood))
+            # Normalize to sum to 1 (avoid drift)
+            s = max(1e-8, r_id + r_bd + r_ood + r_cf)
+            rr = [r_id / s, r_bd / s, r_ood / s, r_cf / s]
+            # Floor counts then distribute remainder by largest fractional parts
+            raw = [rr[0] * Bm, rr[1] * Bm, rr[2] * Bm, rr[3] * Bm]
+            base = [int(x) for x in raw]
+            rem = int(Bm - sum(base))
+            if rem > 0:
+                frac_idx = sorted(range(4), key=lambda i: (raw[i] - base[i]), reverse=True)
+                for i in range(rem):
+                    base[frac_idx[i % 4]] += 1
+            # Assign
+            n_id, n_bd, n_ood, n_cf = base
             # In-dist idx range
             def parse_range(s):
                 if not s:
@@ -1757,6 +1774,13 @@ def train(args):
         y_safe = y.clone()
         y_safe = torch.where(valid_y, y_safe, torch.full_like(y_safe, ignore_index))
         seq_mask = valid_y
+        # Diagnostics: track label coverage and range
+        try:
+            n_seq_valid = int(seq_mask.sum().item())
+            y_min = int(y.min().item()) if y.numel() > 0 else 0
+            y_max = int(y.max().item()) if y.numel() > 0 else -1
+        except Exception:
+            n_seq_valid, y_min, y_max = 0, 0, -1
         if seq_mask.any():
             loss_seq = torch.nn.functional.cross_entropy(
                 logits_seq[seq_mask], y_safe[seq_mask], label_smoothing=cur_ls
@@ -2720,9 +2744,15 @@ def train(args):
                     (pred_b == b_batch["label"].to(device)).float().mean().item()
                 )
 
+            diag = ""
+            try:
+                if (step + 1) % int(getattr(args, "log_every", 50)) == 0 or n_seq_valid == 0:
+                    diag = f" | n_seq={n_seq_valid} C={C} y=[{y_min},{y_max}]"
+            except Exception:
+                diag = ""
             print(
                 f"step {step + 1}/{args.steps} loss={loss.item():.4f} seq={loss_seq.item():.4f} "
-                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}"
+                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}{diag}"
             )
             if vq_diag_str:
                 print(f"  VQ: {vq_diag_str}")
