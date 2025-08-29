@@ -1749,14 +1749,17 @@ def train(args):
         )
         if getattr(args, "label_smoothing", 0.0) <= 0.0:
             cur_ls = ls_sched_start if step < ls_sched_after else ls_sched_final
-        # Final safety: sanitize logits before CE
+        # Final safety: sanitize logits before CE and build a safe mask for valid labels
         logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        # Masked sequence CE: allow batches with no seq labels (ignore_index=-100)
+        C = logits_seq.size(-1)
         ignore_index = -100
-        seq_mask = (y != ignore_index)
+        valid_y = (y >= 0) & (y < C)
+        y_safe = y.clone()
+        y_safe = torch.where(valid_y, y_safe, torch.full_like(y_safe, ignore_index))
+        seq_mask = valid_y
         if seq_mask.any():
             loss_seq = torch.nn.functional.cross_entropy(
-                logits_seq[seq_mask], y[seq_mask], label_smoothing=cur_ls
+                logits_seq[seq_mask], y_safe[seq_mask], label_smoothing=cur_ls
             )
         else:
             loss_seq = logits_seq.new_zeros(())
@@ -1776,7 +1779,12 @@ def train(args):
                 ids_k, mask_k, y_k, _m = comp_splits[key]
                 _, logits_k, _, _, _, _ = model(ids_k, mask_k)
                 logits_k = torch.nan_to_num(logits_k, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-                ce_k = torch.nn.functional.cross_entropy(logits_k, y_k, label_smoothing=cur_ls)
+                Ck = logits_k.size(-1)
+                yk_valid = (y_k >= 0) & (y_k < Ck)
+                if yk_valid.any():
+                    ce_k = torch.nn.functional.cross_entropy(logits_k[yk_valid], y_k[yk_valid], label_smoothing=cur_ls)
+                else:
+                    ce_k = logits_k.new_zeros(())
                 w = 1.0
                 if key == 'bd':
                     w = lambda_bd
@@ -2216,7 +2224,10 @@ def train(args):
                 with torch.no_grad():
                     _, logits_seq_hnm, _, _, stop_logits_hnm, _ = model(ids_hnm, mask_hnm)
                     logits_seq_hnm = torch.nan_to_num(logits_seq_hnm, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-                    loss_items = torch.nn.functional.cross_entropy(logits_seq_hnm, y_hnm, reduction='none')
+                    Ch = logits_seq_hnm.size(-1)
+                    y_h_safe = y_hnm.clone()
+                    y_h_safe[(y_h_safe < 0) | (y_h_safe >= Ch)] = -100
+                    loss_items = torch.nn.functional.cross_entropy(logits_seq_hnm, y_h_safe, reduction='none', ignore_index=-100)
                     # predicted stop step (0-based)
                     p_stop = torch.sigmoid(stop_logits_hnm)  # (B,S)
                     step_pred = p_stop.argmax(dim=-1)
@@ -2262,7 +2273,13 @@ def train(args):
                     with amp_ctx():
                         _lt, logits_seq_e, vq_loss_e, _, _sl, _ = model(ids_sel, mask_sel)
                         logits_seq_e = torch.nan_to_num(logits_seq_e, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-                        loss_e = torch.nn.functional.cross_entropy(logits_seq_e, y_sel) + args.lambda_vq * vq_loss_e
+                        Ce = logits_seq_e.size(-1)
+                        y_e_valid = (y_sel >= 0) & (y_sel < Ce)
+                        if y_e_valid.any():
+                            ce_e = torch.nn.functional.cross_entropy(logits_seq_e[y_e_valid], y_sel[y_e_valid])
+                        else:
+                            ce_e = logits_seq_e.new_zeros(())
+                        loss_e = ce_e + args.lambda_vq * vq_loss_e
                     opt.zero_grad(set_to_none=True)
                     if use_amp:
                         scaler.scale(loss_e).backward()
