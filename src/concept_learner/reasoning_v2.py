@@ -9,6 +9,7 @@ from concept_learner.reasoning_ops import (
     OpCompareGeneric,
     OpNAC,
     OpNALU,
+    OpAddRouted,
     OpFunction,
     StepSpec,
     FnCandidate,
@@ -74,6 +75,7 @@ class ReasonerV2(nn.Module):
                 OpCount(d_model, learn_phi=False),  # Aggregator from set->scalar
                 OpNAC(d_model),  # NAC for add/sub on scalars
                 OpNALU(d_model),  # NALU for mul/div/pow on scalars
+                OpAddRouted(d_model),  # Routed add: MLP in-dist, NALU for large/OOD
                 OpCompareGeneric(d_model, use_z=True),  # boolean guard
                 OpLet(d_model),  # env write (registers)
                 OpLoad(d_model),  # env read

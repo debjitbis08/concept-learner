@@ -538,6 +538,51 @@ class OpNALU(OpBase):
         return state.mask, y, state.boolean
 
 
+# ------------------------------ ROUTED ADD (MLP/NALU) --------------------
+
+
+class OpAddRouted(OpBase):
+    """
+    Additive update that routes between a simple MLP-style add (OpAdd) and NALU
+    based on value magnitude and an OOD flag read from z.
+
+    - For in-distribution small magnitudes, prefers the MLP path (smooth, stable).
+    - For large |val| or when OOD score(z) is high, blends toward NALU for
+      better range transfer.
+
+    Gate g in [0,1] mixes the two paths: val' = (1-g)*mlp + g*nalu.
+    """
+
+    def __init__(self, d_model: int, threshold: float = 50.0, mix_weight: float = 0.5):
+        super().__init__()
+        self.name = "add_routed"
+        self.threshold = float(threshold)
+        self.mix_weight = float(mix_weight)
+        # sub-ops
+        self.mlp = OpAdd(d_model, use_z=True)
+        self.nalu = OpNALU(d_model)
+        # small OOD scorer from z
+        self.ood = nn.Linear(d_model, 1)
+        nn.init.zeros_(self.ood.weight)
+        nn.init.zeros_(self.ood.bias)
+        # layernorm on inputs for stability
+        self.ln = nn.LayerNorm(1 + d_model)
+
+    def forward(self, state: TypedState, z: torch.Tensor):
+        # compute gates
+        val_abs = state.val.abs()
+        # soft magnitude gate around threshold
+        scale = max(1.0, self.threshold * 0.5)
+        g_mag = torch.sigmoid((val_abs - self.threshold) / scale)  # (B,1)
+        g_ood = torch.sigmoid(self.ood(z))  # (B,1)
+        g = torch.clamp(self.mix_weight * 0.5 * (g_mag + g_ood), 0.0, 1.0)
+        # mix paths
+        m_mask, m_val, m_bool = self.mlp(state, z)
+        n_mask, n_val, n_bool = self.nalu(state, z)
+        val = (1.0 - g) * m_val + g * n_val
+        # pass-through mask and boolean (prefer mlp's, they are pass-through anyway)
+        return m_mask, val, m_bool
+
 # ------------------------------ FUNCTION SLOTS ---------------------------
 
 
