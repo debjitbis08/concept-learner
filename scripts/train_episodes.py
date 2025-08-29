@@ -2135,7 +2135,7 @@ def evaluate(args):
     # accumulators for diagnostics
     rel_tot = {i: 0 for i in range(9)}
     rel_hit = {i: 0 for i in range(9)}
-    all_probs = []
+    all_probs = []  # p(YES)
     all_labels = []
     all_a = []
     all_b = []
@@ -2201,9 +2201,16 @@ def evaluate(args):
 
     acc = correct / max(1, total)
     print(f"Eval accuracy over {total} examples: {acc:.4f}")
+    # Build unified arrays
+    import torch as _t
+    probs_all = _t.cat(all_probs)
+    labels_all = _t.cat(all_labels)
+    a_all = _t.cat(all_a)
+    b_all = _t.cat(all_b)
+    rel_all = _t.cat(all_rel)
 
-    # Per-relation accuracy summary
-    names = [
+    # Threshold sweep: best by macro-F1 and by binarized Brier
+    rel_names = [
         "same_parity",
         "successor",
         "predecessor",
@@ -2214,38 +2221,106 @@ def evaluate(args):
         "greater",
         "smaller",
     ]
-    print("Per-relation accuracy:")
-    for r, name in enumerate(names):
-        tot, hit = rel_tot[r], rel_hit[r]
-        if tot > 0:
-            print(f"  {name:12s}: {hit}/{tot} = {hit / max(1, tot):.3f}")
-        else:
-            print(f"  {name:12s}: (no samples)")
 
-    # Calibration / threshold sweep
-    import torch as _t
+    # Helper to compute macro-F1 at a threshold
+    def macro_f1_at(thr: float) -> float:
+        preds = (probs_all >= thr).long()
+        f1s = []
+        for ridx in range(9):
+            sel = (rel_all == ridx)
+            if not sel.any():
+                continue
+            y = labels_all[sel]
+            yhat = preds[sel]
+            tp = int(((y == 1) & (yhat == 1)).sum().item())
+            fp = int(((y == 0) & (yhat == 1)).sum().item())
+            fn = int(((y == 1) & (yhat == 0)).sum().item())
+            prec = tp / max(1, tp + fp)
+            rec = tp / max(1, tp + fn)
+            f1 = 0.0 if (prec + rec) == 0 else (2 * prec * rec) / (prec + rec)
+            f1s.append(f1)
+        return float(sum(f1s) / max(1, len(f1s)))
 
-    probs_all = _t.cat(all_probs)
-    labels_all = _t.cat(all_labels)
-    for thr in [0.4, 0.5, 0.6]:
-        acc_thr = ((probs_all >= thr).long() == labels_all).float().mean().item()
-        print(f"Acc@thr={thr:.1f}: {acc_thr:.3f}")
-    # best among a small grid
-    grid = [i / 100.0 for i in range(35, 66, 1)]
-    best_thr, best_acc = 0.5, 0.0
-    for thr in grid:
-        acc_thr = ((probs_all >= thr).long() == labels_all).float().mean().item()
-        if acc_thr > best_acc:
-            best_acc, best_thr = acc_thr, thr
-    print(
-        f"Best fixed-threshold acc in [0.35,0.65]: {best_acc:.3f} at thr={best_thr:.2f}"
-    )
+    def brier_bin_at(thr: float) -> float:
+        preds = (probs_all >= thr).float()
+        return float(((preds - labels_all.float()) ** 2).mean().item())
+
+    thrs = [i / 100.0 for i in range(20, 81)]  # 0.20 .. 0.80
+    best_thr_f1 = max(thrs, key=macro_f1_at)
+    best_thr_brier = min(thrs, key=brier_bin_at)
+    # Nearby points
+    def neighbors(center: float, step: float = 0.02):
+        return [round(max(0.0, min(1.0, center - step)), 2), round(center, 2), round(min(1.0, center + step), 2)]
+
+    nb_f1 = neighbors(best_thr_f1)
+    nb_br = neighbors(best_thr_brier)
+    print("Threshold sweep (macro-F1):")
+    for t in nb_f1:
+        print(f"  thr={t:.2f}  macro-F1={macro_f1_at(t):.3f}")
+    print("Threshold sweep (Brier-bin):")
+    for t in nb_br:
+        print(f"  thr={t:.2f}  brier={brier_bin_at(t):.3f}")
+
+    # Build rows for eval report at best_thr_f1
+    used_thr = float(round(best_thr_f1, 2))
+    rows = []
+    # precompute string rel names for speed
+    rel_name_map = {i: n for i, n in enumerate(rel_names)}
+    # canonical renderer
+    def canonical(a: int, b: int, rname: str) -> str:
+        if rname == "successor":
+            return f"succ({a}) == {a}+1 ?"
+        if rname == "predecessor":
+            return f"pred({a}) == {a}-1 ?"
+        if rname == "same_ones":
+            return f"same_ones({a},{b}) ?"
+        if rname == "same_tens":
+            return f"same_tens({a},{b}) ?"
+        if rname == "same_parity":
+            return f"same_parity({a},{b}) ?"
+        if rname == "makes_ten":
+            return f"ones({a}) + ones({b}) == 10 ?"
+        if rname == "add_2":
+            return f"{a} + 2 == {b} ?"
+        if rname == "greater":
+            return f"greater({a},{b}) ?"
+        if rname == "smaller":
+            return f"smaller({a},{b}) ?"
+        return f"rel({a},{b}) ?"
+
+    preds_used = (probs_all >= used_thr).long()
+    for i in range(probs_all.size(0)):
+        a_i = int(a_all[i].item())
+        b_i = int(b_all[i].item())
+        ridx = int(rel_all[i].item())
+        rname = rel_name_map.get(ridx, str(ridx))
+        rows.append({
+            "rel": rname,
+            "gold": int(labels_all[i].item()),
+            "pred": int(preds_used[i].item()),
+            "p_yes": float(probs_all[i].item()),
+            "a": a_i,
+            "b": b_i,
+            "canon": canonical(a_i, b_i, rname),
+        })
+
+    # Rich, compact evaluation report
+    try:
+        from eval_report import print_eval_report
+        print_eval_report(rows, threshold_used=used_thr)
+    except Exception as _e:
+        # Fallback to old per-relation summary if report import fails
+        print(f"(eval_report unavailable: {_e})")
+        print("Per-relation accuracy:")
+        for r, name in enumerate(rel_names):
+            tot, hit = rel_tot[r], rel_hit[r]
+            if tot > 0:
+                print(f"  {name:12s}: {hit}/{tot} = {hit / max(1, tot):.3f}")
+            else:
+                print(f"  {name:12s}: (no samples)")
 
     # Error slices near boundary for greater/smaller (|a-b| <= 1)
-    a_all = _t.cat(all_a)
-    b_all = _t.cat(all_b)
-    rel_all = _t.cat(all_rel)
-    pred_all = (probs_all >= 0.5).long()
+    pred_all = (probs_all >= used_thr).long()
     eq_diff = (a_all - b_all).abs()
     for r, name in [(7, "greater"), (8, "smaller")]:
         sel = rel_all == r
@@ -2263,7 +2338,7 @@ def evaluate(args):
                     f"{name} far   (|a-b|>1):  {int(far.sum())} ex, acc={acc_far:.3f}"
                 )
 
-    # Print a few sample predictions with questions and answers
+    # Print a few sample predictions with canonical questions and answers
     batch = gen.sample_posneg_pairs(batch=4)
     ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len)
     y = batch["label"].tolist()
@@ -2292,25 +2367,29 @@ def evaluate(args):
             return str(r)
 
     def make_question(a, b, r):
-        if r == 0:
-            return f"Do {a} and {b} have the same parity?"
-        if r == 1:
-            return f"Is {b} the successor of {a}?"
-        if r == 2:
-            return f"Is {b} the predecessor of {a}?"
-        if r == 3:
-            return f"Is {b} equal to {a} + 2?"
-        if r == 4:
-            return f"Do {a} and {b} have the same tens digit?"
-        if r == 5:
-            return f"Do {a} and {b} have the same ones digit?"
-        if r == 6:
-            return f"Do the ones digits of {a} and {b} make ten?"
-        if r == 7:
-            return f"Is {a} greater than {b}?"
-        if r == 8:
-            return f"Is {a} smaller than {b}?"
-        return f"Do {a} and {b} satisfy the relation?"
+        try:
+            nm = rel_names[r]
+        except Exception:
+            nm = str(r)
+        if nm == "successor":
+            return f"succ({a}) == {a}+1 ?"
+        if nm == "predecessor":
+            return f"pred({a}) == {a}-1 ?"
+        if nm == "same_ones":
+            return f"same_ones({a},{b}) ?"
+        if nm == "same_tens":
+            return f"same_tens({a},{b}) ?"
+        if nm == "same_parity":
+            return f"same_parity({a},{b}) ?"
+        if nm == "makes_ten":
+            return f"ones({a}) + ones({b}) == 10 ?"
+        if nm == "add_2":
+            return f"{a} + 2 == {b} ?"
+        if nm == "greater":
+            return f"greater({a},{b}) ?"
+        if nm == "smaller":
+            return f"smaller({a},{b}) ?"
+        return f"rel({a},{b}) ?"
 
     print("Sample QA predictions:")
     for i, p in enumerate(probs):
