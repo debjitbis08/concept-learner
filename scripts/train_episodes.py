@@ -1327,6 +1327,23 @@ def train(args):
     comp_stage = "A"  # 'A' basics, 'B' composition
     act_ent_hist: list[float] = []
 
+    # Curriculum (phase-wise exclusive training)
+    curr_enable = int(getattr(args, "curriculum_enable", 0)) > 0
+    curr_groups = [s.strip() for s in str(getattr(args, "curr_groups", "BasicsA,BasicsB,Structure,Composition")).split(",") if s.strip()]
+    if len(curr_groups) == 0:
+        curr_groups = ["BasicsA", "BasicsB", "Structure", "Composition"]
+    curr_idx = 0
+    curr_phase = curr_groups[curr_idx]
+    curr_phase_min = int(getattr(args, "curr_phase_min_steps", 800))
+    thr_cnt_A = float(getattr(args, "curr_thr_cnt_A", 0.70))
+    thr_in_A = float(getattr(args, "curr_thr_in_A", 0.60))
+    thr_vq_A = float(getattr(args, "curr_thr_vq_A", 0.30))
+    thr_stop_lo_A = float(getattr(args, "curr_thr_stop_lo_A", 0.18))
+    thr_stop_hi_A = float(getattr(args, "curr_thr_stop_hi_A", 0.35))
+    thr_bdry_B_lo = float(getattr(args, "curr_thr_bdry_B_lo", 0.45))
+    thr_bdry_B_hi = float(getattr(args, "curr_thr_bdry_B_hi", 0.60))
+    thr_tood_gap = float(getattr(args, "curr_thr_tood_gap", 0.05))
+
     for step in range(start_step, args.steps):
         # EMA decay schedule: increase after threshold
         if ema is not None:
@@ -1353,6 +1370,24 @@ def train(args):
         include_pairs = True
         if rel_arg and rel_arg.strip().lower() != "all" and (rel_ids is None or len(rel_ids) == 0):
             include_pairs = False
+
+        # Curriculum: compute per-phase task toggles
+        if curr_enable:
+            curr_phase = curr_groups[curr_idx]
+            inc_pairs = (curr_phase in ("BasicsB", "Structure"))
+            inc_count = (curr_phase == "BasicsA")
+            inc_place = (curr_phase == "Structure")
+            inc_parity = (curr_phase == "BasicsA")
+            inc_offsets = (curr_phase == "BasicsA")
+            inc_eqnum = (curr_phase == "BasicsA")
+            inc_cmp = (curr_phase == "BasicsB")
+            inc_edge = (curr_phase == "BasicsB")
+            inc_add = (curr_phase == "BasicsB")
+            # Only enable composition generation in Composition phase
+            comp_enabled = comp_enabled and (curr_phase == "Composition")
+            include_pairs = include_pairs and inc_pairs
+        else:
+            inc_pairs = inc_count = inc_place = inc_parity = inc_offsets = inc_eqnum = inc_cmp = inc_edge = inc_add = True
 
         if include_pairs and not args.frozen_mix:
             # optional restriction to training range for in-distribution sampling
@@ -1456,13 +1491,18 @@ def train(args):
         )
         y_eq = torch.full((eq_bsz,), YES_IDX, dtype=torch.long, device=device)
 
-        # counting batch
-        cnt_bsz = args.batch_size
-        data_cnt = gen.sample_counting(batch=cnt_bsz, idx_range=train_idx_range)
-        ids_cnt, mask_cnt = _pack_count_examples_text(
-            data_cnt["kind"], data_cnt["a"], data_cnt["c"], tok, max_len=seq_len
-        )
-        y_cnt = data_cnt["target"].to(device)  # 0..N-1
+        # counting batch (BasicsA)
+        if (not curr_enable) or inc_count:
+            cnt_bsz = args.batch_size
+            data_cnt = gen.sample_counting(batch=cnt_bsz, idx_range=train_idx_range)
+            ids_cnt, mask_cnt = _pack_count_examples_text(
+                data_cnt["kind"], data_cnt["a"], data_cnt["c"], tok, max_len=seq_len
+            )
+            y_cnt = data_cnt["target"].to(device)  # 0..N-1
+        else:
+            ids_cnt = torch.empty(0, seq_len, dtype=torch.long, device=device)
+            mask_cnt = torch.empty(0, seq_len, dtype=torch.long, device=device)
+            y_cnt = torch.empty(0, dtype=torch.long, device=device)
 
         # place-value / face-value inclusion controlled by --relations
         include_place, include_face = True, True
@@ -1510,27 +1550,29 @@ def train(args):
         mask = torch.cat([mask, mask_eqn], dim=0)
         y = torch.cat([y, y_eqn], dim=0)
 
-        # symbolic comparison batch (a>b? a<b?) -> YES/NO
-        cmp_bsz = args.batch_size
-        data_cmp = gen.sample_symbolic_compare(batch=cmp_bsz, idx_range=train_idx_range)
-        ids_cmp, mask_cmp = _pack_symbolic_compare_text(
-            data_cmp["a"], data_cmp["b"], data_cmp["op"], tok, max_len=seq_len
-        )
-        y_cmp = torch.where(
-            data_cmp["label"].to(device) > 0,
-            torch.full((cmp_bsz,), YES_IDX, dtype=torch.long, device=device),
-            torch.full((cmp_bsz,), NO_IDX, dtype=torch.long, device=device),
-        )
-        ids = torch.cat([ids, ids_cmp], dim=0)
-        mask = torch.cat([mask, mask_cmp], dim=0)
-        y = torch.cat([y, y_cmp], dim=0)
+        # symbolic comparison batch (BasicsB)
+        if (not curr_enable) or inc_cmp:
+            cmp_bsz = args.batch_size
+            data_cmp = gen.sample_symbolic_compare(batch=cmp_bsz, idx_range=train_idx_range)
+            ids_cmp, mask_cmp = _pack_symbolic_compare_text(
+                data_cmp["a"], data_cmp["b"], data_cmp["op"], tok, max_len=seq_len
+            )
+            y_cmp = torch.where(
+                data_cmp["label"].to(device) > 0,
+                torch.full((cmp_bsz,), YES_IDX, dtype=torch.long, device=device),
+                torch.full((cmp_bsz,), NO_IDX, dtype=torch.long, device=device),
+            )
+            ids = torch.cat([ids, ids_cmp], dim=0)
+            mask = torch.cat([mask, mask_cmp], dim=0)
+            y = torch.cat([y, y_cmp], dim=0)
 
-        # Edge-case oversampling for comparisons (near-boundary and equality)
+        # Edge-case oversampling for comparisons (BasicsB)
         try:
-            B_edge = max(1, int(0.15 * cmp_bsz))
-            a_edge = torch.randint(0, gen.n_items, (B_edge,), device=device)
-            # choose pattern among equal, +1, -1
-            mode = torch.randint(0, 3, (B_edge,), device=device)
+            if (not curr_enable) or inc_edge:
+                B_edge = max(1, int(0.15 * cmp_bsz))
+                a_edge = torch.randint(0, gen.n_items, (B_edge,), device=device)
+                # choose pattern among equal, +1, -1
+                mode = torch.randint(0, 3, (B_edge,), device=device)
             b_edge = a_edge.clone()
             b_edge = torch.where(mode == 0, a_edge, b_edge)
             b_edge = torch.where(mode == 1, (a_edge + 1).clamp(max=gen.n_items - 1), b_edge)
@@ -1545,61 +1587,67 @@ def train(args):
                 torch.full((B_edge,), YES_IDX, dtype=torch.long, device=device),
                 torch.full((B_edge,), NO_IDX, dtype=torch.long, device=device),
             )
-            ids = torch.cat([ids, ids_cmp2], dim=0)
-            mask = torch.cat([mask, mask_cmp2], dim=0)
-            y = torch.cat([y, y_cmp2], dim=0)
+            if (not curr_enable) or inc_edge:
+                ids = torch.cat([ids, ids_cmp2], dim=0)
+                mask = torch.cat([mask, mask_cmp2], dim=0)
+                y = torch.cat([y, y_cmp2], dim=0)
         except Exception:
             pass
 
-        # addition batch (a+b=?) -> numeric class
-        add_bsz = args.batch_size
-        data_add = gen.sample_addition(batch=add_bsz, idx_range=train_idx_range)
-        ids_add, mask_add = _pack_addition_text(
-            data_add["a"], data_add["b"], tok, max_len=seq_len
-        )
-        y_add = data_add["target"].to(device)
-        ids = torch.cat([ids, ids_add], dim=0)
-        mask = torch.cat([mask, mask_add], dim=0)
-        y = torch.cat([y, y_add], dim=0)
+        # addition batch (BasicsB)
+        if (not curr_enable) or inc_add:
+            add_bsz = args.batch_size
+            data_add = gen.sample_addition(batch=add_bsz, idx_range=train_idx_range)
+            ids_add, mask_add = _pack_addition_text(
+                data_add["a"], data_add["b"], tok, max_len=seq_len
+            )
+            y_add = data_add["target"].to(device)
+            ids = torch.cat([ids, ids_add], dim=0)
+            mask = torch.cat([mask, mask_add], dim=0)
+            y = torch.cat([y, y_add], dim=0)
 
         # Oversample carry cases for addition (…9 + 1)
         try:
-            Bc = max(1, args.batch_size // 8)
-            a_carry = torch.randint(0, gen.n_items, (Bc,), device=device)
-            a_carry = (a_carry // 10) * 10 + 9
-            a_carry = a_carry.clamp(max=gen.n_items - 1)
-            b_carry = torch.ones_like(a_carry)
-            y_carry = (a_carry + b_carry).clamp(max=gen.n_items - 1)
-            ids_add2, mask_add2 = _pack_addition_text(a_carry, b_carry, tok, max_len=seq_len)
-            ids = torch.cat([ids, ids_add2], dim=0)
-            mask = torch.cat([mask, mask_add2], dim=0)
-            y = torch.cat([y, y_carry], dim=0)
+            if (not curr_enable) or inc_add:
+                Bc = max(1, args.batch_size // 8)
+                a_carry = torch.randint(0, gen.n_items, (Bc,), device=device)
+                a_carry = (a_carry // 10) * 10 + 9
+                a_carry = a_carry.clamp(max=gen.n_items - 1)
+                b_carry = torch.ones_like(a_carry)
+                y_carry = (a_carry + b_carry).clamp(max=gen.n_items - 1)
+                ids_add2, mask_add2 = _pack_addition_text(a_carry, b_carry, tok, max_len=seq_len)
+            if (not curr_enable) or inc_add:
+                ids = torch.cat([ids, ids_add2], dim=0)
+                mask = torch.cat([mask, mask_add2], dim=0)
+                y = torch.cat([y, y_carry], dim=0)
         except Exception:
             pass
 
-        # parity batch -> outputs EVEN/ODD classes
-        par_bsz = args.batch_size
-        data_par = gen.sample_parity(batch=par_bsz, idx_range=train_idx_range)
-        ids_par, mask_par = _pack_parity_text(data_par["a"], tok, max_len=seq_len)
-        y_par = torch.where(
-            (data_par["target"].to(device) % 2) > 0,
-            torch.full((par_bsz,), ODD_IDX, dtype=torch.long, device=device),
-            torch.full((par_bsz,), EVEN_IDX, dtype=torch.long, device=device),
-        )
-        ids = torch.cat([ids, ids_par], dim=0)
-        mask = torch.cat([mask, mask_par], dim=0)
-        y = torch.cat([y, y_par], dim=0)
+        # parity batch (BasicsA)
+        if (not curr_enable) or inc_parity:
+            par_bsz = args.batch_size
+            data_par = gen.sample_parity(batch=par_bsz, idx_range=train_idx_range)
+            ids_par, mask_par = _pack_parity_text(data_par["a"], tok, max_len=seq_len)
+            y_par = torch.where(
+                (data_par["target"].to(device) % 2) > 0,
+                torch.full((par_bsz,), ODD_IDX, dtype=torch.long, device=device),
+                torch.full((par_bsz,), EVEN_IDX, dtype=torch.long, device=device),
+            )
+            ids = torch.cat([ids, ids_par], dim=0)
+            mask = torch.cat([mask, mask_par], dim=0)
+            y = torch.cat([y, y_par], dim=0)
 
-        # simple +/- k tasks with k in {1,2,3}
-        off_bsz = args.batch_size
-        data_off = gen.sample_offset(batch=off_bsz, idx_range=train_idx_range)
-        ids_off, mask_off = _pack_offset_text(
-            data_off["a"], data_off["offset"], tok, max_len=seq_len
-        )
-        y_off = data_off["target"].to(device)
-        ids = torch.cat([ids, ids_off], dim=0)
-        mask = torch.cat([mask, mask_off], dim=0)
-        y = torch.cat([y, y_off], dim=0)
+        # simple +/- k tasks with k in {1,2,3} (BasicsA)
+        if (not curr_enable) or inc_offsets:
+            off_bsz = args.batch_size
+            data_off = gen.sample_offset(batch=off_bsz, idx_range=train_idx_range)
+            ids_off, mask_off = _pack_offset_text(
+                data_off["a"], data_off["offset"], tok, max_len=seq_len
+            )
+            y_off = data_off["target"].to(device)
+            ids = torch.cat([ids, ids_off], dim=0)
+            mask = torch.cat([mask, mask_off], dim=0)
+            y = torch.cat([y, y_off], dim=0)
 
         # Dynamic composition sizing based on target share r
         if comp_enabled:
@@ -1638,8 +1686,10 @@ def train(args):
             except Exception:
                 pass
 
-        # Oversample successor/pred around carries/borrows: …9 + 1 and …0 − 1
+        # Oversample successor/pred around carries/borrows (BasicsA)
         try:
+            if curr_enable and not inc_count:
+                raise Exception("skip carry oversample outside BasicsA")
             Bsp = max(1, args.batch_size // 8)
             # successor with ones=9
             a_succ = torch.randint(0, gen.n_items, (Bsp,), device=device)
@@ -1660,8 +1710,10 @@ def train(args):
         except Exception:
             pass
 
-        # Negatives around zero for comparisons: -1, 0, +1
+        # Negatives around zero for comparisons (BasicsB)
         try:
+            if curr_enable and not inc_cmp:
+                raise Exception("skip near-zero compare outside BasicsB")
             vals = torch.tensor([-1, 0, 1], device=device)
             combos = []
             for ai in vals:
@@ -1684,7 +1736,7 @@ def train(args):
         except Exception:
             pass
         # Optional compositional template-block bursts for support
-        if comp_enabled and comp_burst_every > 0:
+        if comp_enabled and (not curr_enable or curr_phase == "Composition") and comp_burst_every > 0:
             try:
                 if (step + 1) % comp_burst_every == 0:
                     import random as _r
@@ -2838,6 +2890,39 @@ def train(args):
             print(
                 f"  eval in-dist={val_in:.3f} range-OOD={val_range:.3f} template-OOD={val_tood:.3f} boundary-OOD={acc_b:.3f}"
             )
+            # Curriculum phase promotion (metric-gated)
+            try:
+                if curr_enable and (step + 1) >= curr_phase_min:
+                    advance = False
+                    if curr_phase == "BasicsA":
+                        # gates: counting strong, in-dist baseline, VQ stable, STOP in range
+                        stop_p = 0.0
+                        try:
+                            stop_p = float(torch.sigmoid(stop_logits).mean().item())
+                        except Exception:
+                            pass
+                        vq_ok = (avg_vq_chg is not None and avg_vq_chg <= thr_vq_A)
+                        if (val_acc_cnt >= thr_cnt_A) and (val_in >= thr_in_A) and vq_ok and (thr_stop_lo_A <= stop_p <= thr_stop_hi_A):
+                            advance = True
+                    elif curr_phase == "BasicsB":
+                        # gates: boundary-OOD ~ mid, template-OOD close to in-dist
+                        import math as _m
+                        tood_gap = float('inf') if _m.isnan(float(val_tood)) else abs(val_tood - val_in)
+                        if (acc_b >= thr_bdry_B_lo and acc_b <= thr_bdry_B_hi) and (tood_gap <= thr_tood_gap):
+                            advance = True
+                    elif curr_phase == "Structure":
+                        telem = getattr(model.reasoner, "_telemetry", {})
+                        pct_d2 = float(telem.get("pct_depth_ge2", 0.0) or 0.0)
+                        import math as _m
+                        tood_gap = float('inf') if _m.isnan(float(val_tood)) else abs(val_tood - val_in)
+                        if (pct_d2 > 0.0) and (tood_gap <= thr_tood_gap):
+                            advance = True
+                    if advance and (curr_idx + 1 < len(curr_groups)):
+                        curr_idx += 1
+                        curr_phase = curr_groups[curr_idx]
+                        print(f"  [curriculum] advancing to phase={curr_phase} (idx={curr_idx})")
+            except Exception:
+                pass
             # Composition scheduler tick (every comp_tick steps)
             try:
                 if comp_enabled and comp_tick > 0 and ((step + 1) % comp_tick == 0):
@@ -3487,6 +3572,18 @@ def main():
     pt.add_argument("--fast_eta", type=float, default=0.05, help="Hebbian learning rate eta")
     pt.add_argument("--fast_decay", type=float, default=0.90, help="Fast-weight decay per step")
     pt.add_argument("--fast_norm_max", type=float, default=1.0, help="Max Frobenius norm for fast weights")
+    # Curriculum (phased training)
+    pt.add_argument("--curriculum_enable", type=int, default=0, help="Enable phased curriculum (1=on, 0=off)")
+    pt.add_argument("--curr_groups", type=str, default="BasicsA,BasicsB,Structure,Composition", help="Comma-separated phases")
+    pt.add_argument("--curr_phase_min_steps", type=int, default=800, help="Min steps in a phase before promotion")
+    pt.add_argument("--curr_thr_cnt_A", type=float, default=0.70, help="Counting accuracy gate for BasicsA→B")
+    pt.add_argument("--curr_thr_in_A", type=float, default=0.60, help="In-dist gate for BasicsA→B")
+    pt.add_argument("--curr_thr_vq_A", type=float, default=0.30, help="Avg VQ churn gate for BasicsA→B")
+    pt.add_argument("--curr_thr_stop_lo_A", type=float, default=0.18, help="STOP lower bound for BasicsA→B")
+    pt.add_argument("--curr_thr_stop_hi_A", type=float, default=0.35, help="STOP upper bound for BasicsA→B")
+    pt.add_argument("--curr_thr_bdry_B_lo", type=float, default=0.45, help="Boundary-OOD lower bound for BasicsB→Structure")
+    pt.add_argument("--curr_thr_bdry_B_hi", type=float, default=0.60, help="Boundary-OOD upper bound for BasicsB→Structure")
+    pt.add_argument("--curr_thr_tood_gap", type=float, default=0.05, help="Max template-OOD vs in-dist gap")
     # Composition scheduler & bursts
     pt.add_argument("--comp_enable", type=int, default=1, help="Enable compositional data (1=on, 0=off)")
     pt.add_argument("--comp_init", type=float, default=0.15, help="Initial composition share r in Module A")
