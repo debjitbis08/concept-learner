@@ -140,16 +140,20 @@ class ProtoRouter(torch.nn.Module):
         valid = (rel_ids >= 0) & (rel_ids < self.num_rel)
         if not valid.any():
             return logits_seq
-        # compute cosine per row
+        # compute cosine per row (with numerical safety)
         mu_sel = self.mu[rel_ids.clamp(0, self.num_rel - 1)]  # (B,D)
+        # Sanitize features and prototypes to avoid NaN/Inf in cosine
+        feats = torch.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
+        mu_sel = torch.nan_to_num(mu_sel, nan=0.0, posinf=0.0, neginf=0.0)
         cos = F.cosine_similarity(feats, mu_sel, dim=-1)  # (B,)
+        cos = torch.nan_to_num(cos, nan=0.0, posinf=0.0, neginf=0.0).clamp(-1.0, 1.0)
         # gate by warmup
         cnt_sel = self.cnt[rel_ids.clamp(0, self.num_rel - 1)]  # (B,)
         gate = (cnt_sel >= self.warmup).to(logits_seq.dtype)
         bias = (self._current_weight()) * cos * gate  # (B,)
+        bias = torch.nan_to_num(bias, nan=0.0, posinf=0.0, neginf=0.0)
         # Add symmetric bias to YES/NO
         out = logits_seq
         out[:, yes_idx] = out[:, yes_idx] + bias
         out[:, no_idx] = out[:, no_idx] - bias
         return out
-
