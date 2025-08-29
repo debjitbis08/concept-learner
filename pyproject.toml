@@ -76,7 +76,7 @@ python scripts/train_episodes.py train \
   --lambda_vq 0.25 --lambda_stop 0.3 \
   --max_number 100 --train_range 0-79 --ood_range 80-99 \
   --frozen_mix --mix_ratio_id 0.45 --mix_ratio_bd 0.20 --mix_ratio_ood 0.25 --mix_ratio_cf 0.05 \
-  --resume runs/episodes_b10/latest.pt
+  --resume runs/episodes_b10/best.pt
 """
 setup = """
 apt update && sudo apt upgrade -y
