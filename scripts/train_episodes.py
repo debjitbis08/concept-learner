@@ -2,6 +2,7 @@ import argparse
 import os
 import math
 import torch
+from contextlib import nullcontext
 from typing import List
 from concept_learner.episodes import EpisodeConfig, EpisodeGenerator
 from concept_learner.model import CLModel
@@ -932,6 +933,11 @@ def train(args):
         param_groups.append({"params": no_decay, "weight_decay": 0.0})
     opt = torch.optim.AdamW(param_groups, lr=args.lr)
 
+    # Optional AMP (mixed precision) for memory savings
+    use_amp = bool(getattr(args, "amp", False)) and (str(device).startswith("cuda") and torch.cuda.is_available())
+    amp_ctx = torch.cuda.amp.autocast if use_amp else nullcontext
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
         start_step = load_checkpoint(
@@ -1217,8 +1223,11 @@ def train(args):
             sel = perm[:n]
             a = A[sel]; b = B[sel]; op = OO[sel]; y_bin = YY[sel]
         # counterfactual flips: start from in-dist and tilt by ±1 to flip
-        op = torch.randint(0, 2, (n,), device=device)  # 0:'>', 1:'<'
-        y_bin = torch.where(op == 0, (a > b).long(), (a < b).long())
+        # For non-boundary kinds, (re)sample op and derive labels to match current lengths
+        if kind != 'bd':
+            n_eff = int(a.size(0))
+            op = torch.randint(0, 2, (n_eff,), device=device)  # 0:'>', 1:'<'
+            y_bin = torch.where(op == 0, (a > b).long(), (a < b).long())
         if kind == 'cf':
             delta = torch.where(y_bin > 0, -1, 1)
             b = (b + delta).clamp(0, gen.n_items - 1)
@@ -1594,16 +1603,17 @@ def train(args):
                 model.decoder.reset_fast()
         except Exception:
             pass
-        logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
-        # One-shot Hebbian update and recompute logits (before applying proto bias)
-        try:
-            if int(getattr(args, "fast_enable", 1)) > 0:
-                model.decoder.hebbian_update(y)
-                logits_seq2 = model.decoder.recompute_seq_logits()
-                if logits_seq2 is not None:
-                    logits_seq = logits_seq2
-        except Exception:
-            pass
+        with amp_ctx():
+            logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
+            # One-shot Hebbian update and recompute logits (before applying proto bias)
+            try:
+                if int(getattr(args, "fast_enable", 1)) > 0:
+                    model.decoder.hebbian_update(y)
+                    logits_seq2 = model.decoder.recompute_seq_logits()
+                    if logits_seq2 is not None:
+                        logits_seq = logits_seq2
+            except Exception:
+                pass
 
         # kNN posterior mixing (train-time optional) and memory update
         try:
@@ -1993,9 +2003,16 @@ def train(args):
                 pass
 
         opt.zero_grad(set_to_none=True)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        if use_amp:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
         if ema is not None:
             ema.update(model)
         # update EMA teacher for numeric head
@@ -2175,12 +2192,20 @@ def train(args):
                     mask_sel = mask_hnm[selected]
                     y_sel = y_hnm[selected]
                     # one extra optimization step (sequence CE + VQ regularizer only)
-                    logits_tok_e, logits_seq_e, vq_loss_e, _, stop_logits_e, _ = model(ids_sel, mask_sel)
-                    loss_e = torch.nn.functional.cross_entropy(logits_seq_e, y_sel) + args.lambda_vq * vq_loss_e
+                    with amp_ctx():
+                        _lt, logits_seq_e, vq_loss_e, _, _sl, _ = model(ids_sel, mask_sel)
+                        loss_e = torch.nn.functional.cross_entropy(logits_seq_e, y_sel) + args.lambda_vq * vq_loss_e
                     opt.zero_grad(set_to_none=True)
-                    loss_e.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    opt.step()
+                    if use_amp:
+                        scaler.scale(loss_e).backward()
+                        scaler.unscale_(opt)
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        loss_e.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        opt.step()
                     if ema is not None:
                         ema.update(model)
         except Exception:
@@ -3136,6 +3161,7 @@ def main():
     pt.add_argument("--lr", type=float, default=3e-4)
     pt.add_argument("--weight_decay", type=float, default=0.0)
     pt.add_argument("--label_smoothing", type=float, default=0.0)
+    pt.add_argument("--amp", action="store_true", help="Enable CUDA AMP mixed precision to save memory")
     # Schedules / stability tweaks
     pt.add_argument("--head_boost_steps", type=int, default=5000, help="Multiply LR for action/STOP heads during first N steps")
     pt.add_argument("--label_smoothing_start", type=float, default=0.05, help="Initial label smoothing before schedule kicks in")
@@ -3352,6 +3378,7 @@ def main():
     ct.add_argument("--max_len", type=int, default=18)
     ct.add_argument("--eval_batches", type=int, default=50)
     ct.add_argument("--weight_decay", type=float, default=0.0)
+    ct.add_argument("--amp", action="store_true", help="Enable CUDA AMP mixed precision to save memory")
     ct.add_argument(
         "--save_all_checkpoints",
         action="store_true",
@@ -3452,6 +3479,11 @@ def main():
             ],
             lr=args.lr,
         )
+        # Optional AMP for memory savings
+        use_amp_ct = bool(getattr(args, "amp", False)) and (str(device).startswith("cuda") and torch.cuda.is_available())
+        amp_ctx_ct = torch.cuda.amp.autocast if use_amp_ct else nullcontext
+        scaler_ct = torch.cuda.amp.GradScaler(enabled=use_amp_ct)
+
         start = 0
         if args.resume and os.path.isfile(args.resume):
             start = load_checkpoint(args.resume, model, opt, map_location=device)
@@ -3463,12 +3495,20 @@ def main():
                 data["kind"], data["a"], data["c"], tok, max_len=args.max_len
             )
             y = data["target"].to(device)
-            _, logits_seq, vq_loss, _, stop_logits, _ = model(ids, mask)
-            loss = torch.nn.functional.cross_entropy(logits_seq, y)
+            with amp_ctx_ct():
+                _, logits_seq, vq_loss, _, stop_logits, _ = model(ids, mask)
+                loss = torch.nn.functional.cross_entropy(logits_seq, y)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()
+            if use_amp_ct:
+                scaler_ct.scale(loss).backward()
+                scaler_ct.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler_ct.step(opt)
+                scaler_ct.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
             if (step + 1) % args.log_every == 0:
                 # quick eval
                 model.eval()

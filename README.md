@@ -32,6 +32,11 @@ Architecture in short: a tiny Transformer encoder, a multi-VQ bottleneck (parall
 --ema_decay 0.995 --weight_decay 0.003 --label_smoothing 0.03 \
 --lambda_vq 0.25 --lambda_stop 0.3`
 
+- If you hit CUDA OOM, try:
+  - Lower `--batch_size` (e.g., 64 → 32 or 16)
+  - Enable mixed precision: add `--amp` (CUDA only)
+  - Set env var to reduce fragmentation: `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+
 - Resume Training
 
   - `python scripts/train_episodes.py train \
