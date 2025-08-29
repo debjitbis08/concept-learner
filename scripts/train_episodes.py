@@ -179,6 +179,8 @@ def _quick_eval(
     relations: str | None = None,
     idx_range: tuple[int, int] | None = None,
     template_filter: dict | None = None,
+    probe=None,
+    probe_alpha: float | None = None,
 ) -> float:
     model.eval()
     total, correct = 0, 0
@@ -190,11 +192,84 @@ def _quick_eval(
         _, logits_seq, _, _, _, _ = model(ids, mask)
         NO_IDX = num_numbers + 1
         YES_IDX = num_numbers
-        pred_bin = logits_seq[:, [NO_IDX, YES_IDX]].argmax(dim=-1)
+        if probe is not None and getattr(probe, "w", None) is not None:
+            # Blend learned head with ridge probe
+            with torch.no_grad():
+                h, _ = model.enc(ids, mask)
+                ridge_logit = probe.predict_logit(h)
+                base_pair = logits_seq[:, [NO_IDX, YES_IDX]]
+                learned_logit = base_pair[:, 1] - base_pair[:, 0]
+                a = float(probe_alpha if probe_alpha is not None else getattr(probe, "alpha", 0.7))
+                blended = a * learned_logit + (1.0 - a) * ridge_logit
+                # decision by sign of blended logit
+                pred_bin = (blended > 0).long()
+        else:
+            pred_bin = logits_seq[:, [NO_IDX, YES_IDX]].argmax(dim=-1)
         correct += (pred_bin == y).sum().item()
         total += y.numel()
     model.train()
     return correct / max(1, total)
+
+
+# --------------------------- Ridge Probe (Few-Shot) -------------------------
+
+
+class RidgeProbe:
+    def __init__(self, d: int, max_items: int = 2048, lam: float = 1e-3, alpha: float = 0.7, device: str | torch.device = "cpu"):
+        self.max_items = int(max_items)
+        self.lam = float(lam)
+        self.alpha = float(alpha)
+        self.d = int(d)
+        self.device = device
+        self.X: list[torch.Tensor] = []  # list of (n_i, d)
+        self.Y: list[torch.Tensor] = []  # list of (n_i,)
+        self.w: torch.Tensor | None = None  # (d,)
+
+    def __len__(self):
+        return sum(x.size(0) for x in self.X)
+
+    def add(self, x: torch.Tensor, y: torch.Tensor):
+        if x.numel() == 0:
+            return
+        # detach to CPU for storage
+        self.X.append(x.detach().to("cpu").float())
+        self.Y.append(y.detach().to("cpu").float())
+        # trim to ring size
+        while len(self) > self.max_items and len(self.X) > 0:
+            # pop oldest chunk
+            drop = self.X[0].size(0)
+            self.X.pop(0)
+            self.Y.pop(0)
+
+    def fit(self, device: str | torch.device):
+        if len(self.X) == 0:
+            self.w = None
+            return False
+        X = torch.cat(self.X, dim=0)  # (N,d)
+        Y = torch.cat(self.Y, dim=0)  # (N,)
+        if X.size(0) < self.d:
+            self.w = None
+            return False
+        # Closed-form ridge: w = (X^T X + lam I)^{-1} X^T y
+        Xt = X.t()  # (d,N)
+        XtX = Xt @ X  # (d,d)
+        lamI = self.lam * torch.eye(self.d, dtype=X.dtype, device=X.device)
+        Xty = Xt @ Y  # (d,)
+        try:
+            w = torch.linalg.solve(XtX + lamI, Xty)
+        except RuntimeError:
+            w = torch.linalg.pinv(XtX + lamI) @ Xty
+        self.w = w.to(device)
+        self.device = device
+        return True
+
+    @torch.no_grad()
+    def predict_logit(self, h: torch.Tensor) -> torch.Tensor:
+        # h: (B,d) on any device; returns (B,) ridge logit
+        if self.w is None:
+            return torch.zeros(h.size(0), device=h.device)
+        w = self.w.to(h.device)
+        return (h @ w)
 
 
 def _pack_text_batch(
@@ -877,6 +952,8 @@ def train(args):
     seq_len = args.max_len
     # Wake/Sleep/Dream replay buffer
     rb = ReplayBuffer(max_items=getattr(args, "replay_max_items", 512))
+    # Linear probe (ridge) for quick few-shot adaptation
+    probe = RidgeProbe(d=args.d_model, max_items=getattr(args, "probe_max_items", 2048), lam=getattr(args, "probe_lambda", 1e-3), alpha=getattr(args, "probe_alpha", 0.7), device=device)
     # Eval history for on-demand sleep trigger
     eval_hist: list[float] = []
     prev_eval_avg: float | None = None
@@ -1326,6 +1403,20 @@ def train(args):
                 # replace default CE contribution with the reweighted compare CE averaged with other tasks
                 loss_seq = loss_seq * 0.5 + loss_cmp_total * 0.5
 
+        # Collect binary compare examples into probe buffer
+        try:
+            YES_IDX = num_numbers
+            NO_IDX = num_numbers + 1
+            with torch.no_grad():
+                h_all, _H = model.enc(ids, mask)
+            sel = (y == YES_IDX) | (y == NO_IDX)
+            if sel.any() and int(getattr(args, "probe_enable", 1)) > 0:
+                x = h_all[sel]
+                y_bin = (y[sel] == YES_IDX).float()
+                probe.add(x, y_bin)
+        except Exception:
+            pass
+
         # ---- Auxiliary: margin-aware BCE for YES/NO near boundary ----
         # apply only on symbolic compares where |a-b|<=1 or a==b
         try:
@@ -1756,6 +1847,9 @@ def train(args):
             if _using_ema:
                 ema.store(model)
                 ema.copy_to(model)
+            # Fit/update probe right before eval if enabled
+            if int(getattr(args, "probe_enable", 1)) > 0:
+                probe.fit(device)
             val_acc_pair = _quick_eval(
                 model,
                 gen,
@@ -1766,6 +1860,8 @@ def train(args):
                 max_len=seq_len,
                 num_numbers=num_numbers,
                 relations=getattr(args, "relations", None),
+                probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
+                probe_alpha=getattr(args, "probe_alpha", 0.7),
             )
             # quick counting eval
             model.eval()
@@ -1901,6 +1997,8 @@ def train(args):
                 relations=getattr(args, "relations", None),
                 idx_range=in_range,
                 template_filter=tmpl_train,
+                probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
+                probe_alpha=getattr(args, "probe_alpha", 0.7),
             )
             val_range = (
                 _quick_eval(
@@ -1915,6 +2013,8 @@ def train(args):
                     relations=getattr(args, "relations", None),
                     idx_range=ood_range,
                     template_filter=tmpl_train,
+                    probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
+                    probe_alpha=getattr(args, "probe_alpha", 0.7),
                 )
                 if ood_range is not None
                 else float("nan")
@@ -1931,6 +2031,8 @@ def train(args):
                 relations=getattr(args, "relations", None),
                 idx_range=in_range,
                 template_filter=tmpl_ood,
+                probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
+                probe_alpha=getattr(args, "probe_alpha", 0.7),
             )
             # boundary-OOD
             b_batch = gen.sample_posneg_pairs_boundary(
@@ -2378,6 +2480,11 @@ def main():
     pt.add_argument(
         "--sleep_every", type=int, default=300, help="Run sleep-abstraction + dreaming every N steps"
     )
+    # Linear probe (few-shot ridge) knobs
+    pt.add_argument("--probe_enable", type=int, default=1, help="Enable ridge probe blending for pair eval (1=on, 0=off)")
+    pt.add_argument("--probe_max_items", type=int, default=2048, help="Rolling buffer size for ridge probe")
+    pt.add_argument("--probe_lambda", type=float, default=1e-3, help="Ridge regularization lambda")
+    pt.add_argument("--probe_alpha", type=float, default=0.7, help="Blend: alpha*learned + (1-alpha)*ridge on logit scale")
     # On-demand sleep trigger knobs
     pt.add_argument("--on_demand_sleep", type=int, default=1, help="Enable on-demand short sleep when metrics regress (1=on, 0=off)")
     pt.add_argument("--ods_window", type=int, default=5, help="Window size (N evals) for moving-average drop detection")
