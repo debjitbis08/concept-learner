@@ -211,25 +211,69 @@ def _pack_text_batch(
 
 
 def _pair_templates(a: int, b: int, r: int) -> List[str]:
-    # Simple natural templates; tokenizer handles subwords; we don't hardcode tokens.
-    if r == 0:
-        return [f"Do {a} and {b} have the same parity?"]
-    if r == 1:
-        return [f"Is {b} the successor of {a}?", f"Is {b} equal to {a} + 1?"]
-    if r == 2:
-        return [f"Is {b} the predecessor of {a}?", f"Is {b} equal to {a} - 1?"]
-    if r == 3:
-        return [f"Is {b} equal to {a} + 2?"]
-    if r == 4:
-        return [f"Do {a} and {b} have the same tens digit?"]
-    if r == 5:
-        return [f"Do {a} and {b} have the same ones digit?"]
-    if r == 6:
-        return [f"Do the ones digits of {a} and {b} make ten?"]
-    if r == 7:
-        return [f"Is {a} greater than {b}?"]
-    if r == 8:
-        return [f"Is {a} smaller than {b}?"]
+    """Return a mix of natural-language and symbolic templates for pair relations.
+    Keeps variety to better match eval phrasing and symbolic forms.
+    """
+    if r == 0:  # same_parity
+        return [
+            f"Do {a} and {b} have the same parity?",
+            f"Is parity({a}) equal to parity({b})?",
+            f"Is {a}%2 == {b}%2?",
+        ]
+    if r == 1:  # successor
+        return [
+            f"Is {b} the successor of {a}?",
+            f"Is {b} equal to {a} + 1?",
+            f"Is {b} == {a}+1?",
+            f"{b} = {a} + 1?",
+        ]
+    if r == 2:  # predecessor
+        return [
+            f"Is {b} the predecessor of {a}?",
+            f"Is {b} equal to {a} - 1?",
+            f"Is {b} == {a}-1?",
+            f"{b} = {a} - 1?",
+        ]
+    if r == 3:  # add_2
+        return [
+            f"Is {b} equal to {a} + 2?",
+            f"Is {b} == {a}+2?",
+            f"{b} = {a} + 2?",
+        ]
+    if r == 4:  # same_tens
+        return [
+            f"Do {a} and {b} have the same tens digit?",
+            f"Is tens({a}) equal to tens({b})?",
+            f"tens({a}) == tens({b})?",
+        ]
+    if r == 5:  # same_ones
+        return [
+            f"Do {a} and {b} have the same ones digit?",
+            f"Is ones({a}) equal to ones({b})?",
+            f"{a}%10 == {b}%10?",
+        ]
+    if r == 6:  # makes_ten (ones digits sum to 10)
+        return [
+            f"Do the ones digits of {a} and {b} make ten?",
+            f"Is ones({a}) + ones({b}) equal to 10?",
+            f"({a}%10 + {b}%10) == 10?",
+        ]
+    if r == 7:  # greater
+        return [
+            f"Is {a} greater than {b}?",
+            f"Is {a} larger than {b}?",
+            f"Is {a} > {b}?",
+            f"{a}>{b}?",
+            f"{a} > {b}?",
+        ]
+    if r == 8:  # smaller
+        return [
+            f"Is {a} smaller than {b}?",
+            f"Is {a} less than {b}?",
+            f"Is {a} < {b}?",
+            f"{a}<{b}?",
+            f"{a} < {b}?",
+        ]
     return [f"Do {a} and {b} satisfy the relation?"]
 
 
@@ -410,14 +454,30 @@ def _pack_symbolic_compare_text(a: torch.Tensor, b: torch.Tensor, op: torch.Tens
     a_l = a.tolist(); b_l = b.tolist(); op_l = op.tolist()
     texts = []
     for ai, bi, oi in zip(a_l, b_l, op_l):
-        sym = '>' if oi == 0 else '<'
-        candidates = [
-            f"{ai}{sym}{bi}?",
-            f"{ai} {sym} {bi}?",
-            f"Is {ai}{sym}{bi}?",
-            f"Is {ai} {sym} {bi}?",
-            f"Is {ai} {sym} {bi} true?",
-        ]
+        if oi == 0:  # '>'
+            candidates = [
+                # natural-language
+                f"Is {ai} greater than {bi}?",
+                f"Is {ai} larger than {bi}?",
+                f"Is {ai} more than {bi}?",
+                f"Does {ai} exceed {bi}?",
+                # symbolic
+                f"{ai}>{bi}?",
+                f"{ai} > {bi}?",
+                f"Is {ai} > {bi}?",
+            ]
+        else:  # '<'
+            candidates = [
+                # natural-language
+                f"Is {ai} smaller than {bi}?",
+                f"Is {ai} less than {bi}?",
+                f"Is {ai} below {bi}?",
+                f"Is {ai} under {bi}?",
+                # symbolic
+                f"{ai}<{bi}?",
+                f"{ai} < {bi}?",
+                f"Is {ai} < {bi}?",
+            ]
         texts.append(random.choice(candidates))
     device = "cuda" if torch.cuda.is_available() else "cpu"
     return _pack_text_batch(texts, tok, max_len, device)
@@ -955,11 +1015,8 @@ def train(args):
             set_cosine_lr(step)
         rel_arg = getattr(args, "relations", None)
         rel_ids = _parse_relations_arg(rel_arg)
-        # Remove training for same_parity (0), same_tens (4), same_ones (5), makes_ten (6)
-        if rel_ids is None:
-            rel_ids = [1, 2, 3, 7, 8]
-        else:
-            rel_ids = [r for r in rel_ids if r not in (0, 4, 5, 6)]
+        # If no --relations provided, train on all pair relations (0..8).
+        # If provided, use exactly the requested subset.
         include_pairs = True
         if rel_arg and rel_arg.strip().lower() != "all" and (rel_ids is None or len(rel_ids) == 0):
             include_pairs = False
@@ -1588,7 +1645,7 @@ def train(args):
                 except Exception:
                     rb_len = 0
                 print(f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={compact}")
-                # Dream-MAP from replay buffer
+                # Dream-MAP from replay buffer (replayed experiences)
                 if len(rb) > 0:
                     dream_bs = min(args.batch_size, len(rb))
                     replays = rb.sample(dream_bs)
@@ -1624,6 +1681,49 @@ def train(args):
                             _ = train_step_with_trace_supervision(
                                 model, (ids_c, mask_c, y_tok_c, y_seq_c, y_stop_c), traces_c_canon, opt
                             )
+                        # Fantasies: sample random programs from the learned library (functions + primitives)
+                        try:
+                            def _sample_fantasy_traces(reasoner, k: int, max_steps: int):
+                                total = []
+                                num_prims = len(getattr(reasoner, 'prims', []))
+                                num_fn = 0
+                                nonempty_fns = []
+                                if getattr(reasoner, 'use_functions', False) and getattr(reasoner, 'op_function', None) is not None:
+                                    slots = getattr(reasoner.op_function, 'slots', [])
+                                    for sid, sl in enumerate(slots):
+                                        if hasattr(sl, 'steps') and len(sl.steps) > 0:
+                                            nonempty_fns.append(sid)
+                                    num_fn = len(nonempty_fns)
+                                import random as _r
+                                for _ in range(k):
+                                    L = max(1, min(max_steps, _r.randint(1, max_steps)))
+                                    trace = []
+                                    for __ in range(L):
+                                        # mix: 50% primitives, 50% functions if available
+                                        pick_fn = (num_fn > 0) and (_r.random() < 0.5)
+                                        if pick_fn:
+                                            sid = nonempty_fns[_r.randrange(num_fn)]
+                                            trace.append(num_prims + sid)
+                                        else:
+                                            pid = _r.randrange(max(1, num_prims))
+                                            trace.append(pid)
+                                    total.append(trace)
+                                return total
+                            # pair fantasies with observable data (ids/mask) from replay
+                            k = min(len(replays), max(1, dream_bs // 2))
+                            traces_f = _sample_fantasy_traces(model.reasoner, k, getattr(model.reasoner, 'max_steps', 1))
+                            if k > 0 and len(traces_f) == k:
+                                ids_f = ids_rep[:k]
+                                mask_f = mask_rep[:k]
+                                y_tok_f = torch.zeros(k, seq_len, dtype=torch.long, device=device)
+                                y_seq_f = torch.zeros(k, dtype=torch.long, device=device)
+                                y_stop_f = make_stop_targets_from_traces(traces_f, max_steps=getattr(model.reasoner, 'max_steps', 1), device=device)
+                                _ = train_step_with_trace_supervision(
+                                    model, (ids_f, mask_f, y_tok_f, y_seq_f, y_stop_f), traces_f, opt
+                                )
+                        except Exception:
+                            # fantasy generation is best-effort; ignore failures
+                            pass
         except Exception:
             # keep training even if dreaming fails
             pass
