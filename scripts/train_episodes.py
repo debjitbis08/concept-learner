@@ -1308,6 +1308,25 @@ def train(args):
                 _ = load_checkpoint(args.resume, model, opt=None, map_location=device, proto=proto)
             except Exception:
                 pass
+    # ---- Composition scheduler state ----
+    comp_enabled = int(getattr(args, "comp_enable", 1)) > 0
+    comp_r = float(getattr(args, "comp_init", 0.15))
+    comp_min = float(getattr(args, "comp_min", 0.10))
+    comp_max = float(getattr(args, "comp_max", 0.50))
+    comp_tick = int(getattr(args, "comp_tick", 500))
+    comp_big = float(getattr(args, "comp_ramp_big", 0.10))
+    comp_small = float(getattr(args, "comp_ramp_small", 0.05))
+    comp_entry = float(getattr(args, "comp_entry", 0.30))
+    comp_burst_every = int(getattr(args, "comp_burst_every", 400))
+    comp_burst_groups = int(getattr(args, "comp_burst_groups", 2))
+    comp_burst_k_min = int(getattr(args, "comp_burst_k_min", 12))
+    comp_burst_k_max = int(getattr(args, "comp_burst_k_max", 16))
+    comp_support_min = int(getattr(args, "comp_support_min", 8))
+    comp_sleep_gate = int(getattr(args, "comp_sleep_gate", 0)) > 0
+    comp_support: dict[int, int] = {}
+    comp_stage = "A"  # 'A' basics, 'B' composition
+    act_ent_hist: list[float] = []
+
     for step in range(start_step, args.steps):
         # EMA decay schedule: increase after threshold
         if ema is not None:
@@ -1582,36 +1601,42 @@ def train(args):
         mask = torch.cat([mask, mask_off], dim=0)
         y = torch.cat([y, y_off], dim=0)
 
-        # compositional numeric targets (e.g., succ(ones(a)), pred(pred(a)))
-        try:
-            comp_num_bsz = max(1, args.batch_size // 8)
-            comp_texts_num, comp_y_num = make_numeric_compositions(
-                n_items=ecfg.max_number, batch=comp_num_bsz, device=device
-            )
-            ids_cnum, mask_cnum = _pack_text_batch(comp_texts_num, tok, seq_len, device)
-            y = torch.cat([y, comp_y_num.to(device)], dim=0)
-            ids = torch.cat([ids, ids_cnum], dim=0)
-            mask = torch.cat([mask, mask_cnum], dim=0)
-        except Exception:
-            pass
-
-        # compositional equality yes/no (e.g., Is succ(succ(a)) == b?)
-        try:
-            comp_yn_bsz = max(1, args.batch_size // 8)
-            comp_texts_yn, comp_y_yn_bin = make_equality_compositions(
-                n_items=ecfg.max_number, batch=comp_yn_bsz, device=device
-            )
-            ids_cyn, mask_cyn = _pack_text_batch(comp_texts_yn, tok, seq_len, device)
-            y_cyn = torch.where(
-                comp_y_yn_bin.to(device) > 0,
-                torch.full((comp_yn_bsz,), YES_IDX, dtype=torch.long, device=device),
-                torch.full((comp_yn_bsz,), NO_IDX, dtype=torch.long, device=device),
-            )
-            ids = torch.cat([ids, ids_cyn], dim=0)
-            mask = torch.cat([mask, mask_cyn], dim=0)
-            y = torch.cat([y, y_cyn], dim=0)
-        except Exception:
-            pass
+        # Dynamic composition sizing based on target share r
+        if comp_enabled:
+            try:
+                T_before = int(ids.size(0))
+                Bsp = max(1, args.batch_size // 8)
+                future_extras = (2 * Bsp) + 9  # succ/pred oversample + near-zero set
+                target_comp = int(max(0, round((comp_r / max(1e-6, (1.0 - comp_r))) * (T_before + future_extras))))
+                comp_num_bsz = max(0, target_comp // 2)
+                comp_yn_bsz = max(0, target_comp - comp_num_bsz)
+                if comp_num_bsz > 0:
+                    comp_texts_num, comp_y_num, kinds_num = make_numeric_compositions(
+                        n_items=ecfg.max_number, batch=comp_num_bsz, device=device
+                    )
+                    ids_cnum, mask_cnum = _pack_text_batch(comp_texts_num, tok, seq_len, device)
+                    y = torch.cat([y, comp_y_num.to(device)], dim=0)
+                    ids = torch.cat([ids, ids_cnum], dim=0)
+                    mask = torch.cat([mask, mask_cnum], dim=0)
+                    for k in kinds_num:
+                        comp_support[int(k)] = comp_support.get(int(k), 0) + 1
+                if comp_yn_bsz > 0:
+                    comp_texts_yn, comp_y_yn_bin, kinds_yn = make_equality_compositions(
+                        n_items=ecfg.max_number, batch=comp_yn_bsz, device=device
+                    )
+                    ids_cyn, mask_cyn = _pack_text_batch(comp_texts_yn, tok, seq_len, device)
+                    y_cyn = torch.where(
+                        comp_y_yn_bin.to(device) > 0,
+                        torch.full((comp_yn_bsz,), YES_IDX, dtype=torch.long, device=device),
+                        torch.full((comp_yn_bsz,), NO_IDX, dtype=torch.long, device=device),
+                    )
+                    ids = torch.cat([ids, ids_cyn], dim=0)
+                    mask = torch.cat([mask, mask_cyn], dim=0)
+                    y = torch.cat([y, y_cyn], dim=0)
+                    for k in kinds_yn:
+                        comp_support[int(k)] = comp_support.get(int(k), 0) + 1
+            except Exception:
+                pass
 
         # Oversample successor/pred around carries/borrows: …9 + 1 and …0 − 1
         try:
@@ -1658,6 +1683,26 @@ def train(args):
             y = torch.cat([y, y_ncmp], dim=0)
         except Exception:
             pass
+        # Optional compositional template-block bursts for support
+        if comp_enabled and comp_burst_every > 0:
+            try:
+                if (step + 1) % comp_burst_every == 0:
+                    import random as _r
+                    groups = max(1, comp_burst_groups)
+                    for _ in range(groups):
+                        K = _r.randint(max(1, comp_burst_k_min), max(comp_burst_k_min, comp_burst_k_max))
+                        kind = _r.randrange(0, 8)
+                        texts_b, y_b, kinds_b = make_numeric_compositions(
+                            n_items=ecfg.max_number, batch=K, device=device, force_kind=kind
+                        )
+                        ids_b, mask_b = _pack_text_batch(texts_b, tok, seq_len, device)
+                        ids = torch.cat([ids, ids_b], dim=0)
+                        mask = torch.cat([mask, mask_b], dim=0)
+                        y = torch.cat([y, y_b.to(device)], dim=0)
+                        for k in kinds_b:
+                            comp_support[int(k)] = comp_support.get(int(k), 0) + 1
+            except Exception:
+                pass
         # Reset fast-weights per episode (batch) before forward
         try:
             if int(getattr(args, "fast_enable", 1)) > 0:
@@ -1665,7 +1710,7 @@ def train(args):
         except Exception:
             pass
         with amp_ctx():
-            logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
+            logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits = model(ids, mask)
             # One-shot Hebbian update and recompute logits (before applying proto bias)
             try:
                 if int(getattr(args, "fast_enable", 1)) > 0:
@@ -2518,6 +2563,14 @@ def train(args):
                 from concept_learner.utils import select_pair_columns_safe
                 lp = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab")
                 probs = torch.softmax(lp, dim=-1)[:, 1].mean().item()
+                # action entropy snapshot
+                try:
+                    import torch.nn.functional as _F
+                    ap = _F.softmax(action_logits, dim=-1).clamp_min(1e-8)
+                    ent = (-(ap * ap.log()).sum(dim=-1)).mean().item()
+                    act_ent_hist.append(float(ent))
+                except Exception:
+                    pass
             # quick validation for best checkpoint tracking
             # VQ usage (unique codes per quantizer / codebook_size)
             vq_util = None
@@ -2646,7 +2699,10 @@ def train(args):
                     drop_flag = prev_eval_avg is not None and (avg_drop > drop_thr)
                     vq_flag = (avg_vq_chg is not None) and (avg_vq_chg > vq_thr)
                     prev_eval_avg = cur_avg
-                    if (drop_flag or vq_flag) and len(rb) > 0 and int(getattr(args, "wake_sleep", 1)) > 0:
+                    support_ok = True
+                    if comp_sleep_gate and comp_enabled:
+                        support_ok = (max(comp_support.values()) if len(comp_support) > 0 else 0) >= comp_support_min
+                    if (drop_flag or vq_flag) and support_ok and len(rb) > 0 and int(getattr(args, "wake_sleep", 1)) > 0:
                         print(
                             f"[on-demand sleep] step={step + 1} reason={'drop' if drop_flag else ''}{'+' if drop_flag and vq_flag else ''}{'vq' if vq_flag else ''} avg_drop={avg_drop:.4f} avg_vq_chg={avg_vq_chg if avg_vq_chg is not None else float('nan'):.3f}"
                         )
@@ -2782,6 +2838,77 @@ def train(args):
             print(
                 f"  eval in-dist={val_in:.3f} range-OOD={val_range:.3f} template-OOD={val_tood:.3f} boundary-OOD={acc_b:.3f}"
             )
+            # Composition scheduler tick (every comp_tick steps)
+            try:
+                if comp_enabled and comp_tick > 0 and ((step + 1) % comp_tick == 0):
+                    # Gates for Module A → B
+                    gates_ok = True
+                    if vq_util is None:
+                        pass
+                    # VQ stability: avg_vq_chg computed below in VQ diag block; recompute quickly if None
+                    avg_vq_chg_local = None
+                    try:
+                        ks = [model.rvq.codebook_size] * int(args.parallel_heads) + [model.rvq.serial_codebook_size] * int(args.serial_heads)
+                        changes_for_avg = []
+                        probe_ids = ids[: min(128, ids.size(0))]
+                        probe_mask = mask[: min(128, mask.size(0))]
+                        with torch.no_grad():
+                            _, _, _, ind1, _, _ = model(probe_ids, probe_mask)
+                            _, _, _, ind2, _, _ = model(probe_ids, probe_mask)
+                        for h in range(min(len(ind1), len(ks))):
+                            a1 = ind1[h].view(-1)
+                            a2 = ind2[h].view(-1)
+                            changed = (a1 != a2).float().mean().item()
+                            changes_for_avg.append(float(changed))
+                        if len(changes_for_avg) > 0:
+                            avg_vq_chg_local = float(sum(changes_for_avg) / len(changes_for_avg))
+                    except Exception:
+                        avg_vq_chg_local = None
+                    if avg_vq_chg_local is not None and avg_vq_chg_local > 0.30:
+                        gates_ok = False
+                    import math as _m
+                    if val_in < 0.60:
+                        gates_ok = False
+                    if not _m.isnan(float(val_range)) and abs(val_range - val_in) > 0.05:
+                        gates_ok = False
+                    # STOP and action entropy gates
+                    try:
+                        stop_p = torch.sigmoid(stop_logits).detach().cpu().numpy().mean()
+                        if not (0.18 <= stop_p <= 0.35):
+                            gates_ok = False
+                    except Exception:
+                        pass
+                    try:
+                        if len(act_ent_hist) >= 500:
+                            import numpy as _np
+                            med500 = _np.median(_np.array(act_ent_hist[:500], dtype=float))
+                            cur_ent = _np.median(_np.array(act_ent_hist[-min(200, len(act_ent_hist)):], dtype=float))
+                            if cur_ent < med500:
+                                gates_ok = False
+                    except Exception:
+                        pass
+                    if comp_stage == "A" and gates_ok:
+                        comp_stage = "B"
+                        comp_r = max(comp_r, float(getattr(args, "comp_entry", 0.30)))
+                    # Adaptive ramp in Module B
+                    if comp_stage == "B":
+                        telem = getattr(model.reasoner, "_telemetry", {})
+                        pct_d2 = float(telem.get("pct_depth_ge2", 0.0) or 0.0)
+                        avg_len = float(telem.get("avg_flat_len", 0.0) or 0.0)
+                        delta = 0.0
+                        if pct_d2 < 0.05 or avg_len < 1.5:
+                            delta = float(getattr(args, "comp_ramp_big", 0.10))
+                        elif 0.05 <= pct_d2 <= 0.15:
+                            delta = float(getattr(args, "comp_ramp_small", 0.05))
+                        else:
+                            # hold; small rollback if eval dips
+                            if abs(val_acc - prev_eval_avg) > float(getattr(args, "comp_eval_drop_thr", 0.03)) if (prev_eval_avg is not None) else False:
+                                delta = -float(getattr(args, "comp_ramp_small", 0.05))
+                        comp_r = float(min(float(getattr(args, "comp_max", 0.50)), max(float(getattr(args, "comp_min", 0.10)), comp_r + delta)))
+                    comp_support = {}
+                    print(f"  [comp] stage={comp_stage} r={comp_r:.2f} pct_d2={getattr(model.reasoner, '_telemetry', {}).get('pct_depth_ge2', 0.0)} avg_fn_len={getattr(model.reasoner, '_telemetry', {}).get('avg_flat_len', 0.0)}")
+            except Exception:
+                pass
             # Selection metric: if an OOD range is specified and evaluated, include it.
             sel_metric = val_acc
             try:
@@ -3360,6 +3487,21 @@ def main():
     pt.add_argument("--fast_eta", type=float, default=0.05, help="Hebbian learning rate eta")
     pt.add_argument("--fast_decay", type=float, default=0.90, help="Fast-weight decay per step")
     pt.add_argument("--fast_norm_max", type=float, default=1.0, help="Max Frobenius norm for fast weights")
+    # Composition scheduler & bursts
+    pt.add_argument("--comp_enable", type=int, default=1, help="Enable compositional data (1=on, 0=off)")
+    pt.add_argument("--comp_init", type=float, default=0.15, help="Initial composition share r in Module A")
+    pt.add_argument("--comp_entry", type=float, default=0.30, help="Composition share r when promoting to Module B")
+    pt.add_argument("--comp_min", type=float, default=0.10)
+    pt.add_argument("--comp_max", type=float, default=0.50)
+    pt.add_argument("--comp_tick", type=int, default=500, help="Update interval (steps) for adaptive ramp")
+    pt.add_argument("--comp_ramp_big", type=float, default=0.10, help="Increase to r when depth<5% or avg_len<1.5")
+    pt.add_argument("--comp_ramp_small", type=float, default=0.05, help="Increase to r when depth in [5%,15%]")
+    pt.add_argument("--comp_burst_every", type=int, default=400, help="Every N steps, inject compositional template bursts")
+    pt.add_argument("--comp_burst_groups", type=int, default=2, help="Number of burst groups per event")
+    pt.add_argument("--comp_burst_k_min", type=int, default=12)
+    pt.add_argument("--comp_burst_k_max", type=int, default=16)
+    pt.add_argument("--comp_support_min", type=int, default=8, help="Min same-template support to allow gated sleep")
+    pt.add_argument("--comp_sleep_gate", type=int, default=0, help="Gate on-demand sleep on composition support (1=on)")
     pt.add_argument(
         "--sched",
         type=str,

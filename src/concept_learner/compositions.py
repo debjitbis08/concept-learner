@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import random
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import torch
 
@@ -21,8 +21,8 @@ def _wrap(v: int, mod: int) -> int:
 
 
 def make_numeric_compositions(
-    n_items: int, batch: int, device: str | torch.device = "cpu"
-) -> Tuple[List[str], torch.Tensor]:
+    n_items: int, batch: int, device: str | torch.device = "cpu", force_kind: Optional[int] = None
+) -> Tuple[List[str], torch.Tensor, List[int]]:
     """
     Generate numeric-target composition questions and their targets.
 
@@ -35,11 +35,12 @@ def make_numeric_compositions(
       (texts, targets) where targets are in [0, n_items-1].
     """
     texts: List[str] = []
+    kinds_out: List[int] = []
     y = torch.zeros(batch, dtype=torch.long, device=device)
     A = torch.randint(0, max(1, n_items), (batch,), device=device).tolist()
 
     for i, a in enumerate(A):
-        kind = random.randrange(0, 8)
+        kind = int(force_kind) if force_kind is not None else random.randrange(0, 8)
         if kind == 0:  # succ(succ(a))
             r = _wrap(a + 2, n_items)
             txt = random.choice(
@@ -111,12 +112,13 @@ def make_numeric_compositions(
         # targets must be in [0, n_items-1]
         y[i] = int(r) if r < n_items else (r % n_items)
         texts.append(txt)
-    return texts, y
+        kinds_out.append(kind)
+    return texts, y, kinds_out
 
 
 def make_equality_compositions(
-    n_items: int, batch: int, device: str | torch.device = "cpu"
-) -> Tuple[List[str], torch.Tensor]:
+    n_items: int, batch: int, device: str | torch.device = "cpu", force_kind: Optional[int] = None
+) -> Tuple[List[str], torch.Tensor, List[int]]:
     """
     Generate yes/no equality questions with small compositions.
 
@@ -126,6 +128,7 @@ def make_equality_compositions(
       - "Is the successor of the ones digit of a equal to r?"
     """
     texts: List[str] = []
+    kinds_out: List[int] = []
     y = torch.zeros(batch, dtype=torch.long, device=device)
     A = torch.randint(0, max(1, n_items), (batch,), device=device).tolist()
     pos_mask = [False] * batch
@@ -134,7 +137,7 @@ def make_equality_compositions(
     random.shuffle(pos_mask)
 
     for i, a in enumerate(A):
-        kind = random.randrange(0, 8)
+        kind = int(force_kind) if force_kind is not None else random.randrange(0, 8)
         # compute the true result r_true according to kind
         if kind == 0:
             r_true = _wrap(a + 2, n_items)
@@ -188,5 +191,5 @@ def make_equality_compositions(
             y[i] = 0
         tmpl = random.choice(cand)
         texts.append(tmpl.format(b=b))
-    return texts, y
-
+        kinds_out.append(kind)
+    return texts, y, kinds_out
