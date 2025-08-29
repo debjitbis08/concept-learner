@@ -2269,9 +2269,9 @@ def evaluate(args):
     # canonical renderer
     def canonical(a: int, b: int, rname: str) -> str:
         if rname == "successor":
-            return f"succ({a}) == {a}+1 ?"
+            return f"succ({a}) == {b} ?"
         if rname == "predecessor":
-            return f"pred({a}) == {a}-1 ?"
+            return f"pred({a}) == {b} ?"
         if rname == "same_ones":
             return f"same_ones({a},{b}) ?"
         if rname == "same_tens":
@@ -2372,9 +2372,9 @@ def evaluate(args):
         except Exception:
             nm = str(r)
         if nm == "successor":
-            return f"succ({a}) == {a}+1 ?"
+            return f"succ({a}) == {b} ?"
         if nm == "predecessor":
-            return f"pred({a}) == {a}-1 ?"
+            return f"pred({a}) == {b} ?"
         if nm == "same_ones":
             return f"same_ones({a},{b}) ?"
         if nm == "same_tens":
