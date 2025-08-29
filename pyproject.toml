@@ -76,9 +76,9 @@ python scripts/train_episodes.py train \
   --lambda_vq 0.25 --lambda_stop 0.3 \
   --max_number 100 --train_range 0-79 --ood_range 80-99 \
   --frozen_mix --mix_ratio_id 0.45 --mix_ratio_bd 0.20 --mix_ratio_ood 0.25 --mix_ratio_cf 0.05 \
-  --replay_max_items 2048 --proto_beta 0.995 --proto_warmup 100 \
-  --mine_min_support 12 --mine_max_len 3 \
-  --resume runs/episodes_b10/best.pt
+  --replay_max_items 2048 --proto_beta 0.95 --proto_warmup 100 \
+  --mine_min_support 8 --mine_max_len 3 \
+  --resume runs/episodes_b10/latest.pt
 """
 setup = """
 apt update && apt upgrade -y

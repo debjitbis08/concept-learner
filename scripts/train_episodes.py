@@ -264,14 +264,16 @@ def _quick_eval(
             with torch.no_grad():
                 h, _ = model.enc(ids, mask)
                 ridge_logit = probe.predict_logit(h)
-                base_pair = logits_seq[:, [NO_IDX, YES_IDX]]
+                from concept_learner.utils import select_pair_columns_safe
+                base_pair = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab")
                 learned_logit = base_pair[:, 1] - base_pair[:, 0]
                 a = float(probe_alpha if probe_alpha is not None else getattr(probe, "alpha", 0.7))
                 blended = a * learned_logit + (1.0 - a) * ridge_logit
                 # decision by sign of blended logit
                 pred_bin = (blended > 0).long()
         else:
-            pred_bin = logits_seq[:, [NO_IDX, YES_IDX]].argmax(dim=-1)
+            from concept_learner.utils import select_pair_columns_safe
+            pred_bin = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab").argmax(dim=-1)
         correct += (pred_bin == y).sum().item()
         total += y.numel()
     model.train()
@@ -1256,7 +1258,8 @@ def train(args):
             ids_p, mask_p = _pack_symbolic_compare_text(aa, bb, oo, tok, max_len=seq_len)
             with torch.no_grad():
                 _, logits_p, _, _, _, _ = model(ids_p, mask_p)
-                lp = logits_p[:, [NO_IDX, YES_IDX]]
+                from concept_learner.utils import select_pair_columns_safe
+                lp = select_pair_columns_safe(logits_p, NO_IDX, YES_IDX, order="ab")
                 margin = (lp[:, 1] - lp[:, 0]).abs()  # |logit_yes - logit_no|
                 # smallest margins are hardest
                 idx_sel = torch.topk(-margin, k=n).indices
@@ -1784,7 +1787,8 @@ def train(args):
             with torch.no_grad():
                 ids_c, mask_c = ids_cmp, mask_cmp
             logits_cmp = model(ids_c, mask_c)[1]
-            yes_no = logits_cmp[:, [YES_IDX, NO_IDX]]
+            from concept_learner.utils import select_pair_columns_safe
+            yes_no = select_pair_columns_safe(logits_cmp, YES_IDX, NO_IDX, order="ab")
             logit_yes = yes_no[:, 0] - yes_no[:, 1]
             w = torch.where((a_cmp == b_cmp) | ((a_cmp - b_cmp).abs() <= 1), 1.3, 1.0)
             # focal-like weighting if skewed
@@ -2391,7 +2395,8 @@ def train(args):
 
         if (step + 1) % args.log_every == 0:
             with torch.no_grad():
-                lp = logits_seq[:, [NO_IDX, YES_IDX]]
+                from concept_learner.utils import select_pair_columns_safe
+                lp = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab")
                 probs = torch.softmax(lp, dim=-1)[:, 1].mean().item()
             # quick validation for best checkpoint tracking
             # VQ usage (unique codes per quantizer / codebook_size)
@@ -2636,7 +2641,8 @@ def train(args):
                         s_b = h_b
                     feat_b = ProtoRouter.build_feature(h_b, s_b, getattr(args, "proto_space", "typed"))
                     logits_b = proto.apply_bias(logits_b, feat_b, b_batch.get("rel").to(device), YES_IDX, NO_IDX, train_mode=False)
-                pred_b = logits_b[:, [NO_IDX, YES_IDX]].argmax(dim=-1)
+                from concept_learner.utils import select_pair_columns_safe
+                pred_b = select_pair_columns_safe(logits_b, NO_IDX, YES_IDX, order="ab").argmax(dim=-1)
                 acc_b = (
                     (pred_b == b_batch["label"].to(device)).float().mean().item()
                 )
@@ -2746,7 +2752,8 @@ def evaluate(args):
                 ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len)
                 y = batch["label"].to(device)
                 _, logits_seq_fit, _, _, _, _ = model(ids, mask)
-                lp = logits_seq_fit[:, [NO_IDX, YES_IDX]]
+                from concept_learner.utils import select_pair_columns_safe
+                lp = select_pair_columns_safe(logits_seq_fit, NO_IDX, YES_IDX, order="ab")
                 logits_stack.append(lp)
                 labels_stack.append(y)
             if len(logits_stack) > 0:
@@ -2809,7 +2816,8 @@ def evaluate(args):
                 logits_seq = torch.log(p_mix)
             except Exception:
                 pass
-        logits_pair = logits_seq[:, [NO_IDX, YES_IDX]] / T
+        from concept_learner.utils import select_pair_columns_safe
+        logits_pair = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab") / T
         pred = logits_pair.argmax(dim=-1)
         probs = torch.softmax(logits_pair, dim=-1)[:, 1]
         correct += (pred == y).sum().item()
@@ -2918,7 +2926,8 @@ def evaluate(args):
                 ids, mask = _pack_pair_questions_text(batch, tok, max_len=args.max_len, template_filter=tmpl_ood)
                 y = batch["label"].to(device)
                 _, logits_seq_r, _, _, _, _ = model(ids, mask)
-                logits_pair_r = logits_seq_r[:, [NO_IDX, YES_IDX]] / T
+                from concept_learner.utils import select_pair_columns_safe
+                logits_pair_r = select_pair_columns_safe(logits_seq_r, NO_IDX, YES_IDX, order="ab") / T
                 pred_r = logits_pair_r.argmax(dim=-1)
                 acc_r = (pred_r == y).float().mean().item()
                 print(f"  {rname:12s}: acc={acc_r:.3f}")
@@ -3025,7 +3034,8 @@ def evaluate(args):
     rel = batch.get("rel")
     rel = rel.tolist() if rel is not None else [None] * len(y)
     _, logits_seq, _, _, _, _ = model(ids, mask)
-    probs = torch.softmax(logits_seq[:, [NO_IDX, YES_IDX]], dim=-1)[:, 1].tolist()
+    from concept_learner.utils import select_pair_columns_safe
+    probs = torch.softmax(select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab"), dim=-1)[:, 1].tolist()
 
     def rel_name(r):
         names = [
@@ -3093,7 +3103,8 @@ def evaluate(args):
         NO_IDX = num_numbers + 1
         YES_IDX = num_numbers
         _, logits_seq_eq, _, _, _, _ = model(ids_eq, mask_eq)
-        probs_eq = torch.softmax(logits_seq_eq[:, [NO_IDX, YES_IDX]], dim=-1)[
+        from concept_learner.utils import select_pair_columns_safe
+        probs_eq = torch.softmax(select_pair_columns_safe(logits_seq_eq, NO_IDX, YES_IDX, order="ab"), dim=-1)[
             :, 1
         ].tolist()
         y_eq = y_eq.tolist()
