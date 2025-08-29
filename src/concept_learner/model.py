@@ -106,6 +106,11 @@ class CLModel(nn.Module):
         H_reasoned, s_final, stop_logits, action_logits = self.reasoner(
             H_cond, z_for_reason, mask
         )
+        # expose typed state for downstream consumers (e.g., proto routing)
+        try:
+            self.reasoner._last_s = s_final
+        except Exception:
+            pass
         val_final = getattr(self.reasoner, "_last_val", None)
         logits_tok, logits_seq = self.decoder(H_reasoned, mask, val=val_final)
         return logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits

@@ -5,6 +5,7 @@ import torch
 from typing import List
 from concept_learner.episodes import EpisodeConfig, EpisodeGenerator
 from concept_learner.model import CLModel
+from concept_learner.proto_router import ProtoRouter
 from concept_learner.tokenizer import HFTokenizerWrapper
 from concept_learner.trainer import (
     ReplayBuffer,
@@ -44,7 +45,7 @@ def _pack_pairs(a_desc, a_mask, b_desc, b_mask, device):
 
 
 def save_checkpoint(
-    path, model, opt, step, best_acc: float | None = None, ema_state: dict | None = None
+    path, model, opt, step, best_acc: float | None = None, ema_state: dict | None = None, proto_state: dict | None = None
 ):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     payload = {"model": model.state_dict(), "opt": opt.state_dict(), "step": step}
@@ -52,10 +53,12 @@ def save_checkpoint(
         payload["best_acc"] = float(best_acc)
     if ema_state is not None:
         payload["ema"] = ema_state
+    if proto_state is not None:
+        payload["proto"] = proto_state
     torch.save(payload, path)
 
 
-def load_checkpoint(path, model, opt, map_location=None, ema=None):
+def load_checkpoint(path, model, opt, map_location=None, ema=None, proto: ProtoRouter | None = None):
     ckpt = torch.load(path, map_location=map_location)
     sd = ckpt["model"]
     # expose best_acc to callers for resume logic
@@ -163,6 +166,11 @@ def load_checkpoint(path, model, opt, map_location=None, ema=None):
             load_checkpoint.loaded_ema = True
     except Exception:
         pass
+    try:
+        if proto is not None and isinstance(ckpt.get("proto"), dict):
+            proto.load_state_dict(ckpt["proto"])  # type: ignore[arg-type]
+    except Exception:
+        pass
     return int(ckpt.get("step", 0))
 
 
@@ -181,6 +189,8 @@ def _quick_eval(
     template_filter: dict | None = None,
     probe=None,
     probe_alpha: float | None = None,
+    proto: ProtoRouter | None = None,
+    proto_space: str = "typed",
 ) -> float:
     model.eval()
     total, correct = 0, 0
@@ -189,7 +199,29 @@ def _quick_eval(
         batch = gen.sample_posneg_pairs(batch=batch_size, allowed_relations=rel_ids, idx_range=idx_range)
         ids, mask = _pack_pair_questions_text(batch, tok, max_len, template_filter=template_filter)
         y = batch["label"].to(device)
-        _, logits_seq, _, _, _, _ = model(ids, mask)
+        logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits = model(ids, mask)
+        # Optional prototypical routing bias on YES/NO for pair relations
+        if proto is not None:
+            with torch.no_grad():
+                # Build normalized features per requested space
+                h_pool, _ = model.enc(ids, mask)
+                # s_final is exposed on reasoner last forward as return value
+                # Model.forward returns s_final in slot 2; keep consistent with above
+                # We recompute it via last call: we already captured return values.
+                # Use reasoner's _last_val? Stick to returned tensors to avoid ambiguity.
+                # logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits = ...
+                # We need s_final but model.forward returns it at index 2; to avoid interface changes,
+                # we read it from local variable where available via closure — not possible.
+                # Instead, reuse model.reasoner._last_s if present, else skip.
+                s_typed = getattr(model.reasoner, "_last_s", None)
+                if s_typed is None:
+                    # Fallback: approximate with h_pool if typed state not exposed
+                    s_typed = h_pool
+                feat = ProtoRouter.build_feature(h_pool, s_typed, proto_space)
+                YES_IDX = num_numbers
+                NO_IDX = num_numbers + 1
+                # Apply bias; do not update in eval
+                logits_seq = proto.apply_bias(logits_seq, feat, batch["rel"], YES_IDX, NO_IDX, train_mode=False)
         NO_IDX = num_numbers + 1
         YES_IDX = num_numbers
         if probe is not None and getattr(probe, "w", None) is not None:
@@ -800,7 +832,7 @@ def train(args):
     start_step = 0
     if args.resume and os.path.isfile(args.resume):
         start_step = load_checkpoint(
-            args.resume, model, opt, map_location=device, ema=None
+            args.resume, model, opt, map_location=device, ema=None, proto=None
         )
         print(f"Resumed from {args.resume} at step {start_step}")
         # initialize best_acc from checkpoint if present; else from a quick eval
@@ -832,6 +864,8 @@ def train(args):
                 relations=getattr(args, "relations", None),
                 idx_range=tr_range,
                 template_filter=tmpl_train,
+                proto=None,
+                proto_space=str(getattr(args, "proto_space", "typed")),
             )
             # quick counting eval baseline
             model.eval()
@@ -866,6 +900,8 @@ def train(args):
                         relations=getattr(args, "relations", None),
                         idx_range=od_range,
                         template_filter=tmpl_train,
+                        proto=None,
+                        proto_space=str(getattr(args, "proto_space", "typed")),
                     )
                 else:
                     val_range0 = float("nan")
@@ -1090,6 +1126,28 @@ def train(args):
         )
         meta = {"a": a, "b": b, "op": op, "y_bin": y_bin}
         return ids, mask, y, meta
+    # Initialize optional prototypical router
+    proto = None
+    if int(getattr(args, "proto_enable", 0)) > 0:
+        # feature dim is d_model regardless of space for (typed|pooled)
+        feat_dim = int(args.d_model)
+        proto = ProtoRouter(
+            num_relations=9,
+            feat_dim=feat_dim,
+            beta=float(getattr(args, "proto_beta", 0.98)),
+            weight=float(getattr(args, "proto_weight", 0.2)),
+            weight_end=float(getattr(args, "proto_weight_end", 0.1)),
+            decay_steps=int(getattr(args, "proto_decay_steps", 0)),
+            space=str(getattr(args, "proto_space", "typed")),
+            warmup=int(getattr(args, "proto_warmup", 50)),
+            device=device,
+        )
+        # If resuming, try to load proto state as well
+        if args.resume and os.path.isfile(args.resume):
+            try:
+                _ = load_checkpoint(args.resume, model, opt=None, map_location=device, proto=proto)
+            except Exception:
+                pass
     for step in range(start_step, args.steps):
         if args.sched == "cosine":
             set_cosine_lr(step)
@@ -1376,6 +1434,40 @@ def train(args):
         except Exception:
             pass
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
+        # Apply prototypical routing on the pair slice at the front (if enabled)
+        if proto is not None and ids_pairs.size(0) > 0:
+            with torch.no_grad():
+                h_all, _ = model.enc(ids, mask)
+                s_typed = getattr(model.reasoner, "_last_s", None)
+                if s_typed is None:
+                    s_typed = h_all
+                feat_all = ProtoRouter.build_feature(h_all, s_typed, getattr(args, "proto_space", "typed"))
+            YES_IDX = num_numbers
+            NO_IDX = num_numbers + 1
+            # update + bias only for the pair segment at the front
+            if not args.frozen_mix:
+                rel_ids_pairs = batch["rel"]
+            else:
+                rel_list = []
+                for k in ["id", "bd", "ood", "cf"]:
+                    if comp_splits.get(k) is None:
+                        continue
+                    meta_k = comp_splits[k][3]
+                    # op: 0-> '>' (greater:7), 1-> '<' (smaller:8)
+                    op_k = meta_k.get("op").to(device)
+                    rel_k = torch.where(op_k == 0, torch.full_like(op_k, 7), torch.full_like(op_k, 8))
+                    rel_list.append(rel_k)
+                rel_ids_pairs = torch.cat(rel_list, dim=0) if len(rel_list) > 0 else torch.full((ids_pairs.size(0),), -1, device=device, dtype=torch.long)
+            # guard shape
+            rel_ids_pairs = rel_ids_pairs.to(device) if rel_ids_pairs is not None else torch.full((ids_pairs.size(0),), -1, device=device, dtype=torch.long)
+            logits_seq[: ids_pairs.size(0)] = proto.apply_bias(
+                logits_seq[: ids_pairs.size(0)],
+                feat_all[: ids_pairs.size(0)],
+                rel_ids_pairs[: ids_pairs.size(0)],
+                YES_IDX,
+                NO_IDX,
+                train_mode=True,
+            )
 
         # If frozen mix is enabled, compute separate CE losses for each compare split and reweight
         loss_seq = torch.nn.functional.cross_entropy(
@@ -1862,6 +1954,8 @@ def train(args):
                 relations=getattr(args, "relations", None),
                 probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
                 probe_alpha=getattr(args, "probe_alpha", 0.7),
+                proto=proto,
+                proto_space=str(getattr(args, "proto_space", "typed")),
             )
             # quick counting eval
             model.eval()
@@ -1999,6 +2093,8 @@ def train(args):
                 template_filter=tmpl_train,
                 probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
                 probe_alpha=getattr(args, "probe_alpha", 0.7),
+                proto=proto,
+                proto_space=str(getattr(args, "proto_space", "typed")),
             )
             val_range = (
                 _quick_eval(
@@ -2015,6 +2111,8 @@ def train(args):
                     template_filter=tmpl_train,
                     probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
                     probe_alpha=getattr(args, "probe_alpha", 0.7),
+                    proto=proto,
+                    proto_space=str(getattr(args, "proto_space", "typed")),
                 )
                 if ood_range is not None
                 else float("nan")
@@ -2033,6 +2131,8 @@ def train(args):
                 template_filter=tmpl_ood,
                 probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
                 probe_alpha=getattr(args, "probe_alpha", 0.7),
+                proto=proto,
+                proto_space=str(getattr(args, "proto_space", "typed")),
             )
             # boundary-OOD
             b_batch = gen.sample_posneg_pairs_boundary(
@@ -2043,6 +2143,13 @@ def train(args):
             )
             with torch.no_grad():
                 _, logits_b, _, _, _, _ = model(ids_b, mask_b)
+                if proto is not None:
+                    h_b, _ = model.enc(ids_b, mask_b)
+                    s_b = getattr(model.reasoner, "_last_s", None)
+                    if s_b is None:
+                        s_b = h_b
+                    feat_b = ProtoRouter.build_feature(h_b, s_b, getattr(args, "proto_space", "typed"))
+                    logits_b = proto.apply_bias(logits_b, feat_b, b_batch.get("rel").to(device), YES_IDX, NO_IDX, train_mode=False)
                 pred_b = logits_b[:, [NO_IDX, YES_IDX]].argmax(dim=-1)
                 acc_b = (
                     (pred_b == b_batch["label"].to(device)).float().mean().item()
@@ -2076,6 +2183,7 @@ def train(args):
                     step + 1,
                     best_acc=best_acc,
                     ema_state=ema_state,
+                    proto_state=(proto.state_dict() if proto is not None else None),
                 )
                 print(
                     f"  Saved best checkpoint: {best_path} (sel={best_acc:.3f}, avg={val_acc:.3f})"
@@ -2085,7 +2193,7 @@ def train(args):
             ema_state = ema.state_dict() if ema is not None else None
             if args.save_all_checkpoints:
                 ckpt_path = os.path.join(args.save_dir, f"ckpt_step_{step + 1}.pt")
-                save_checkpoint(ckpt_path, model, opt, step + 1, ema_state=ema_state)
+                save_checkpoint(ckpt_path, model, opt, step + 1, ema_state=ema_state, proto_state=(proto.state_dict() if proto is not None else None))
             latest = os.path.join(args.save_dir, "latest.pt")
             save_checkpoint(
                 latest,
@@ -2094,6 +2202,7 @@ def train(args):
                 step + 1,
                 best_acc=best_acc if best_acc >= 0 else None,
                 ema_state=ema_state,
+                proto_state=(proto.state_dict() if proto is not None else None),
             )
 
 
@@ -2632,6 +2741,14 @@ def main():
     pt.add_argument("--hard_mine_pct", type=float, default=0.25, help="Fraction in boundary/OOD buckets to select as hardest based on margin")
     # Cosine warm restart step (0 to disable)
     pt.add_argument("--cosine_restart_step", type=int, default=0)
+    # Prototypical routing knobs
+    pt.add_argument("--proto_enable", type=int, default=1, help="Enable prototypical routing on pair relations (1=on, 0=off)")
+    pt.add_argument("--proto_space", type=str, choices=["typed", "pooled"], default="typed", help="Feature space for prototypes: typed-state or encoder pooled")
+    pt.add_argument("--proto_beta", type=float, default=0.98, help="EMA decay for prototypes (0..1)")
+    pt.add_argument("--proto_weight", type=float, default=0.2, help="Initial bias weight w")
+    pt.add_argument("--proto_weight_end", type=float, default=0.1, help="Final bias weight w_end for decay (set equal to keep constant)")
+    pt.add_argument("--proto_decay_steps", type=int, default=0, help="Linear decay steps from w to w_end (0 disables decay)")
+    pt.add_argument("--proto_warmup", type=int, default=50, help="Per-relation count warmup before applying bias")
 
     pe = sub.add_parser("eval", help="Evaluate from a checkpoint")
     add_shared(pe)
