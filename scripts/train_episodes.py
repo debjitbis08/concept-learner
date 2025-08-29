@@ -1540,7 +1540,22 @@ def train(args):
             y = torch.cat([y, y_ncmp], dim=0)
         except Exception:
             pass
+        # Reset fast-weights per episode (batch) before forward
+        try:
+            if int(getattr(args, "fast_enable", 1)) > 0:
+                model.decoder.reset_fast()
+        except Exception:
+            pass
         logits_tok, logits_seq, vq_loss, indices, stop_logits, _ = model(ids, mask)
+        # One-shot Hebbian update and recompute logits (before applying proto bias)
+        try:
+            if int(getattr(args, "fast_enable", 1)) > 0:
+                model.decoder.hebbian_update(y)
+                logits_seq2 = model.decoder.recompute_seq_logits()
+                if logits_seq2 is not None:
+                    logits_seq = logits_seq2
+        except Exception:
+            pass
         # Apply prototypical routing on the pair slice at the front (if enabled)
         if proto is not None and ids_pairs.size(0) > 0:
             with torch.no_grad():
@@ -2988,6 +3003,11 @@ def main():
     pt.add_argument("--ema_decay_after", type=int, default=10000, help="Step after which to increase EMA decay")
     pt.add_argument("--ema_decay_final", type=float, default=0.997, help="Final EMA decay after schedule step")
     pt.add_argument("--lambda_fn_use", type=float, default=0.05, help="Aux reward weight for using functions (percent of episodes)")
+    # Fast-weights (Hebbian) for sequence head
+    pt.add_argument("--fast_enable", type=int, default=1, help="Enable per-episode fast-weights on classifier")
+    pt.add_argument("--fast_eta", type=float, default=0.05, help="Hebbian learning rate eta")
+    pt.add_argument("--fast_decay", type=float, default=0.90, help="Fast-weight decay per step")
+    pt.add_argument("--fast_norm_max", type=float, default=1.0, help="Max Frobenius norm for fast weights")
     pt.add_argument(
         "--sched",
         type=str,
