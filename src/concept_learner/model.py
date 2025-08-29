@@ -145,6 +145,8 @@ class FiLM(nn.Module):
     def forward(self, H, z):
         s = torch.sigmoid(self.strength)
         gamma = self.gamma_net(z).unsqueeze(1) * s
+        # Clamp FiLM scale to keep routing stable
+        gamma = torch.clamp(gamma, min=-2.0, max=2.0)
         beta = self.beta_net(z).unsqueeze(1) * s
         return self.post_ln(H * (1 + gamma) + beta)
 

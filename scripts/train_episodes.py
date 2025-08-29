@@ -2005,6 +2005,15 @@ def train(args):
                 for p_t, p_s in zip(model.num_head_teacher.parameters(), model.num_head.parameters()):
                     p_t.copy_(m * p_t + (1.0 - m) * p_s)
 
+        # VQ hygiene: periodic dead-code reinit
+        try:
+            if (step + 1) % int(getattr(args, "vq_reinit_every", 2000)) == 0:
+                nreset = model.rvq.reinit_dead_codes(step + 1, util_floor=float(getattr(args, "vq_util_floor", 0.02)), min_interval=int(getattr(args, "vq_reinit_every", 2000)))
+                if nreset > 0:
+                    print(f"[vq] step={step + 1} reinitialized {nreset} dead codes")
+        except Exception:
+            pass
+
         # TTL tick for drafted temporary functions
         try:
             model.reasoner.ttl_tick(1)
@@ -3184,6 +3193,9 @@ def main():
     pt.add_argument("--save_dir", type=str, default="runs/episodes")
     pt.add_argument("--ckpt_every", type=int, default=200)
     pt.add_argument("--log_every", type=int, default=50)
+    # VQ hygiene
+    pt.add_argument("--vq_util_floor", type=float, default=0.02, help="Utilization floor to consider a code dead (0..1)")
+    pt.add_argument("--vq_reinit_every", type=int, default=2000, help="Reinitialize dead codes every N steps (cool-down)")
     pt.add_argument("--save_knn", type=int, default=0, help="Include kNN snapshot in checkpoints (0=off,1=on)")
     pt.add_argument("--save_knn_best", type=int, default=1, help="Save kNN snapshot with best.pt")
     pt.add_argument("--save_knn_every", type=int, default=0, help="Also save kNN snapshot every N steps (0 disables)")

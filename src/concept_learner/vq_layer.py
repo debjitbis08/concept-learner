@@ -112,6 +112,28 @@ class ResidualVQLayer(nn.Module):
         out_dim = int(out_dim or in_dim)
         final_in_dim = concat_dim * (1 + self.num_serial)
         self.proj_out = nn.Linear(final_in_dim, out_dim)
+        # --- Utilization EMA for hygiene ---
+        if self.num_parallel_heads > 0:
+            self.register_buffer(
+                "util_ema_parallel",
+                torch.zeros(self.num_parallel_heads, self.codebook_size),
+                persistent=False,
+            )
+        else:
+            self.util_ema_parallel = None
+        if self.num_serial > 0:
+            self.register_buffer(
+                "util_ema_serial",
+                torch.zeros(self.num_serial, self.serial_codebook_size),
+                persistent=False,
+            )
+        else:
+            self.util_ema_serial = None
+        self.util_decay = 0.99
+        self._last_reinit_step = -10**9
+        # caches of latest pre-quant inputs for reinit sampling
+        self._cache_z_parallel: list[torch.Tensor] | None = None
+        self._cache_u_serial: list[torch.Tensor] | None = None
 
     def _entropy_bonus(self, indices_list, K_list) -> torch.Tensor:
         if self.entropy_weight <= 0:
@@ -154,7 +176,8 @@ class ResidualVQLayer(nn.Module):
         parallel_embs: list[torch.Tensor] = []
         total_loss = torch.tensor(0.0, device=x.device)
 
-        for proj, vq in zip(self.parallel_proj, self.parallel_vq):
+        self._cache_z_parallel = []
+        for hi, (proj, vq) in enumerate(zip(self.parallel_proj, self.parallel_vq)):
             z = proj(x)  # (B, L, d_i)
             if self.training and self.pre_vq_noise_std > 0:
                 z = z + torch.randn_like(z) * self.pre_vq_noise_std
@@ -162,6 +185,15 @@ class ResidualVQLayer(nn.Module):
             parallel_embs.append(e)
             parallel_indices.append(idx)
             total_loss = total_loss + loss
+            self._cache_z_parallel.append(z.detach())
+            # update util ema
+            if self.util_ema_parallel is not None:
+                K = self.codebook_size
+                cnt = torch.bincount(idx.view(-1), minlength=K).float()
+                self.util_ema_parallel[hi] = (
+                    self.util_ema_parallel[hi] * self.util_decay
+                    + (1.0 - self.util_decay) * cnt
+                )
 
         c = (
             torch.cat(parallel_embs, dim=-1)
@@ -173,7 +205,8 @@ class ResidualVQLayer(nn.Module):
         serial_indices: list[torch.Tensor] = []
         serial_embs: list[torch.Tensor] = []
         current = c
-        for stage in self.serial:
+        self._cache_u_serial = []
+        for si, stage in enumerate(self.serial):
             u = stage["mlp"](current)
             if self.training and self.pre_vq_noise_std > 0:
                 u = u + torch.randn_like(u) * self.pre_vq_noise_std
@@ -182,6 +215,14 @@ class ResidualVQLayer(nn.Module):
             serial_indices.append(idx)
             total_loss = total_loss + loss
             current = torch.cat([current, e], dim=-1)
+            self._cache_u_serial.append(u.detach())
+            if self.util_ema_serial is not None:
+                K = self.serial_codebook_size
+                cnt = torch.bincount(idx.view(-1), minlength=K).float()
+                self.util_ema_serial[si] = (
+                    self.util_ema_serial[si] * self.util_decay
+                    + (1.0 - self.util_decay) * cnt
+                )
 
         # Final representation and projection back to out_dim
         all_feats = [c] + serial_embs
@@ -212,3 +253,80 @@ class ResidualVQLayer(nn.Module):
         if total_loss.ndim != 0:
             total_loss = total_loss.mean()
         return z_q, indices_list, total_loss
+
+    @torch.no_grad()
+    def _get_codebook_tensor(self, vq: VectorQuantize) -> torch.Tensor | None:
+        """Best-effort access to underlying codebook weight tensor."""
+        cands = [
+            getattr(vq, "codebook", None),
+            getattr(vq, "_codebook", None),
+        ]
+        for cb in cands:
+            if cb is None:
+                continue
+            for name in ["weight", "weights", "embed", "embeddings"]:
+                t = getattr(cb, name, None)
+                if isinstance(t, torch.Tensor):
+                    return t
+        # some versions expose directly vq.embeddings
+        for name in ["embeddings", "embed", "codebook"]:
+            t = getattr(vq, name, None)
+            if isinstance(t, torch.Tensor):
+                return t
+        return None
+
+    @torch.no_grad()
+    def reinit_dead_codes(self, step: int, util_floor: float = 0.02, min_interval: int = 2000):
+        """Reinitialize codes whose utilization fraction falls below util_floor.
+
+        Uses cached pre-quant inputs from the most recent forward pass to sample
+        replacements. Cool-down via min_interval to avoid flicker.
+        """
+        if (step - self._last_reinit_step) < int(min_interval):
+            return 0
+        nreset = 0
+        # Parallel heads
+        if self.util_ema_parallel is not None and self._cache_z_parallel is not None:
+            for hi, (vq, zc) in enumerate(zip(self.parallel_vq, self._cache_z_parallel)):
+                counts = self.util_ema_parallel[hi]
+                total = counts.sum().item()
+                if total <= 0:
+                    continue
+                util = counts / (total + 1e-8)
+                dead = (util < float(util_floor)).nonzero(as_tuple=False).view(-1)
+                if dead.numel() == 0:
+                    continue
+                cb = self._get_codebook_tensor(vq)
+                if cb is None:
+                    continue
+                # sample replacements from cached z
+                Z = zc.reshape(-1, zc.size(-1))
+                if Z.size(0) == 0:
+                    Z = torch.randn(cb.size(0), cb.size(1), device=cb.device)
+                idx = torch.randint(0, Z.size(0), (dead.numel(),), device=cb.device)
+                cb.data[dead] = Z[idx].to(cb.dtype)
+                nreset += int(dead.numel())
+        # Serial heads
+        if self.util_ema_serial is not None and self._cache_u_serial is not None:
+            for si, (stage, uc) in enumerate(zip(self.serial, self._cache_u_serial)):
+                counts = self.util_ema_serial[si]
+                total = counts.sum().item()
+                if total <= 0:
+                    continue
+                util = counts / (total + 1e-8)
+                dead = (util < float(util_floor)).nonzero(as_tuple=False).view(-1)
+                if dead.numel() == 0:
+                    continue
+                vq = stage["vq"]
+                cb = self._get_codebook_tensor(vq)
+                if cb is None:
+                    continue
+                U = uc.reshape(-1, uc.size(-1))
+                if U.size(0) == 0:
+                    U = torch.randn(cb.size(0), cb.size(1), device=cb.device)
+                idx = torch.randint(0, U.size(0), (dead.numel(),), device=cb.device)
+                cb.data[dead] = U[idx].to(cb.dtype)
+                nreset += int(dead.numel())
+        if nreset > 0:
+            self._last_reinit_step = int(step)
+        return nreset
