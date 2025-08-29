@@ -68,7 +68,7 @@ test = "pytest -q"
 lint = "ruff check --fix src"
 train = """
 python scripts/train_episodes.py train \
-  --steps 15000 --base10 --batch_size 512 --d_model 256 \
+  --steps 15000 --base10 --batch_size 256 --d_model 256 --amp \
   --save_dir runs/episodes_b10 \
   --ckpt_every 500 --log_every 100 \
   --lr 8e-5 --sched cosine --warmup_ratio 0.03 --min_lr 1e-6 \
