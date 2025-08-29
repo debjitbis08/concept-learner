@@ -1100,16 +1100,50 @@ def train(args):
             b = _sample_by_width(n, widths, idx_range)
         # boundary: force |a-b| in {0,1} and include a few special patterns
         if kind == 'bd':
-            # half equal, half ±1
-            half = n // 2
-            a[:half] = a[:half]
-            b[:half] = a[:half]
-            rem = n - half
-            if rem > 0:
-                a[half:] = a[half:]
-                delta = torch.randint(0, 2, (rem,), device=device)
-                delta = torch.where(delta == 0, torch.tensor(-1, device=device), torch.tensor(1, device=device))
-                b[half:] = (a[half:] + delta).clamp(0, gen.n_items - 1)
+            # Rebuild boundary set legitimately: avoid edges; balanced by construction; include counterfactual flips
+            lo_safe = 1 if idx_range is None else max(1, int(idx_range[0]) + 1)
+            hi_safe = (gen.n_items - 2) if idx_range is None else min(gen.n_items - 2, int(idx_range[1]) - 1)
+            m = max(2, (n // 2) * 2)
+            half = m // 2
+            a0 = torch.randint(lo_safe, hi_safe + 1, (half,), device=device)
+            # half positives, half negatives for '>'/'<' chosen later by op
+            pos_mask = torch.zeros(half, dtype=torch.bool, device=device); pos_mask[: half // 2] = True
+            pos_mask = pos_mask[torch.randperm(half, device=device)]
+            # Randomly assign op per item
+            op0 = torch.randint(0, 2, (half,), device=device)  # 0:'>', 1:'<'
+            b0 = torch.empty_like(a0)
+            yb0 = torch.empty_like(a0)
+            for i in range(half):
+                if op0[i] == 0:  # greater
+                    if pos_mask[i]:
+                        b0[i] = a0[i] - 1
+                        yb0[i] = 1
+                    else:
+                        b0[i] = a0[i] if torch.rand(1, device=device).item() < 0.5 else a0[i] + 1
+                        yb0[i] = 0
+                else:  # smaller
+                    if pos_mask[i]:
+                        b0[i] = a0[i] + 1
+                        yb0[i] = 1
+                    else:
+                        b0[i] = a0[i] if torch.rand(1, device=device).item() < 0.5 else a0[i] - 1
+                        yb0[i] = 0
+            # Counterfactual flips
+            a1 = a0.clone(); op1 = op0.clone(); yb1 = 1 - yb0
+            b1 = torch.empty_like(b0)
+            for i in range(half):
+                if op0[i] == 0:
+                    b1[i] = a0[i] if yb0[i] == 1 else a0[i] - 1
+                else:
+                    b1[i] = a0[i] if yb0[i] == 1 else a0[i] + 1
+            # combine and trim
+            A = torch.cat([a0, a1], dim=0)
+            B = torch.cat([b0, b1], dim=0)
+            OO = torch.cat([op0, op1], dim=0)
+            YY = torch.cat([yb0, yb1], dim=0)
+            perm = torch.randperm(A.size(0), device=device)
+            sel = perm[:n]
+            a = A[sel]; b = B[sel]; op = OO[sel]; y_bin = YY[sel]
         # counterfactual flips: start from in-dist and tilt by ±1 to flip
         op = torch.randint(0, 2, (n,), device=device)  # 0:'>', 1:'<'
         y_bin = torch.where(op == 0, (a > b).long(), (a < b).long())

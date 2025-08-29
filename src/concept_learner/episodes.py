@@ -225,59 +225,92 @@ class EpisodeGenerator:
     ) -> Dict[str, torch.Tensor]:
         device = self.cfg.device
         n = batch
+        # Safe sampling range to avoid boundary artifacts
         if idx_range is None:
-            a = torch.randint(0, self.n_items, (n,), device=device)
+            lo_safe, hi_safe = 1, max(1, self.n_items - 2)
         else:
             lo, hi = int(idx_range[0]), int(idx_range[1])
             hi = min(hi, self.n_items - 1)
             lo = max(0, lo)
             if hi < lo:
                 lo, hi = 0, self.n_items - 1
-            a = torch.randint(lo, hi + 1, (n,), device=device)
+            lo_safe = max(1, lo + 1)
+            hi_safe = max(lo_safe, min(self.n_items - 2, hi - 1))
+        # Half base items; we will add their counterfactual flips to reach n
+        m = max(2, (n // 2) * 2)
+        half = m // 2
+        a_base = torch.randint(lo_safe, hi_safe + 1, (half,), device=device)
         rel_choices = torch.tensor(list(relations), device=device)
-        sel = torch.randint(0, len(rel_choices), (n,), device=device)
-        rel = rel_choices[sel]
-        diff_choices = torch.tensor(list(diffs), device=device)
-        sel_d = torch.randint(0, len(diff_choices), (n,), device=device)
-        d = diff_choices[sel_d]
-        y = torch.zeros(n, dtype=torch.long, device=device)
-        b = torch.zeros_like(a)
-        pos_mask = torch.zeros(n, dtype=torch.bool, device=device)
-        pos_mask[: n // 2] = True
-        pos_mask = pos_mask[torch.randperm(n, device=device)]
-        for i in range(n):
-            ai = int(a[i].item())
-            ri = int(rel[i].item())
-            di = int(d[i].item())
+        rel_base = rel_choices[torch.randint(0, len(rel_choices), (half,), device=device)]
+        # Balanced positives/negatives
+        pos_mask = torch.zeros(half, dtype=torch.bool, device=device)
+        pos_mask[: half // 2] = True
+        pos_mask = pos_mask[torch.randperm(half, device=device)]
+        b_base = torch.empty_like(a_base)
+        y_base = torch.empty_like(a_base)
+        # Use only diffs in {0,1} for boundary; treat 0 as equal for negatives
+        for i in range(half):
+            ai = int(a_base[i].item())
+            ri = int(rel_base[i].item())
             if ri == 7:  # greater
                 if pos_mask[i]:
-                    di = max(1, di)
-                    bi = max(0, ai - di)
-                    y[i] = 1
+                    bi = ai - 1  # ensure within [lo_safe-1, hi_safe+1]; ai>=1 guaranteed
+                    y_base[i] = 1
                 else:
-                    bi = min(self.n_items - 1, ai + di)
-                    y[i] = 0
+                    bi = ai if torch.rand(1, device=device).item() < 0.5 else ai + 1
+                    y_base[i] = 0
             else:  # smaller
                 if pos_mask[i]:
-                    di = max(1, di)
-                    bi = min(self.n_items - 1, ai + di)
-                    y[i] = 1
+                    bi = ai + 1
+                    y_base[i] = 1
                 else:
-                    bi = max(0, ai - di)
-                    y[i] = 0
-            b[i] = bi
-        a_desc, a_mask, a_base = self._render_batch(a)
-        b_desc, b_mask, b_base = self._render_batch(b)
+                    bi = ai if torch.rand(1, device=device).item() < 0.5 else ai - 1
+                    y_base[i] = 0
+            bi = min(max(bi, lo_safe - 1), hi_safe + 1)
+            b_base[i] = bi
+        # Counterfactual flips: invert boundary direction for each base item
+        a_cf = a_base.clone()
+        rel_cf = rel_base.clone()
+        y_cf = 1 - y_base
+        b_cf = torch.empty_like(b_base)
+        for i in range(half):
+            ai = int(a_base[i].item())
+            ri = int(rel_base[i].item())
+            if ri == 7:  # greater
+                # If base was positive (b=ai-1), flip to b>=ai; else flip to b=ai-1
+                if y_base[i] == 1:
+                    b_cf[i] = ai if torch.rand(1, device=device).item() < 0.5 else ai + 1
+                else:
+                    b_cf[i] = ai - 1
+            else:  # smaller
+                if y_base[i] == 1:
+                    b_cf[i] = ai if torch.rand(1, device=device).item() < 0.5 else ai - 1
+                else:
+                    b_cf[i] = ai + 1
+            b_cf[i] = min(max(int(b_cf[i].item()), lo_safe - 1), hi_safe + 1)
+        # Combine and trim to n
+        a_all = torch.cat([a_base, a_cf], dim=0)
+        b_all = torch.cat([b_base, b_cf], dim=0)
+        rel_all = torch.cat([rel_base, rel_cf], dim=0)
+        y_all = torch.cat([y_base, y_cf], dim=0)
+        # Shuffle and take first n
+        perm = torch.randperm(a_all.size(0), device=device)
+        a = a_all[perm][:n]
+        b = b_all[perm][:n]
+        rel = rel_all[perm][:n]
+        y = y_all[perm][:n]
+        a_desc, a_mask, a_base_tok = self._render_batch(a)
+        b_desc, b_mask, b_base_tok = self._render_batch(b)
         return {
             "a_idx": a,
             "b_idx": b,
             "rel": rel,
             "a_desc": a_desc,
             "a_mask": a_mask,
-            "a_base": a_base,
+            "a_base": a_base_tok,
             "b_desc": b_desc,
             "b_mask": b_mask,
-            "b_base": b_base,
+            "b_base": b_base_tok,
             "label": y,
             "domain": torch.zeros(n, dtype=torch.long, device=self.cfg.device),
         }
