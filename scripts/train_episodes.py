@@ -2306,7 +2306,7 @@ def evaluate(args):
 
     # Rich, compact evaluation report
     try:
-        from eval_report import print_eval_report
+        from concept_learner.eval_report import print_eval_report
         print_eval_report(rows, threshold_used=used_thr)
     except Exception as _e:
         # Fallback to old per-relation summary if report import fails
