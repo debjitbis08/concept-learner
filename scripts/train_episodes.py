@@ -1296,16 +1296,16 @@ def train(args):
                     ema.decay = float(getattr(args, "ema_decay_final", ema.decay))
             except Exception:
                 pass
-    if args.sched == "cosine":
-        set_cosine_lr(step)
-    # Apply head LR multiplier during early steps
-    def _apply_head_lr(step_idx: int):
-        base_lr = opt.param_groups[0]["lr"] if len(opt.param_groups) > 0 else args.lr
-        mult = 2.0 if step_idx < int(getattr(args, "head_boost_steps", 5000)) else 1.0
-        for g in opt.param_groups:
-            is_head = bool(g.get("is_head", False))
-            g["lr"] = base_lr * (mult if is_head else 1.0)
-    _apply_head_lr(step)
+        if args.sched == "cosine":
+            set_cosine_lr(step)
+        # Apply head LR multiplier during early steps
+        def _apply_head_lr(step_idx: int):
+            base_lr = opt.param_groups[0]["lr"] if len(opt.param_groups) > 0 else args.lr
+            mult = 2.0 if step_idx < int(getattr(args, "head_boost_steps", 5000)) else 1.0
+            for g in opt.param_groups:
+                is_head = bool(g.get("is_head", False))
+                g["lr"] = base_lr * (mult if is_head else 1.0)
+        _apply_head_lr(step)
         rel_arg = getattr(args, "relations", None)
         rel_ids = _parse_relations_arg(rel_arg)
         # If no --relations provided, train on all pair relations (0..8).
