@@ -191,6 +191,10 @@ def _quick_eval(
     probe_alpha: float | None = None,
     proto: ProtoRouter | None = None,
     proto_space: str = "typed",
+    knn=None,
+    knn_space: str = "typed",
+    knn_alpha: float | None = None,
+    knn_alpha_end: float | None = None,
 ) -> float:
     model.eval()
     total, correct = 0, 0
@@ -224,6 +228,21 @@ def _quick_eval(
                 logits_seq = proto.apply_bias(logits_seq, feat, batch["rel"], YES_IDX, NO_IDX, train_mode=False)
         NO_IDX = num_numbers + 1
         YES_IDX = num_numbers
+        # Optional kNN posterior mixing on full classes
+        if knn is not None:
+            with torch.no_grad():
+                h_pool, _ = model.enc(ids, mask)
+                s_typed = getattr(model.reasoner, "_last_s", None)
+                if s_typed is None:
+                    s_typed = h_pool
+                feat = ProtoRouter.build_feature(h_pool, s_typed, knn_space)
+                p_model = torch.softmax(logits_seq, dim=-1)
+                p_knn = knn.posterior(feat)
+                a = float(knn_alpha if knn_alpha is not None else 0.2)
+                a_end = float(knn_alpha_end if knn_alpha_end is not None else a)
+                # Use provided alpha (caller may pass decayed value)
+                p = (a * p_model + (1.0 - a) * p_knn).clamp_min(1e-8)
+                logits_seq = torch.log(p)
         if probe is not None and getattr(probe, "w", None) is not None:
             # Blend learned head with ridge probe
             with torch.no_grad():
@@ -1219,6 +1238,8 @@ def train(args):
         return ids, mask, y, meta
     # Initialize optional prototypical router
     proto = None
+    from concept_learner.knn_memory import KNNSoftClassifier
+    knn = None
     if int(getattr(args, "proto_enable", 0)) > 0:
         # feature dim is d_model regardless of space for (typed|pooled)
         feat_dim = int(args.d_model)
@@ -1554,6 +1575,48 @@ def train(args):
                 logits_seq2 = model.decoder.recompute_seq_logits()
                 if logits_seq2 is not None:
                     logits_seq = logits_seq2
+        except Exception:
+            pass
+
+        # kNN posterior mixing (train-time optional) and memory update
+        try:
+            if knn is None and int(getattr(args, "knn_enable", 1)) > 0:
+                # determine feature dim from space
+                d = args.d_model
+                feat_dim = d if getattr(args, 'knn_space', 'typed') != 'concat' else (2 * d)
+                knn = KNNSoftClassifier(
+                    num_classes=num_numbers + 4,
+                    feat_dim=feat_dim,
+                    capacity=int(getattr(args, 'knn_capacity', 10000)),
+                    k=int(getattr(args, 'knn_k', 32)),
+                    tau=float(getattr(args, 'knn_tau', 0.2)),
+                    device=device,
+                ).to(device)
+            if knn is not None:
+                # build features
+                with torch.no_grad():
+                    h_pool, _H = model.enc(ids, mask)
+                    s_typed = getattr(model.reasoner, "_last_s", None)
+                    if s_typed is None:
+                        s_typed = h_pool
+                    from concept_learner.proto_router import ProtoRouter as _PR
+                    feat = _PR.build_feature(h_pool, s_typed, getattr(args, 'knn_space', 'typed'))
+                # update memory with current batch
+                knn.add(feat, y)
+                # apply mixing if not eval-only
+                if int(getattr(args, 'knn_eval_only', 1)) == 0:
+                    alpha = float(getattr(args, 'knn_alpha', 0.2))
+                    dec = int(getattr(args, 'knn_alpha_decay_steps', 0))
+                    a_end = float(getattr(args, 'knn_alpha_end', 0.1))
+                    if dec > 0:
+                        t = min(1.0, max(0.0, (step - start_step) / float(max(1, dec))))
+                        alpha = (1.0 - t) * alpha + t * a_end
+                    with torch.no_grad():
+                        p_model = torch.softmax(logits_seq, dim=-1)
+                        p_knn = knn.posterior(feat)
+                        p_mix = (alpha * p_model + (1.0 - alpha) * p_knn).clamp_min(1e-8)
+                        # replace logits_seq by log of mixed prob for CE
+                        logits_seq = torch.log(p_mix)
         except Exception:
             pass
         # Apply prototypical routing on the pair slice at the front (if enabled)
@@ -2258,6 +2321,11 @@ def train(args):
             # Fit/update probe right before eval if enabled
             if int(getattr(args, "probe_enable", 1)) > 0:
                 probe.fit(device)
+            # compute decayed alpha for knn mixing
+            knn_alpha_val = float(getattr(args, 'knn_alpha', 0.2))
+            if int(getattr(args, 'knn_alpha_decay_steps', 0)) > 0:
+                t = min(1.0, max(0.0, (step - start_step) / float(max(1, int(getattr(args, 'knn_alpha_decay_steps', 0))))) )
+                knn_alpha_val = (1.0 - t) * float(getattr(args, 'knn_alpha', 0.2)) + t * float(getattr(args, 'knn_alpha_end', 0.1))
             val_acc_pair = _quick_eval(
                 model,
                 gen,
@@ -2272,6 +2340,10 @@ def train(args):
                 probe_alpha=getattr(args, "probe_alpha", 0.7),
                 proto=proto,
                 proto_space=str(getattr(args, "proto_space", "typed")),
+                knn=(knn if int(getattr(args, 'knn_enable', 1)) > 0 else None),
+                knn_space=str(getattr(args, 'knn_space', 'typed')),
+                knn_alpha=knn_alpha_val,
+                knn_alpha_end=float(getattr(args, 'knn_alpha_end', 0.1)),
             )
             # quick counting eval
             model.eval()
@@ -2608,6 +2680,38 @@ def evaluate(args):
         a_idx = batch["a_idx"].to(device)
         b_idx = batch["b_idx"].to(device)
         _, logits_seq, _, _, _, _ = model(ids, mask)
+        # Optional kNN mixing during eval
+        if int(getattr(args, 'knn_enable', 0)) > 0:
+            try:
+                from concept_learner.knn_memory import KNNSoftClassifier as _K
+                # Build (or reuse) a local kNN memory by sampling a larger pool once
+                if _eval_knn is None:
+                    _eval_knn = _K(num_classes=args.max_number + 4, feat_dim=args.d_model if getattr(args, 'knn_space', 'typed') != 'concat' else (2 * args.d_model), capacity=int(getattr(args, 'knn_capacity', 10000)), k=int(getattr(args, 'knn_k', 32)), tau=float(getattr(args, 'knn_tau', 0.2)), device=device)
+                    # Populate from an offline pool
+                    with torch.no_grad():
+                        pool = gen.sample_posneg_pairs(batch=min(4096, args.batch_size * 16))
+                        ids_p, mask_p = _pack_pair_questions_text(pool, tok, max_len=args.max_len)
+                        _, lsp, _, _, _, _ = model(ids_p, mask_p)
+                        h_pool_p, _ = model.enc(ids_p, mask_p)
+                        s_typed_p = getattr(model.reasoner, "_last_s", None)
+                        if s_typed_p is None:
+                            s_typed_p = h_pool_p
+                        feat_p = ProtoRouter.build_feature(h_pool_p, s_typed_p, getattr(args, 'knn_space', 'typed'))
+                        y_p = pool["label"].to(device)
+                        _eval_knn.add(feat_p, y_p)
+                # mix
+                h_pool_e, _ = model.enc(ids, mask)
+                s_typed_e = getattr(model.reasoner, "_last_s", None)
+                if s_typed_e is None:
+                    s_typed_e = h_pool_e
+                feat_e = ProtoRouter.build_feature(h_pool_e, s_typed_e, getattr(args, 'knn_space', 'typed'))
+                p_m = torch.softmax(logits_seq, dim=-1)
+                p_k = _eval_knn.posterior(feat_e)
+                a = float(getattr(args, 'knn_alpha_end', 0.1))
+                p_mix = (a * p_m + (1.0 - a) * p_k).clamp_min(1e-8)
+                logits_seq = torch.log(p_mix)
+            except Exception:
+                pass
         logits_pair = logits_seq[:, [NO_IDX, YES_IDX]] / T
         pred = logits_pair.argmax(dim=-1)
         probs = torch.softmax(logits_pair, dim=-1)[:, 1]
@@ -3003,6 +3107,16 @@ def main():
     pt.add_argument("--ema_decay_after", type=int, default=10000, help="Step after which to increase EMA decay")
     pt.add_argument("--ema_decay_final", type=float, default=0.997, help="Final EMA decay after schedule step")
     pt.add_argument("--lambda_fn_use", type=float, default=0.05, help="Aux reward weight for using functions (percent of episodes)")
+    # kNN fallback (eval-time smoothing)
+    pt.add_argument("--knn_enable", type=int, default=1, help="Enable kNN posterior mixing (1=on, 0=off)")
+    pt.add_argument("--knn_capacity", type=int, default=10000, help="Memory capacity (N examples)")
+    pt.add_argument("--knn_k", type=int, default=32, help="Number of neighbors")
+    pt.add_argument("--knn_tau", type=float, default=0.2, help="Temperature for neighbor weights")
+    pt.add_argument("--knn_alpha", type=float, default=0.2, help="Initial mix weight alpha")
+    pt.add_argument("--knn_alpha_end", type=float, default=0.1, help="Final mix weight alpha_end")
+    pt.add_argument("--knn_alpha_decay_steps", type=int, default=0, help="Linear decay steps from alpha to alpha_end (0 disables)")
+    pt.add_argument("--knn_space", type=str, choices=["typed", "pooled", "concat"], default="typed", help="Feature space for kNN: typed-state, pooled encoder, or concat")
+    pt.add_argument("--knn_eval_only", type=int, default=1, help="Apply kNN mixing only in eval paths (1=on, 0=also during training loss)")
     # Fast-weights (Hebbian) for sequence head
     pt.add_argument("--fast_enable", type=int, default=1, help="Enable per-episode fast-weights on classifier")
     pt.add_argument("--fast_eta", type=float, default=0.05, help="Hebbian learning rate eta")
