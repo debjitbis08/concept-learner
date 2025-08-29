@@ -1792,14 +1792,15 @@ def train(args):
                     print(f"[warn] logits contained {nf_all} non-finite values before CE (masked subset)")
             except Exception:
                 pass
+            # Compute CE in FP32 even under AMP to avoid half-precision instability
             loss_seq = torch.nn.functional.cross_entropy(
-                logits_m, y_m, label_smoothing=cur_ls
+                logits_m.float(), y_m, label_smoothing=cur_ls
             )
             # If CE still returns non-finite, attempt manual smoothed CE
             if not torch.isfinite(loss_seq):
                 try:
                     eps = float(cur_ls)
-                    lsm = torch.log_softmax(logits_m, dim=-1)
+                    lsm = torch.log_softmax(logits_m.float(), dim=-1)
                     nll = -lsm.gather(1, y_m.view(-1, 1)).squeeze(1)
                     if eps > 0.0:
                         smooth = -lsm.mean(dim=-1)
@@ -1855,7 +1856,7 @@ def train(args):
                 Ck = logits_k.size(-1)
                 yk_valid = (y_k >= 0) & (y_k < Ck)
                 if yk_valid.any():
-                    ce_k = torch.nn.functional.cross_entropy(logits_k[yk_valid], y_k[yk_valid], label_smoothing=cur_ls)
+                    ce_k = torch.nn.functional.cross_entropy(logits_k[yk_valid].float(), y_k[yk_valid], label_smoothing=cur_ls)
                 else:
                     ce_k = logits_k.new_zeros(())
                 w = 1.0
@@ -2300,7 +2301,7 @@ def train(args):
                     Ch = logits_seq_hnm.size(-1)
                     y_h_safe = y_hnm.clone()
                     y_h_safe[(y_h_safe < 0) | (y_h_safe >= Ch)] = -100
-                    loss_items = torch.nn.functional.cross_entropy(logits_seq_hnm, y_h_safe, reduction='none', ignore_index=-100)
+                    loss_items = torch.nn.functional.cross_entropy(logits_seq_hnm.float(), y_h_safe, reduction='none', ignore_index=-100)
                     # predicted stop step (0-based)
                     p_stop = torch.sigmoid(stop_logits_hnm)  # (B,S)
                     step_pred = p_stop.argmax(dim=-1)
@@ -2349,7 +2350,7 @@ def train(args):
                         Ce = logits_seq_e.size(-1)
                         y_e_valid = (y_sel >= 0) & (y_sel < Ce)
                         if y_e_valid.any():
-                            ce_e = torch.nn.functional.cross_entropy(logits_seq_e[y_e_valid], y_sel[y_e_valid])
+                            ce_e = torch.nn.functional.cross_entropy(logits_seq_e[y_e_valid].float(), y_sel[y_e_valid])
                         else:
                             ce_e = logits_seq_e.new_zeros(())
                         loss_e = ce_e + args.lambda_vq * vq_loss_e
