@@ -2749,6 +2749,32 @@ def train(args):
                             if k > 0 and len(traces_f) == k:
                                 ids_f = ids_rep[:k]
                                 mask_f = mask_rep[:k]
+                                # Optional: log a few fantasy samples
+                                try:
+                                    n_show_f = int(getattr(args, "log_fantasies", 0))
+                                except Exception:
+                                    n_show_f = 0
+                                if n_show_f > 0:
+                                    n_show_f = min(n_show_f, k)
+                                    num_prims = len(getattr(model.reasoner, 'prims', []))
+                                    for i in range(n_show_f):
+                                        ids_row = ids_f[i].detach().cpu().tolist()
+                                        mask_row = mask_f[i].detach().cpu().tolist()
+                                        L = int(sum(mask_row)) if mask_row else len(ids_row)
+                                        try:
+                                            prompt = tok.decode(ids_row[:L], skip_special_tokens=True)
+                                        except Exception:
+                                            prompt = "<decode-failed>"
+                                        trf = traces_f[i]
+                                        def _fmt(seq):
+                                            out = []
+                                            for a in seq or []:
+                                                try:
+                                                    out.append(f"f{a - num_prims}" if a >= num_prims else f"p{a}")
+                                                except Exception:
+                                                    out.append(str(int(a)))
+                                            return "[" + ",".join(out) + "]"
+                                        print(f"[fantasy] sample={i} len={len(trf)} prompt=\"{prompt}\" trace={_fmt(trf)}")
                                 y_tok_f = torch.zeros(k, seq_len, dtype=torch.long, device=device)
                                 y_seq_f = torch.zeros(k, dtype=torch.long, device=device)
                                 y_stop_f = make_stop_targets_from_traces(traces_f, max_steps=getattr(model.reasoner, 'max_steps', 1), device=device)
@@ -3922,6 +3948,8 @@ def main():
     pt.add_argument("--probe_alpha", type=float, default=0.7, help="Blend: alpha*learned + (1-alpha)*ridge on logit scale")
     # On-demand sleep trigger knobs
     pt.add_argument("--on_demand_sleep", type=int, default=1, help="Enable on-demand short sleep when metrics regress (1=on, 0=off)")
+    # Logging knobs
+    pt.add_argument("--log_fantasies", type=int, default=0, help="Log up to N fantasy samples per dream cycle")
     pt.add_argument("--ods_window", type=int, default=5, help="Window size (N evals) for moving-average drop detection")
     pt.add_argument("--ods_avg_drop", type=float, default=0.0175, help="Trigger if moving-average val acc drops by more than this absolute amount (e.g., 0.015=1.5 pts)")
     pt.add_argument("--ods_vq_chg", type=float, default=0.20, help="Trigger if average VQ assignment change exceeds this threshold (0..1)")
