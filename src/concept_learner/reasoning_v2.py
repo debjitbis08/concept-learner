@@ -716,25 +716,37 @@ class ReasonerV2(nn.Module):
     ) -> List[FnCandidate]:
         from collections import Counter
 
-        # Normalize traces structure
-        seqs: List[List[int]] = []
+        # Normalize traces structure, preserving action kind (primitive/function)
+        # Each sequence element is (kind, idx) where kind in {"prim", "func"}
+        seqs: List[List[Tuple[str, int]]] = []
         for tr in traces or []:
             if isinstance(tr, dict) and "actions" in tr:
-                seq = [a[1] for a in tr["actions"] if a[0] == "prim"]
+                raw = [(a[0], int(a[1])) for a in tr["actions"] if a and isinstance(a, (list, tuple)) and len(a) >= 2]
             else:
-                seq = [a[1] for a in tr if a[0] == "prim"]
-            if len(seq) > 1:
-                seqs.append(seq)
-        C = Counter()
+                raw = [(a[0], int(a[1])) for a in tr if a and isinstance(a, (list, tuple)) and len(a) >= 2]
+            # keep both primitives and functions; require length>1 for n-gram mining
+            if len(raw) > 1:
+                seqs.append(raw)
+
+        # Build n-gram counts over tagged actions
+        C: Counter = Counter()
         for seq in seqs:
             n = len(seq)
             for L in range(2, max_len + 1):
                 for i in range(0, n - L + 1):
                     C[tuple(seq[i : i + L])] += 1
+
+        # Existing primitive-only patterns (if provided) -> encode as tagged for dedup
+        exist: set = set()
+        for p in existing_patterns or []:
+            try:
+                exist.add(tuple(("prim", int(j)) for j in p))
+            except Exception:
+                continue
+
         pats = [(pat, cnt) for pat, cnt in C.items() if cnt >= min_support]
         # MDL gain: gain = c*(L-1) - (L + alpha)
-        scored = []
-        exist = set(existing_patterns or [])
+        scored: List[Tuple[float, Tuple[Tuple[str, int], ...], int]] = []
         for pat, cnt in pats:
             L = len(pat)
             gain = cnt * (L - 1) - (L + mdl_alpha)
@@ -743,7 +755,17 @@ class ReasonerV2(nn.Module):
         scored.sort(key=lambda x: (x[0], x[2], len(x[1])), reverse=True)
         cands: List[FnCandidate] = []
         for (gain, pat, cnt) in scored[:topM]:
-            steps = [StepSpec(kind="primitive", idx=j) for j in pat]
+            steps: List[StepSpec] = []
+            for (k, j) in pat:
+                if k == "prim":
+                    steps.append(StepSpec(kind="primitive", idx=int(j)))
+                elif k == "func":
+                    steps.append(StepSpec(kind="function", idx=int(j)))
+                else:
+                    # ignore unknown kinds in mined pattern
+                    continue
+            # Always end with implicit return
+            steps.append(StepSpec(kind="return"))
             cands.append(FnCandidate(steps=steps, ret_policy="implicit"))
         return cands
 
@@ -768,6 +790,7 @@ class ReasonerV2(nn.Module):
         )
         # Post-filter candidates by body length, effect, and diversity
         def _prim_seq_from_steps(steps: List[StepSpec]) -> List[int]:
+            # Extract only primitive indices from a candidate body; ignore functions/conds.
             seq: List[int] = []
             for st in steps:
                 if st.kind == "primitive" and st.idx is not None:
@@ -775,8 +798,8 @@ class ReasonerV2(nn.Module):
                 elif st.kind == "return":
                     break
                 else:
-                    # disallow higher-order in mined bodies for now
-                    return []
+                    # ignore non-primitive steps for effect/diversity scoring
+                    continue
             return seq
 
         prim_effects = getattr(self, "_last_prim_effects", None)
