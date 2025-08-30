@@ -24,11 +24,14 @@ readme = "README.md"
 dependencies = [
   "pyrootutils",
   "loguru",
-  "torch>=2.6.0",
   "tokenizers>=0.21.4",
   "transformers>=4.55.4",
   "vector-quantize-pytorch>=1.23.1",
 ]
+
+[project.optional-dependencies]
+cpu = ["torch>=2.8.0"]
+cu128 = ["torch>=2.8.0"]
 
 [dependency-groups]
 dev = [
@@ -46,6 +49,10 @@ dev = [
 ]
 
 [tool.uv]
+conflicts = [
+  [{ extra = "cpu" }, { extra = "cu128" }],
+]
+
 
 [[tool.uv.index]]
 name = "pypi"
@@ -53,19 +60,55 @@ url = "https://pypi.org/simple"
 default = true
 
 [[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu124"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch", marker = "sys_platform == 'linux'" },
-  { index = "pypi", marker = "sys_platform == 'darwin'" },
+  { index = "pytorch-cpu",  extra = "cpu"   },
+  { index = "pytorch-cu128", extra = "cu128" },
 ]
 
 [tool.taskipy.tasks]
 test = "pytest -q"
 lint = "ruff check --fix src"
+train_test = """
+python scripts/train_episodes.py train \
+  --steps 100 --base10 --batch_size 32 --d_model 64 --amp \
+  --save_dir runs/episodes_b10_test \
+  --ckpt_every 10 --log_every 10 \
+  --lr 4e-5 --sched cosine --warmup_ratio 0.03 --min_lr 1e-6 \
+  --ema_decay 0.995 --weight_decay 0.003 --label_smoothing 0.03 \
+  --lambda_vq 0.25 --lambda_stop 0.3 \
+  --max_number 100 --train_range 0-79 --ood_range 80-99 \
+  --frozen_mix --mix_ratio_id 0.45 --mix_ratio_bd 0.20 --mix_ratio_ood 0.25 --mix_ratio_cf 0.05 \
+  --replay_max_items 2048 --proto_beta 0.95 --proto_warmup 100 \
+  --mine_min_support 8 --mine_max_len 3
+"""
+eval_test = """
+python scripts/train_episodes.py eval \
+  --base10 --eval_batches 100 --d_model 64 \
+  --checkpoint runs/episodes_b10_test/latest.pt
+"""
+train_from_scratch = """
+python scripts/train_episodes.py train \
+  --steps 15000 --base10 --batch_size 256 --d_model 256 --amp \
+  --save_dir runs/episodes_b10 \
+  --ckpt_every 500 --log_every 100 \
+  --lr 4e-5 --sched cosine --warmup_ratio 0.03 --min_lr 1e-6 \
+  --ema_decay 0.995 --weight_decay 0.003 --label_smoothing 0.03 \
+  --lambda_vq 0.25 --lambda_stop 0.3 \
+  --max_number 100 --train_range 0-79 --ood_range 80-99 \
+  --frozen_mix --mix_ratio_id 0.45 --mix_ratio_bd 0.20 --mix_ratio_ood 0.25 --mix_ratio_cf 0.05 \
+  --replay_max_items 2048 --proto_beta 0.95 --proto_warmup 100 \
+  --mine_min_support 8 --mine_max_len 3
+"""
 train = """
 python scripts/train_episodes.py train \
   --steps 15000 --base10 --batch_size 256 --d_model 256 --amp \

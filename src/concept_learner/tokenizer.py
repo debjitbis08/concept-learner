@@ -91,10 +91,13 @@ class _SimpleTokenizer:
 
 
 class HFTokenizerWrapper:
-    def __init__(self, name: str = "bert-base-cased"):
+    def __init__(self, name: str = "bert-base-cased", force_simple: bool = False):
         tok: Optional[object] = None
-        # try huggingface tokenizer if available
-        if AutoTokenizer is not None:
+        # allow explicit simple fallback via name or flag
+        if isinstance(name, str) and name.strip().lower() in {"simple", "_simple_fallback", "simple-fallback"}:
+            force_simple = True
+        # try huggingface tokenizer if available and not forced to simple
+        if AutoTokenizer is not None and not force_simple:
             try:
                 tok = AutoTokenizer.from_pretrained(name)
                 self.backend = "hf"

@@ -101,7 +101,6 @@ class CLModel(nn.Module):
             z_for_reason = self.z_all_proj(z_all)
         else:
             z_for_reason = z_q
-        # H_cond = H + z_q.unsqueeze(1)  # (B,T,d)
         H_cond = self.film(H, z_for_reason)
         H_reasoned, s_final, stop_logits, action_logits = self.reasoner(
             H_cond, z_for_reason, mask

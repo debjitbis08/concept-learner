@@ -119,7 +119,14 @@ def main():
     gen = EpisodeGenerator(ecfg)
 
     # vocab: PAD, CLS, SEP, digits(0..9), relation words
-    model = CLModel(vocab_size=VOCAB_SIZE, d_model=args.d_model, num_classes=ecfg.max_number, pad_id=0, cls_id=1, max_len=args.max_len).to(device)
+    model = CLModel(
+        vocab_size=VOCAB_SIZE,
+        d_model=args.d_model,
+        num_classes=ecfg.max_number,
+        pad_id=0,
+        cls_id=1,
+        max_len=args.max_len,
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
 
     start = 0

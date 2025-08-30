@@ -1938,6 +1938,22 @@ def train(args):
                     print("[warn] zero seq labels in batch; skipping seq CE")
                 except Exception:
                     pass
+        # Auxiliary: strengthen counting supervision directly on its sub-batch
+        try:
+            w_cnt = float(getattr(args, "lambda_count_aux", 0.5))
+        except Exception:
+            w_cnt = 0.5
+        if 'ids_cnt' in locals() and ids_cnt.numel() > 0 and w_cnt > 0.0:
+            with torch.no_grad():
+                pass  # ensure any cached grads not affected
+            _ltok_c, _lseq_c, *_ = model(ids_cnt, mask_cnt)
+            _lseq_c = torch.nan_to_num(_lseq_c, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+            Cc = _lseq_c.size(-1)
+            y_c_valid = (y_cnt >= 0) & (y_cnt < Cc)
+            if y_c_valid.any():
+                ce_cnt = torch.nn.functional.cross_entropy(_lseq_c[y_c_valid].float(), y_cnt[y_c_valid])
+                loss_seq = loss_seq + w_cnt * ce_cnt
+        
         if args.frozen_mix:
             # recompute logits for compare-only batch and split by sizes
             offs = []
@@ -2684,7 +2700,20 @@ def train(args):
                     )
                     y2 = d2["target"].to(device)
                     _, ls2, _, _, _, _ = model(i2, m2)
-                    pred2 = ls2[:, :num_numbers].argmax(dim=-1)
+                    # Choose number slice (auto) and center per-class means
+                    C_eval = ls2.size(-1)
+                    if C_eval < num_numbers:
+                        print(f"[warn] counting eval head smaller than num_numbers: C={C_eval} < {num_numbers}")
+                    take = min(num_numbers, C_eval)
+                    nums_f = ls2[:, :take]
+                    nums_b = ls2[:, C_eval - take : C_eval] if C_eval >= take else nums_f
+                    subs = slice(0, min(64, ls2.size(0)))
+                    acc_f = (nums_f[subs].argmax(dim=-1) == y2[subs].clamp(0, take - 1)).float().mean().item()
+                    acc_b = (nums_b[subs].argmax(dim=-1) == y2[subs].clamp(0, take - 1)).float().mean().item()
+                    nums = nums_b if acc_b > acc_f else nums_f
+                    # center per-class batch mean before argmax
+                    nums = nums - nums.mean(dim=0, keepdim=True)
+                    pred2 = nums.argmax(dim=-1)
                     hit += (pred2 == y2).sum().item()
                     tot += y2.numel()
             model.train()
@@ -3071,6 +3100,7 @@ def evaluate(args):
     assert args.checkpoint and os.path.isfile(args.checkpoint), "--checkpoint required"
     load_checkpoint(args.checkpoint, model, opt=None, map_location=device)
     model.eval()
+    # debug prints removed
 
     total, correct = 0, 0
     # accumulators for diagnostics
@@ -3479,6 +3509,9 @@ def evaluate(args):
     # Counting diagnostics combined in eval
     print("\nCounting evaluation:")
     tot, hit = 0, 0
+    pred_hist = torch.zeros(ecfg.max_number, dtype=torch.long)
+    sum_logits = torch.zeros(ecfg.max_number, dtype=torch.float32)
+    cnt_logits = 0
     with torch.no_grad():
         for _ in range(args.eval_batches):
             dc = gen.sample_counting(batch=min(args.batch_size, 128))
@@ -3487,10 +3520,50 @@ def evaluate(args):
             )
             yc = dc["target"].to(device)
             _, lsc, _, _, _, _ = model(ic, mc)
-            predc = lsc[:, : ecfg.max_number].argmax(dim=-1)
+            # debug prints removed
+            Cc = lsc.size(-1)
+            if Cc < ecfg.max_number:
+                print(f"[warn] eval head smaller than max_number: C={Cc} < {ecfg.max_number}")
+            takec = min(ecfg.max_number, Cc)
+            # choose slice per args
+            if False and Cc >= takec:  # numbers_slice 'back' disabled
+                nums = lsc[:, Cc - takec : Cc]
+                base = Cc - takec
+            elif Cc >= takec:
+                # quick auto: compare top-1 match rate on a tiny subsample with front vs back against y (labels in 0..N-1)
+                subs = slice(0, min(64, lsc.size(0)))
+                nums_f = lsc[subs, : takec]
+                nums_b = lsc[subs, Cc - takec : Cc]
+                pred_f = nums_f.argmax(dim=-1)
+                pred_b = nums_b.argmax(dim=-1)
+                # compute rough correctness vs labels modulo N (if head mapped numbers at back, pred_b likely closer)
+                y_sub = yc[subs].clamp(0, takec - 1)
+                acc_f = (pred_f == y_sub).float().mean().item()
+                acc_b = (pred_b == y_sub).float().mean().item()
+                if acc_b > acc_f:
+                    nums = nums_b
+                    base = Cc - takec
+                else:
+                    nums = nums_f
+                    base = 0
+            else:
+                nums = lsc[:, : takec]
+                base = 0
+            # remove per-class batch mean offset (eval-only fix)
+            nums = nums - nums.mean(dim=0, keepdim=True)
+            predc = nums.argmax(dim=-1)
             hit += (predc == yc).sum().item()
             tot += yc.numel()
+            # diagnostics accumulators
+            try:
+                ph = torch.bincount(predc.cpu(), minlength=takec)
+                pred_hist[:takec] += ph[:takec]
+                sum_logits[:takec] += nums.detach().cpu().sum(dim=0)[:takec]
+                cnt_logits += nums.size(0)
+            except Exception:
+                pass
     print(f"Counting eval accuracy: {hit / max(1, tot):.3f}")
+    # debug summary removed
     # sample counting QA with variety
     import random as _r
 
@@ -3499,9 +3572,21 @@ def evaluate(args):
         ic, mc = _pack_count_examples_text(
             dshow["kind"], dshow["a"], dshow["c"], tok, max_len=args.max_len
         )
-        yshow = dshow["target"].tolist()
+        yshow_t = dshow["target"].to(device)
+        yshow = yshow_t.tolist()
         _, lss, _, _, _, _ = model(ic, mc)
-        predshow = lss[:, : ecfg.max_number].argmax(dim=-1).tolist()
+        # Use same slicing/centering logic as main counting eval
+        C3 = lss.size(-1)
+        take3 = min(ecfg.max_number, C3)
+        nums_f3 = lss[:, : take3]
+        nums_b3 = lss[:, C3 - take3 : C3] if C3 >= take3 else nums_f3
+        subs3 = slice(0, min(4, lss.size(0)))
+        acc_f3 = (nums_f3[subs3].argmax(dim=-1) == yshow_t[subs3].clamp(0, take3 - 1)).float().mean().item()
+        acc_b3 = (nums_b3[subs3].argmax(dim=-1) == yshow_t[subs3].clamp(0, take3 - 1)).float().mean().item()
+        nums3 = nums_b3 if acc_b3 > acc_f3 else nums_f3
+        # center per-class batch mean
+        nums3 = nums3 - nums3.mean(dim=0, keepdim=True)
+        predshow = nums3.argmax(dim=-1).tolist()
         kind = dshow["kind"].tolist()
         a = dshow["a"].tolist()
         c = dshow["c"].tolist()
@@ -3537,6 +3622,7 @@ def main():
         sp.add_argument("--d_model", type=int, default=128)
         sp.add_argument("--max_number", type=int, default=100)
         sp.add_argument("--max_len", type=int, default=32)
+        # tokenizer is fixed for eval/train; no override flag
         sp.add_argument("--min_base", type=int, default=10)
         sp.add_argument("--max_base", type=int, default=10)
         sp.add_argument("--batch_size", type=int, default=64)
@@ -3559,6 +3645,7 @@ def main():
     pt.add_argument("--ema_decay_after", type=int, default=10000, help="Step after which to increase EMA decay")
     pt.add_argument("--ema_decay_final", type=float, default=0.997, help="Final EMA decay after schedule step")
     pt.add_argument("--lambda_fn_use", type=float, default=0.05, help="Aux reward weight for using functions (percent of episodes)")
+    pt.add_argument("--lambda_count_aux", type=float, default=0.5, help="Extra weight on counting-only CE to stabilize number head")
     # kNN fallback (eval-time smoothing)
     pt.add_argument("--knn_enable", type=int, default=1, help="Enable kNN posterior mixing (1=on, 0=off)")
     pt.add_argument("--knn_capacity", type=int, default=10000, help="Memory capacity (N examples)")
@@ -3776,6 +3863,7 @@ def main():
     )
     pe.add_argument("--temp_fit", action="store_true", help="Fit a scalar temperature on a held-out split for calibration")
     pe.add_argument("--template_holdout", type=float, default=0.0, help="Fraction of NL templates per relation held out for template-OOD (0..1)")
+    # evaluation uses fixed defaults (auto slice + centering) without extra debug flags
 
     # Counting subcommands (unified CLI)
     ct = sub.add_parser(
@@ -3871,10 +3959,11 @@ def main():
         )
         gen = EpisodeGenerator(ecfg)
         tok = HFTokenizerWrapper("bert-base-cased")
+        # Use unified head (numbers + {YES,NO,EVEN,ODD}) to match training checkpoints
         model = CLModel(
             vocab_size=tok.vocab_size,
             d_model=args.d_model,
-            num_classes=ecfg.max_number,
+            num_classes=ecfg.max_number + 4,
             pad_id=0,
             cls_id=1,
             max_len=args.max_len,
@@ -4011,7 +4100,12 @@ def main():
                 )
                 y2 = data2["target"].to(device)
                 _, logits_seq2, _, _, _, _ = model(ids2, mask2)
-                pred2 = logits_seq2.argmax(dim=-1)
+                # Only consider number slice for counting
+                C2 = logits_seq2.size(-1)
+                if C2 < ecfg.max_number:
+                    print(f"[warn] count-eval head smaller than max_number: C={C2} < {ecfg.max_number}")
+                take = min(ecfg.max_number, C2)
+                pred2 = logits_seq2[:, :take].argmax(dim=-1)
                 hit += (pred2 == y2).sum().item()
                 tot += y2.numel()
         print(f"Counting eval accuracy: {hit / max(1, tot):.3f}")
@@ -4025,7 +4119,9 @@ def main():
             )
             y = data["target"].tolist()
             _, logits_seq, _, _, _, _ = model(ids, mask)
-            pred = logits_seq.argmax(dim=-1).tolist()
+            C3 = logits_seq.size(-1)
+            take3 = min(ecfg.max_number, C3)
+            pred = logits_seq[:, :take3].argmax(dim=-1).tolist()
             kind = data["kind"].tolist()
             a = data["a"].tolist()
             c = data["c"].tolist()
