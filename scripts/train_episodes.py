@@ -218,86 +218,43 @@ def _quick_eval(
     knn_alpha: float | None = None,
     knn_alpha_end: float | None = None,
 ) -> float:
+    """Generation-based pair eval: generate answer text and parse yes/no."""
+    import re as _re
     model.eval()
     total, correct = 0, 0
+    yes_id = tok.token_id("yes"); no_id = tok.token_id("no")
     for _ in range(eval_batches):
         rel_ids = _parse_relations_arg(relations)
         batch = gen.sample_posneg_pairs(batch=batch_size, allowed_relations=rel_ids, idx_range=idx_range)
         ids, mask = _pack_pair_questions_text(batch, tok, max_len, template_filter=template_filter)
-        y = batch["label"].to(device)
-        logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits = model(ids, mask)
-        # Optional prototypical routing bias on YES/NO for pair relations
-        if proto is not None:
-            with torch.no_grad():
-                # Build normalized features per requested space
-                h_pool, _ = model.enc(ids, mask)
-                # s_final is exposed on reasoner last forward as return value
-                # Model.forward returns s_final in slot 2; keep consistent with above
-                # We recompute it via last call: we already captured return values.
-                # Use reasoner's _last_val? Stick to returned tensors to avoid ambiguity.
-                # logits_tok, logits_seq, vq_loss, indices, stop_logits, action_logits = ...
-                # We need s_final but model.forward returns it at index 2; to avoid interface changes,
-                # we read it from local variable where available via closure — not possible.
-                # Instead, reuse model.reasoner._last_s if present, else skip.
-                s_typed = getattr(model.reasoner, "_last_s", None)
-                if s_typed is None:
-                    # Fallback: approximate with h_pool if typed state not exposed
-                    s_typed = h_pool
-                feat = ProtoRouter.build_feature(h_pool, s_typed, proto_space)
-                # Map YES/NO indices based on head space
-                C = logits_seq.size(-1)
-                if C == tok.vocab_size:
-                    YES_IDX = tok.token_id("yes")
-                    NO_IDX = tok.token_id("no")
+        gold = batch["label"].tolist()
+        for i in range(ids.size(0)):
+            iids = ids[i : i + 1]
+            imask = mask[i : i + 1]
+            try:
+                gen_ids = _generate_token_ids(model, iids, imask, max_new_tokens=4)
+            except Exception:
+                gen_ids = []
+            pred = None
+            if len(gen_ids) > 0:
+                if gen_ids[0] == yes_id:
+                    pred = 1
+                elif gen_ids[0] == no_id:
+                    pred = 0
+            if pred is None:
+                # fallback: decode and search
+                try:
+                    txt = _generate_text(model, tok, iids, imask, max_new_tokens=4).lower()
+                except Exception:
+                    txt = ""
+                if "yes" in txt and "no" not in txt:
+                    pred = 1
+                elif "no" in txt and "yes" not in txt:
+                    pred = 0
                 else:
-                    YES_IDX = num_numbers
-                    NO_IDX = num_numbers + 1
-                # Apply bias; do not update in eval
-                logits_seq = proto.apply_bias(logits_seq, feat, batch["rel"], YES_IDX, NO_IDX, train_mode=False)
-        # YES/NO for downstream decisions
-        C = logits_seq.size(-1)
-        if C == tok.vocab_size:
-            YES_IDX = tok.token_id("yes")
-            NO_IDX = tok.token_id("no")
-        else:
-            YES_IDX = num_numbers
-            NO_IDX = num_numbers + 1
-        # Optional kNN posterior mixing on full classes
-        if knn is not None:
-            with torch.no_grad():
-                h_pool, _ = model.enc(ids, mask)
-                s_typed = getattr(model.reasoner, "_last_s", None)
-                if s_typed is None:
-                    s_typed = h_pool
-                feat = ProtoRouter.build_feature(h_pool, s_typed, knn_space)
-                p_model = torch.softmax(logits_seq, dim=-1)
-                p_knn = knn.posterior(feat)
-                a = float(knn_alpha if knn_alpha is not None else 0.2)
-                a_end = float(knn_alpha_end if knn_alpha_end is not None else a)
-                # Use provided alpha (caller may pass decayed value); only if shapes match
-                if p_knn.shape == p_model.shape:
-                    p = (a * p_model + (1.0 - a) * p_knn).clamp_min(1e-8)
-                    logits_seq = torch.log(p)
-                # else: skip knn mixing when head dims differ (e.g., vocab head)
-                # safety: sanitize logits before downstream use
-                logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
-        if probe is not None and getattr(probe, "w", None) is not None:
-            # Blend learned head with ridge probe
-            with torch.no_grad():
-                h, _ = model.enc(ids, mask)
-                ridge_logit = probe.predict_logit(h)
-                from concept_learner.utils import select_pair_columns_safe
-                base_pair = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab")
-                learned_logit = base_pair[:, 1] - base_pair[:, 0]
-                a = float(probe_alpha if probe_alpha is not None else getattr(probe, "alpha", 0.7))
-                blended = a * learned_logit + (1.0 - a) * ridge_logit
-                # decision by sign of blended logit
-                pred_bin = (blended > 0).long()
-        else:
-            from concept_learner.utils import select_pair_columns_safe
-            pred_bin = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab").argmax(dim=-1)
-        correct += (pred_bin == y).sum().item()
-        total += y.numel()
+                    pred = 1 if ("yes" in txt and txt.rfind("yes") > txt.rfind("no")) else 0
+            correct += int(pred == int(gold[i]))
+            total += 1
     model.train()
     return correct / max(1, total)
 
@@ -1124,7 +1081,7 @@ def train(args):
             model.eval()
             tot0, hit0 = 0, 0
             with torch.no_grad():
-                for _ in range(5):
+                for _ in range(int(getattr(args, "count_eval_batches", 20))):
                     d2 = gen.sample_counting(batch=min(args.batch_size, 128), idx_range=tr_range)
                     i2, m2 = _pack_count_examples_text(
                         d2["kind"], d2["a"], d2["c"], tok, max_len=args.max_len
@@ -2312,11 +2269,11 @@ def train(args):
             stop_targets[off_off + i, 0] = 1.0
             stop_mask[off_off + i, 0] = 1.0
 
-        # masked BCE across valid steps only
+        # masked BCE across valid steps only (unused in generator-only training)
         stop_per = torch.nn.functional.binary_cross_entropy_with_logits(
             stop_logits, stop_targets, reduction="none"
         )
-        stop_loss = (stop_per * stop_mask).sum() / stop_mask.sum().clamp_min(1.0)
+        stop_loss = torch.tensor(0.0, device=device)
 
         # tiny OpAdd stabilization regularizer (encourage integer-like k)
         reg_k = 0.0
@@ -2333,26 +2290,42 @@ def train(args):
         lambda_margin = 1.0
         lambda_k = 1e-3
 
-        # include auxiliary sparsity and halting penalties from reasoner if present
-        aux = getattr(model.reasoner, "_aux_loss", {}) or {}
-        telem = getattr(model.reasoner, "_telemetry", {}) or {}
-        # aux reward for using functions (percent of episodes using >=1 fn)
-        fn_use = float(telem.get("pct_used_fn", 0.0))
-        fn_use_term = torch.tensor(fn_use, device=device)
-        loss = (
-            loss_seq
-            + args.lambda_vq * vq_loss
-            + args.lambda_stop * stop_loss
-            + lambda_rank * rank_loss
-            + lambda_num * num_loss
-            + lambda_margin * bce_margin
-            + lambda_k * reg_k
-            + 1e-3 * aux.get("sparse", torch.tensor(0.0, device=device))
-            + 1e-3 * aux.get("halt_over", torch.tensor(0.0, device=device))
-            + float(getattr(args, "lambda_act_entropy", 1e-3)) * aux.get("act_entropy", torch.tensor(0.0, device=device))
-            - float(getattr(args, "lambda_fn_adv", 1e-4)) * aux.get("fn_adv", torch.tensor(0.0, device=device))
-            - float(getattr(args, "lambda_fn_use", 0.05)) * fn_use_term
-        )
+        # Generator-only training: build (prompt, answer_text) pairs and optimize token CE + VQ
+        try:
+            prompts, answers = [], []
+            ids_cpu = ids.detach().cpu(); mask_cpu = mask.detach().cpu(); y_cpu = y.detach().cpu() if y is not None else torch.empty(0)
+            for i in range(ids_cpu.size(0)):
+                row = ids_cpu[i].tolist(); m = mask_cpu[i].tolist(); L = int(sum(m)) if m else len(row)
+                try:
+                    ptxt = tok.decode(row[:L], skip_special_tokens=True)
+                except Exception:
+                    ptxt = ""
+                prompts.append(ptxt)
+                # map class to text
+                cls = int(y_cpu[i].item()) if i < y_cpu.numel() else -1
+                if 0 <= cls < num_numbers:
+                    answers.append(str(cls))
+                elif cls == num_numbers:
+                    answers.append("yes")
+                elif cls == num_numbers + 1:
+                    answers.append("no")
+                elif cls == num_numbers + 2:
+                    answers.append("even")
+                elif cls == num_numbers + 3:
+                    answers.append("odd")
+                else:
+                    answers.append("")
+            ids_io, mask_io, y_tok_io, lmask_io = _pack_io_pair_batch(tok, prompts, answers, seq_len, device)
+            logits_tok_g, _ls_dummy, vq_loss, indices, stop_logits, action_logits = model(ids_io, mask_io)
+            Bg, Tg, Cg = logits_tok_g.shape
+            import torch.nn.functional as _F
+            loss_all_g = _F.cross_entropy(logits_tok_g.view(-1, Cg), y_tok_io.view(-1), reduction="none").view(Bg, Tg)
+            denom_g = lmask_io.sum().clamp_min(1.0)
+            loss_tok = (loss_all_g * lmask_io).sum() / denom_g
+        except Exception:
+            loss_tok = torch.tensor(0.0, device=device)
+        # include auxiliary sparsity and halting penalties from reasoner if desired (disabled here)
+        loss = loss_tok + args.lambda_vq * vq_loss
 
         # Final guard: sanitize total loss to avoid inf/nan propagating into backward
         loss = torch.nan_to_num(loss, nan=0.0, posinf=1e6, neginf=-1e6)
@@ -2679,7 +2652,7 @@ def train(args):
                 except Exception:
                     rb_len = 0
                 print(f"[sleep] step={step + 1} installed={len(installed)} rb={rb_len} telem={compact}")
-                # Dream-MAP from replay buffer (replayed experiences)
+                # Dream (recognizer-focused): train action/STOP via MAP on replay/composites/fantasies
                 if len(rb) > 0:
                     dream_bs = min(args.batch_size, len(rb))
                     replays = rb.sample(dream_bs)
@@ -2699,7 +2672,7 @@ def train(args):
                         _ = train_step_with_trace_supervision(
                             model, (ids_rep, mask_rep, y_tok, y_seq, y_stop), traces_canon, opt
                         )
-                        # structured combos to diversify
+                        # structured composites to diversify recognizer training
                         combos = build_composite_from_replays(
                             replays, target_count=max(1, dream_bs // 2), T=seq_len, device=device
                         )
@@ -2809,8 +2782,9 @@ def train(args):
                                                     out.append(str(int(a)))
                                             return "[" + ",".join(out) + "]"
                                         print(f"[fantasy] sample={i} len={len(trf)} prompt=\"{prompt}\" trace={_fmt(trf)}")
-                                y_tok_f = torch.zeros(k, seq_len, dtype=torch.long, device=device)
-                                y_seq_f = torch.zeros(k, dtype=torch.long, device=device)
+                                # Recognizer-style dream on fantasies: use sampled traces directly
+                                y_tok_f = torch.zeros(ids_f.size(0), seq_len, dtype=torch.long, device=device)
+                                y_seq_f = torch.zeros(ids_f.size(0), dtype=torch.long, device=device)
                                 y_stop_f = make_stop_targets_from_traces(traces_f, max_steps=getattr(model.reasoner, 'max_steps', 1), device=device)
                                 _ = train_step_with_trace_supervision(
                                     model, (ids_f, mask_f, y_tok_f, y_seq_f, y_stop_f), traces_f, opt
@@ -2907,33 +2881,30 @@ def train(args):
                 knn_alpha=knn_alpha_val,
                 knn_alpha_end=float(getattr(args, 'knn_alpha_end', 0.1)),
             )
-            # quick counting eval
+            # quick counting eval (generation-based)
+            import re as _re
             model.eval()
             tot, hit = 0, 0
             with torch.no_grad():
-                for _ in range(5):
-                    d2 = gen.sample_counting(batch=min(args.batch_size, 128))
+                for _ in range(int(getattr(args, "count_eval_batches", 20))):
+                    d2 = gen.sample_counting(batch=min(args.batch_size, 64))
                     i2, m2 = _pack_count_examples_text(
                         d2["kind"], d2["a"], d2["c"], tok, max_len=seq_len
                     )
-                    y2 = d2["target"].to(device)
-                    _, ls2, _, _, _, _ = model(i2, m2)
-                    # Choose number slice (auto) and center per-class means
-                    C_eval = ls2.size(-1)
-                    if C_eval < num_numbers:
-                        print(f"[warn] counting eval head smaller than num_numbers: C={C_eval} < {num_numbers}")
-                    take = min(num_numbers, C_eval)
-                    nums_f = ls2[:, :take]
-                    nums_b = ls2[:, C_eval - take : C_eval] if C_eval >= take else nums_f
-                    subs = slice(0, min(64, ls2.size(0)))
-                    acc_f = (nums_f[subs].argmax(dim=-1) == y2[subs].clamp(0, take - 1)).float().mean().item()
-                    acc_b = (nums_b[subs].argmax(dim=-1) == y2[subs].clamp(0, take - 1)).float().mean().item()
-                    nums = nums_b if acc_b > acc_f else nums_f
-                    # center per-class batch mean before argmax
-                    nums = nums - nums.mean(dim=0, keepdim=True)
-                    pred2 = nums.argmax(dim=-1)
-                    hit += (pred2 == y2).sum().item()
-                    tot += y2.numel()
+                    gold = d2["target"].tolist()
+                    for i in range(i2.size(0)):
+                        ids2 = i2[i : i + 1]
+                        mask2 = m2[i : i + 1]
+                        try:
+                            gen_ids = _generate_token_ids(model, ids2, mask2, max_new_tokens=4)
+                            txt = tok.decode(gen_ids, skip_special_tokens=True)
+                        except Exception:
+                            txt = ""
+                        m = _re.search(r"[-+]?\d+", txt)
+                        pred = int(m.group(0)) if m else None
+                        if pred is not None and pred == int(gold[i]):
+                            hit += 1
+                        tot += 1
             model.train()
             if _using_ema:
                 ema.restore(model)
@@ -3020,18 +2991,50 @@ def train(args):
                                 break
                             ids_rep = torch.stack([x.ids for x in replays], dim=0).to(device)
                             mask_rep = torch.stack([x.mask for x in replays], dim=0).to(device)
-                            traces_rep = [x.trace for x in replays]
-                            patterns = extract_primitive_patterns_from_library(model.reasoner)
-                            traces_canon = [
-                                compress_trace_with_patterns(tr, patterns, len(getattr(model.reasoner, 'prims', [])))
-                                for tr in traces_rep
-                            ]
-                            y_tok = torch.zeros(ids_rep.size(0), seq_len, dtype=torch.long, device=device)
-                            y_seq = torch.zeros(ids_rep.size(0), dtype=torch.long, device=device)
-                            y_stop = make_stop_targets_from_traces(traces_canon, max_steps=getattr(model.reasoner, 'max_steps', 1), device=device)
-                            _ = train_step_with_trace_supervision(
-                                model, (ids_rep, mask_rep, y_tok, y_seq, y_stop), traces_canon, opt
-                            )
+                            # Teacher answers from EMA for generator-style dream step
+                            with torch.no_grad():
+                                if ema is not None:
+                                    ema.store(model); ema.copy_to(model)
+                                _lt, ls_t, _vq_t, *_ = model(ids_rep, mask_rep)
+                                ls_t = torch.nan_to_num(ls_t, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+                                y_t = ls_t.argmax(dim=-1).detach()
+                                if ema is not None:
+                                    ema.restore(model)
+                            prompts, answers = [], []
+                            for i in range(ids_rep.size(0)):
+                                row = ids_rep[i].detach().cpu().tolist(); m = mask_rep[i].detach().cpu().tolist()
+                                L = int(sum(m)) if m else len(row)
+                                try:
+                                    prompts.append(tok.decode(row[:L], skip_special_tokens=True))
+                                except Exception:
+                                    prompts.append("")
+                                cls = int(y_t[i].item())
+                                if cls < num_numbers:
+                                    answers.append(str(cls))
+                                elif cls == num_numbers:
+                                    answers.append("yes")
+                                elif cls == num_numbers + 1:
+                                    answers.append("no")
+                                elif cls == num_numbers + 2:
+                                    answers.append("even")
+                                else:
+                                    answers.append("odd")
+                            ids_io, mask_io, y_tok_io, lmask_io = _pack_io_pair_batch(tok, prompts, answers, seq_len, device)
+                            logits_tok_s, _ls_dummy, vq_s, *_ = model(ids_io, mask_io)
+                            B, T, C = logits_tok_s.shape
+                            import torch.nn.functional as _F
+                            loss_all = _F.cross_entropy(logits_tok_s.view(-1, C), y_tok_io.view(-1), reduction="none").view(B, T)
+                            denom = lmask_io.sum().clamp_min(1.0)
+                            loss_d = (loss_all * lmask_io).sum() / denom + args.lambda_vq * vq_s
+                            opt.zero_grad(set_to_none=True)
+                            if use_amp:
+                                scaler.scale(loss_d).backward(); scaler.unscale_(opt)
+                                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                                scaler.step(opt); scaler.update()
+                            else:
+                                loss_d.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+                            if ema is not None:
+                                ema.update(model)
             except Exception:
                 # On-demand sleeps are best-effort and must not break training
                 pass
@@ -3136,10 +3139,15 @@ def train(args):
                     diag = f" | n_seq={n_seq_valid} C={C} y=[{y_min},{y_max}]"
             except Exception:
                 diag = ""
-            print(
-                f"step {step + 1}/{args.steps} loss={loss.item():.4f} seq={loss_seq.item():.4f} "
-                f"vq={vq_loss.item():.4f} stop={stop_loss.item():.4f} p(yes)~{probs:.3f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}{diag}"
-            )
+            try:
+                print(
+                    f"step {step + 1}/{args.steps} loss={loss.item():.4f} tok={loss_tok.item():.4f} "
+                    f"vq={vq_loss.item():.4f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}{diag}"
+                )
+            except Exception:
+                print(
+                    f"step {step + 1}/{args.steps} loss={loss.item():.4f} vq={vq_loss.item():.4f} val_pair={val_acc_pair:.3f} val_cnt={val_acc_cnt:.3f} avg={val_acc:.3f} lr={cur_lr:.2e}{diag}"
+                )
             if vq_diag_str:
                 print(f"  VQ: {vq_diag_str}")
             print(
@@ -4002,6 +4010,7 @@ def main():
     pt.add_argument("--probe_alpha", type=float, default=0.7, help="Blend: alpha*learned + (1-alpha)*ridge on logit scale")
     # On-demand sleep trigger knobs
     pt.add_argument("--on_demand_sleep", type=int, default=1, help="Enable on-demand short sleep when metrics regress (1=on, 0=off)")
+    pt.add_argument("--count_eval_batches", type=int, default=20, help="Number of mini-batches for counting eval (replaces hardcoded 5)")
     # Logging knobs
     pt.add_argument("--log_fantasies", type=int, default=0, help="Log up to N fantasy samples per dream cycle")
     # Dream fantasies (synthetic action sequences)
