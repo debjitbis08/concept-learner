@@ -2835,6 +2835,25 @@ def train(args):
             if int(getattr(args, 'knn_alpha_decay_steps', 0)) > 0:
                 t = min(1.0, max(0.0, (step - start_step) / float(max(1, int(getattr(args, 'knn_alpha_decay_steps', 0))))) )
                 knn_alpha_val = (1.0 - t) * float(getattr(args, 'knn_alpha', 0.2)) + t * float(getattr(args, 'knn_alpha_end', 0.1))
+            # Optionally restrict eval relations by current curriculum phase
+            eval_rel = getattr(args, "relations", None)
+            try:
+                if int(getattr(args, "curriculum_enable", 0)) > 0 and int(getattr(args, "eval_follow_curriculum", 1)) > 0:
+                    if curr_phase == "BasicsA":
+                        # early skills: parity/successor/predecessor/offset(+2)
+                        eval_rel = "same_parity,successor,predecessor,add_2"
+                    elif curr_phase == "BasicsB":
+                        # comparison-focused
+                        eval_rel = "greater,smaller"
+                    elif curr_phase == "Structure":
+                        # place/face value structure
+                        eval_rel = "same_tens,same_ones"
+                    else:
+                        # Composition or unknown -> keep user-provided set
+                        eval_rel = getattr(args, "relations", None)
+            except Exception:
+                eval_rel = getattr(args, "relations", None)
+
             val_acc_pair = _quick_eval(
                 model,
                 gen,
@@ -2844,7 +2863,7 @@ def train(args):
                 eval_batches=10,
                 max_len=seq_len,
                 num_numbers=num_numbers,
-                relations=getattr(args, "relations", None),
+                relations=eval_rel,
                 probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
                 probe_alpha=getattr(args, "probe_alpha", 0.7),
                 proto=proto,
@@ -3003,7 +3022,7 @@ def train(args):
                 eval_batches=5,
                 max_len=seq_len,
                 num_numbers=num_numbers,
-                relations=getattr(args, "relations", None),
+                relations=eval_rel,
                 idx_range=in_range,
                 template_filter=tmpl_train,
                 probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
@@ -3021,7 +3040,7 @@ def train(args):
                     eval_batches=5,
                     max_len=seq_len,
                     num_numbers=num_numbers,
-                    relations=getattr(args, "relations", None),
+                    relations=eval_rel,
                     idx_range=ood_range,
                     template_filter=tmpl_train,
                     probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
@@ -3041,7 +3060,7 @@ def train(args):
                 eval_batches=5,
                 max_len=seq_len,
                 num_numbers=num_numbers,
-                relations=getattr(args, "relations", None),
+                relations=eval_rel,
                 idx_range=in_range,
                 template_filter=tmpl_ood,
                 probe=(probe if int(getattr(args, "probe_enable", 1)) > 0 else None),
@@ -3863,6 +3882,7 @@ def main():
     pt.add_argument("--curr_thr_bdry_B_lo", type=float, default=0.45, help="Boundary-OOD lower bound for BasicsB→Structure")
     pt.add_argument("--curr_thr_bdry_B_hi", type=float, default=0.60, help="Boundary-OOD upper bound for BasicsB→Structure")
     pt.add_argument("--curr_thr_tood_gap", type=float, default=0.05, help="Max template-OOD vs in-dist gap")
+    pt.add_argument("--eval_follow_curriculum", type=int, default=1, help="Make eval relations follow current curriculum phase (1=on, 0=off)")
     # Composition scheduler & bursts
     pt.add_argument("--comp_enable", type=int, default=1, help="Enable compositional data (1=on, 0=off)")
     pt.add_argument("--comp_init", type=float, default=0.15, help="Initial composition share r in Module A")
