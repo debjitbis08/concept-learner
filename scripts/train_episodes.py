@@ -2716,36 +2716,70 @@ def train(args):
                                 model, (ids_c, mask_c, y_tok_c, y_seq_c, y_stop_c), traces_c_canon, opt
                             )
                         # Fantasies: sample random programs from the learned library (functions + primitives)
+                        # Optionally disabled or gated to Composition phase to keep Dream aligned with curriculum.
                         try:
-                            def _sample_fantasy_traces(reasoner, k: int, max_steps: int):
+                            fantasy_enabled = int(getattr(args, "fantasy_enable", 0)) > 0
+                            # default: allow fantasies only in Composition when curriculum is on
+                            fantasy_only_comp = int(getattr(args, "fantasy_only_composition", 1)) > 0
+                            phase_ok = True
+                            try:
+                                if int(getattr(args, "curriculum_enable", 0)) > 0 and fantasy_only_comp:
+                                    phase_ok = (curr_phase == "Composition")
+                            except Exception:
+                                phase_ok = True
+                            if not (fantasy_enabled and phase_ok):
+                                raise Exception("fantasy-disabled-or-phase-gated")
+                            def _sample_fantasy_traces(reasoner, k: int, max_steps: int, allowed_prims: list[int], allowed_fns: list[int]):
                                 total = []
                                 num_prims = len(getattr(reasoner, 'prims', []))
-                                num_fn = 0
-                                nonempty_fns = []
+                                prim_pool = list(sorted(set(int(p) for p in allowed_prims if 0 <= int(p) < num_prims)))
+                                fn_pool = []
                                 if getattr(reasoner, 'use_functions', False) and getattr(reasoner, 'op_function', None) is not None:
-                                    slots = getattr(reasoner.op_function, 'slots', [])
-                                    for sid, sl in enumerate(slots):
-                                        if hasattr(sl, 'steps') and len(sl.steps) > 0:
-                                            nonempty_fns.append(sid)
-                                    num_fn = len(nonempty_fns)
+                                    # keep only currently non-empty function slots that were observed in wake traces
+                                    nonempty_now = [sid for sid, sl in enumerate(getattr(reasoner.op_function, 'slots', [])) if hasattr(sl, 'steps') and len(sl.steps) > 0]
+                                    fn_pool = [int(sid) for sid in allowed_fns if int(sid) in nonempty_now]
                                 import random as _r
+                                if len(prim_pool) == 0 and len(fn_pool) == 0:
+                                    return total
                                 for _ in range(k):
                                     L = max(1, min(max_steps, _r.randint(1, max_steps)))
                                     trace = []
                                     for __ in range(L):
-                                        # mix: 50% primitives, 50% functions if available
-                                        pick_fn = (num_fn > 0) and (_r.random() < 0.5)
+                                        pick_fn = len(fn_pool) > 0 and (_r.random() < 0.5)
                                         if pick_fn:
-                                            sid = nonempty_fns[_r.randrange(num_fn)]
-                                            trace.append(num_prims + sid)
+                                            sid = fn_pool[_r.randrange(len(fn_pool))]
+                                            trace.append(num_prims + int(sid))
                                         else:
-                                            pid = _r.randrange(max(1, num_prims))
-                                            trace.append(pid)
+                                            pid = prim_pool[_r.randrange(len(prim_pool))] if len(prim_pool) > 0 else None
+                                            if pid is not None:
+                                                trace.append(int(pid))
                                     total.append(trace)
                                 return total
                             # pair fantasies with observable data (ids/mask) from replay
                             k = min(len(replays), max(1, dream_bs // 2))
-                            traces_f = _sample_fantasy_traces(model.reasoner, k, getattr(model.reasoner, 'max_steps', 1))
+                            # Build allowed primitive/function pools from wake (replay buffer)
+                            try:
+                                num_prims = len(getattr(model.reasoner, 'prims', []))
+                                used_prims: set[int] = set()
+                                used_fns: set[int] = set()
+                                for it in getattr(rb, 'items', []):
+                                    tr_ = getattr(it, 'trace', [])
+                                    for a in tr_:
+                                        try:
+                                            ai = int(a)
+                                            if ai < num_prims:
+                                                used_prims.add(ai)
+                                            else:
+                                                used_fns.add(ai - num_prims)
+                                        except Exception:
+                                            continue
+                                allowed_prims = list(sorted(used_prims))
+                                allowed_fns = list(sorted(used_fns))
+                            except Exception:
+                                allowed_prims, allowed_fns = [], []
+                            traces_f = _sample_fantasy_traces(
+                                model.reasoner, k, getattr(model.reasoner, 'max_steps', 1), allowed_prims, allowed_fns
+                            )
                             if k > 0 and len(traces_f) == k:
                                 ids_f = ids_rep[:k]
                                 mask_f = mask_rep[:k]
@@ -2782,7 +2816,7 @@ def train(args):
                                     model, (ids_f, mask_f, y_tok_f, y_seq_f, y_stop_f), traces_f, opt
                                 )
                         except Exception:
-                            # fantasy generation is best-effort; ignore failures
+                            # silently skip fantasies when disabled or on error
                             pass
         except Exception:
             # keep training even if dreaming fails
@@ -3970,6 +4004,9 @@ def main():
     pt.add_argument("--on_demand_sleep", type=int, default=1, help="Enable on-demand short sleep when metrics regress (1=on, 0=off)")
     # Logging knobs
     pt.add_argument("--log_fantasies", type=int, default=0, help="Log up to N fantasy samples per dream cycle")
+    # Dream fantasies (synthetic action sequences)
+    pt.add_argument("--fantasy_enable", type=int, default=0, help="Enable sampling synthetic fantasies in Dream (1=on, 0=off)")
+    pt.add_argument("--fantasy_only_composition", type=int, default=1, help="Allow fantasies only in Composition phase when curriculum is enabled (1=on)")
     pt.add_argument("--ods_window", type=int, default=5, help="Window size (N evals) for moving-average drop detection")
     pt.add_argument("--ods_avg_drop", type=float, default=0.0175, help="Trigger if moving-average val acc drops by more than this absolute amount (e.g., 0.015=1.5 pts)")
     pt.add_argument("--ods_vq_chg", type=float, default=0.20, help="Trigger if average VQ assignment change exceeds this threshold (0..1)")
