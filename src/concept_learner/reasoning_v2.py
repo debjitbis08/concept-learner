@@ -159,8 +159,15 @@ class ReasonerV2(nn.Module):
                 torch.zeros(self.num_fn_slots),
                 persistent=False,
             )
+            # slot quality EMA used during candidate filtering (higher-order aware)
+            self.register_buffer(
+                "_slot_score_ema",
+                torch.zeros(self.num_fn_slots),
+                persistent=False,
+            )
         else:
             self._slot_usage_ema = None
+            self._slot_score_ema = None
         # post-install function action logit bias (decays over time)
         if self.use_functions:
             self.register_buffer(
@@ -788,19 +795,60 @@ class ReasonerV2(nn.Module):
             mdl_gain_threshold=(self.mdl_gain_threshold if mdl_gain_threshold is None else mdl_gain_threshold),
             existing_patterns=existing,
         )
-        # Post-filter candidates by body length, effect, and diversity
-        def _prim_seq_from_steps(steps: List[StepSpec]) -> List[int]:
-            # Extract only primitive indices from a candidate body; ignore functions/conds.
-            seq: List[int] = []
-            for st in steps:
-                if st.kind == "primitive" and st.idx is not None:
-                    seq.append(int(st.idx))
-                elif st.kind == "return":
+        # Post-filter candidates by higher-order aware score, diversity
+        def _expand_prims_and_callees(
+            steps: List[StepSpec], depth: int = 0, depth_cap: int = 3, step_cap: int = 16, seen: set | None = None
+        ) -> tuple[list[int], list[int]]:
+            prims: list[int] = []
+            callees: list[int] = []
+            if depth > depth_cap or step_cap <= 0:
+                return prims, callees
+            for st in steps or []:
+                if st.kind == "return":
                     break
+                if st.kind == "primitive" and st.idx is not None:
+                    prims.append(int(st.idx))
+                    step_cap -= 1
+                    if step_cap <= 0:
+                        break
+                elif st.kind == "function" and st.idx is not None:
+                    sid = int(st.idx)
+                    callees.append(sid)
+                    if 0 <= sid < self.num_fn_slots:
+                        body = self.op_function.slots[sid].steps
+                        # recursion guard
+                        seen2 = set() if seen is None else set(seen)
+                        key = (depth, sid)
+                        if key in seen2:
+                            continue
+                        seen2.add(key)
+                        p2, c2 = _expand_prims_and_callees(body, depth + 1, depth_cap, step_cap, seen2)
+                        prims.extend(p2)
+                        callees.extend(c2)
+                        step_cap -= len(p2)
+                        if step_cap <= 0:
+                            break
+                elif st.kind == "cond":
+                    # expand both branches conservatively
+                    sid_then = int(st.idx) if st.idx is not None else -1
+                    sid_else = int(st.idx2) if hasattr(st, 'idx2') and st.idx2 is not None else -1
+                    for sid in [sid_then, sid_else]:
+                        if 0 <= sid < self.num_fn_slots:
+                            body = self.op_function.slots[sid].steps
+                            p2, c2 = _expand_prims_and_callees(body, depth + 1, depth_cap, step_cap)
+                            prims.extend(p2)
+                            callees.extend(c2)
+                            step_cap -= len(p2)
+                            if step_cap <= 0:
+                                break
                 else:
-                    # ignore non-primitive steps for effect/diversity scoring
+                    # ignore other kinds for scoring
                     continue
-            return seq
+            return prims, callees
+
+        def _prim_seq_from_steps(steps: List[StepSpec]) -> List[int]:
+            prims, _ = _expand_prims_and_callees(steps)
+            return prims
 
         prim_effects = getattr(self, "_last_prim_effects", None)
         # build existing library vectors for cosine/overlap
@@ -816,12 +864,21 @@ class ReasonerV2(nn.Module):
 
         filtered: List[FnCandidate] = []
         for cand in cands:
-            seq = _prim_seq_from_steps(cand.steps)
+            # Expand candidate to primitives and callees
+            seq, callees = _expand_prims_and_callees(cand.steps)
             if len(seq) < self.mine_min_body_len:
                 continue
-            # effect threshold: sum recent primitive effects along sequence
+            # effect threshold: sum recent primitive effects along expanded sequence + function EMA bonuses
             if isinstance(prim_effects, torch.Tensor):
-                eff = float(sum([float(prim_effects[min(j, prim_effects.numel()-1)].item()) for j in seq]))
+                eff_prim = float(sum([float(prim_effects[min(j, prim_effects.numel()-1)].item()) for j in seq]))
+                fn_bonus = 0.0
+                if getattr(self, "_slot_score_ema", None) is not None:
+                    for sid in set(int(s) for s in callees if 0 <= int(s) < self.num_fn_slots):
+                        try:
+                            fn_bonus += float(self._slot_score_ema[int(sid)].item())
+                        except Exception:
+                            pass
+                eff = eff_prim + fn_bonus
                 if eff < self.mine_min_effect:
                     continue
             # diversity filters
@@ -855,6 +912,26 @@ class ReasonerV2(nn.Module):
                 self.op_function.prune(usage, self.prune_threshold)
             except Exception:
                 pass
+        # Update slot score EMA for newly installed functions
+        try:
+            if getattr(self, "_slot_score_ema", None) is not None and isinstance(prim_effects, torch.Tensor):
+                for sid in installed:
+                    if not (0 <= int(sid) < self.num_fn_slots):
+                        continue
+                    steps = self.op_function.slots[int(sid)].steps
+                    seq, callees = _expand_prims_and_callees(steps)
+                    eff_prim = float(sum([float(prim_effects[min(j, prim_effects.numel()-1)].item()) for j in seq]))
+                    fn_bonus = 0.0
+                    for s2 in set(int(s) for s in callees if 0 <= int(s) < self.num_fn_slots and int(s) != int(sid)):
+                        try:
+                            fn_bonus += float(self._slot_score_ema[int(s2)].item())
+                        except Exception:
+                            pass
+                    base = eff_prim + fn_bonus
+                    # EMA update
+                    self._slot_score_ema[int(sid)] = 0.9 * self._slot_score_ema[int(sid)] + 0.1 * torch.tensor(base, device=self._slot_score_ema.device)
+        except Exception:
+            pass
         # Boost newly installed functions via logit bias (decaying)
         if self.use_functions and self._fn_post_bias is not None and len(installed) > 0:
             for sid in installed:
