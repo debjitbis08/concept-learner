@@ -115,6 +115,12 @@ def load_checkpoint(path, model, opt, map_location=None, ema=None, proto: ProtoR
             _resize_like("decoder.token_head.bias", model.decoder.token_head.bias)
             _resize_like("decoder.seq_head.weight", model.decoder.seq_head.weight)
             _resize_like("decoder.seq_head.bias", model.decoder.seq_head.bias)
+            # also adjust numeric stream head if present in checkpoint
+            try:
+                _resize_like("decoder.num_head.weight", model.decoder.num_head.weight)
+                _resize_like("decoder.num_head.bias", model.decoder.num_head.bias)
+            except Exception:
+                pass
         # try loading with relaxed strictness after adjustments
         model.load_state_dict(sd, strict=False)
     if opt is not None and "opt" in ckpt:
@@ -238,12 +244,24 @@ def _quick_eval(
                     # Fallback: approximate with h_pool if typed state not exposed
                     s_typed = h_pool
                 feat = ProtoRouter.build_feature(h_pool, s_typed, proto_space)
-                YES_IDX = num_numbers
-                NO_IDX = num_numbers + 1
+                # Map YES/NO indices based on head space
+                C = logits_seq.size(-1)
+                if C == tok.vocab_size:
+                    YES_IDX = tok.token_id("yes")
+                    NO_IDX = tok.token_id("no")
+                else:
+                    YES_IDX = num_numbers
+                    NO_IDX = num_numbers + 1
                 # Apply bias; do not update in eval
                 logits_seq = proto.apply_bias(logits_seq, feat, batch["rel"], YES_IDX, NO_IDX, train_mode=False)
-        NO_IDX = num_numbers + 1
-        YES_IDX = num_numbers
+        # YES/NO for downstream decisions
+        C = logits_seq.size(-1)
+        if C == tok.vocab_size:
+            YES_IDX = tok.token_id("yes")
+            NO_IDX = tok.token_id("no")
+        else:
+            YES_IDX = num_numbers
+            NO_IDX = num_numbers + 1
         # Optional kNN posterior mixing on full classes
         if knn is not None:
             with torch.no_grad():
@@ -256,9 +274,11 @@ def _quick_eval(
                 p_knn = knn.posterior(feat)
                 a = float(knn_alpha if knn_alpha is not None else 0.2)
                 a_end = float(knn_alpha_end if knn_alpha_end is not None else a)
-                # Use provided alpha (caller may pass decayed value)
-                p = (a * p_model + (1.0 - a) * p_knn).clamp_min(1e-8)
-                logits_seq = torch.log(p)
+                # Use provided alpha (caller may pass decayed value); only if shapes match
+                if p_knn.shape == p_model.shape:
+                    p = (a * p_model + (1.0 - a) * p_knn).clamp_min(1e-8)
+                    logits_seq = torch.log(p)
+                # else: skip knn mixing when head dims differ (e.g., vocab head)
                 # safety: sanitize logits before downstream use
                 logits_seq = torch.nan_to_num(logits_seq, nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
         if probe is not None and getattr(probe, "w", None) is not None:
@@ -354,6 +374,119 @@ def _pack_text_batch(
         ids[i] = torch.tensor(enc.ids[:max_len], dtype=torch.long, device=device)
         mask[i] = torch.tensor(enc.mask[:max_len], dtype=torch.long, device=device)
     return ids, mask
+
+
+@torch.no_grad()
+def _generate_text(
+    model: CLModel,
+    tok: HFTokenizerWrapper,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    max_new_tokens: int = 8,
+) -> str:
+    """Greedy token-level generation using the decoder's token head.
+
+    Starts from provided `ids, mask` (B=1) and appends up to `max_new_tokens` tokens,
+    stopping on `[SEP]` or when max length is reached. Returns decoded string.
+    """
+    B = ids.size(0)
+    assert B == 1, "_generate_text expects batch size 1"
+    cur_ids = ids.clone()
+    cur_mask = mask.clone()
+    sep_id = getattr(tok, "sep_id", 2)
+    pad_id = getattr(tok, "pad_id", 0)
+    for _ in range(max_new_tokens):
+        logits_tok, _, _, _, _, _ = model(cur_ids, cur_mask)
+        # pick last non-pad position in mask (or last index)
+        last_idx = int(cur_mask[0].nonzero(as_tuple=False).max().item())
+        next_id = logits_tok[:, last_idx, :].argmax(dim=-1)  # (1,)
+        nid = int(next_id.item())
+        if nid == sep_id or nid == pad_id:
+            break
+        # find first pad index
+        pad_pos = int((cur_mask[0] == 0).nonzero(as_tuple=False)[0].item()) if (cur_mask[0] == 0).any() else cur_ids.size(1) - 1
+        if pad_pos >= cur_ids.size(1):
+            break
+        cur_ids[0, pad_pos] = nid
+        cur_mask[0, pad_pos] = 1
+    # decode complete sequence skipping specials
+    gen_ids = cur_ids[0].tolist()
+    text = tok.decode(gen_ids, skip_special_tokens=True)
+    return text
+
+
+@torch.no_grad()
+def _generate_token_ids(
+    model: CLModel,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    max_new_tokens: int = 8,
+) -> list[int]:
+    """Greedy decode; return only newly generated token ids (B=1)."""
+    B = ids.size(0)
+    assert B == 1, "_generate_token_ids expects batch size 1"
+    cur_ids = ids.clone()
+    cur_mask = mask.clone()
+    start_len = int(cur_mask[0].sum().item())
+    out: list[int] = []
+    for _ in range(max_new_tokens):
+        logits_tok, _, _, _, _, _ = model(cur_ids, cur_mask)
+        last_idx = int(cur_mask[0].nonzero(as_tuple=False).max().item())
+        next_id = int(logits_tok[:, last_idx, :].argmax(dim=-1)[0].item())
+        # stop if no space
+        nz = (cur_mask[0] == 0).nonzero(as_tuple=False)
+        if nz.numel() == 0:
+            break
+        pad_pos = int(nz[0].item())
+        cur_ids[0, pad_pos] = next_id
+        cur_mask[0, pad_pos] = 1
+        out.append(next_id)
+    return out
+
+
+def _pack_io_pair_batch(
+    tok: HFTokenizerWrapper,
+    inputs: list[str],
+    targets: list[str],
+    max_len: int,
+    device: str,
+):
+    """Pack (input, target) pairs into a single sequence, returning:
+    ids, mask, y_tok, loss_mask. Loss is computed only on target span.
+    Layout: [CLS] input ... [SEP] target ... [SEP] [PAD] ...
+    """
+    assert len(inputs) == len(targets)
+    B = len(inputs)
+    pad_id = getattr(tok, 'pad_id', 0)
+    cls_id = getattr(tok, 'cls_id', 1)
+    sep_id = getattr(tok, 'sep_id', 2)
+    ids: list[list[int]] = []
+    masks: list[list[int]] = []
+    ys: list[list[int]] = []
+    lms: list[list[float]] = []
+    for i in range(B):
+        enc_in = tok.encode(inputs[i], max_len=max_len)
+        enc_tg = tok.encode(targets[i], max_len=max_len)
+        in_ids = [x for x in enc_in.ids if x != cls_id]
+        tg_ids = [x for x in enc_tg.ids if x != cls_id]
+        cur = [cls_id]; cur.extend(in_ids); cur.append(sep_id)
+        t_start = len(cur)
+        cur.extend(tg_ids); cur.append(sep_id)
+        cur = cur[:max_len]
+        m = [1]*len(cur) + [0]*max(0, max_len-len(cur))
+        cur = cur + [pad_id]*max(0, max_len-len(cur))
+        y_i = [0]*max_len
+        l_i = [0.0]*max_len
+        t_end = min(len(cur), t_start + len(tg_ids))
+        for j in range(t_start, t_end):
+            y_i[j] = cur[j]
+            l_i[j] = 1.0
+        ids.append(cur); masks.append(m); ys.append(y_i); lms.append(l_i)
+    import torch as _t
+    return (_t.tensor(ids, dtype=_t.long, device=device),
+            _t.tensor(masks, dtype=_t.long, device=device),
+            _t.tensor(ys, dtype=_t.long, device=device),
+            _t.tensor(lms, dtype=_t.float32, device=device))
 
 
 def _pair_templates(a: int, b: int, r: int) -> List[str]:
@@ -853,7 +986,7 @@ def train(args):
     model = CLModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
-        num_classes=num_numbers + 4,
+        num_classes=(vocab_size if int(getattr(args, "decoder_vocab", 0)) > 0 else (num_numbers + 4)),
         pad_id=0,
         cls_id=1,
         max_len=args.max_len,
@@ -1808,9 +1941,10 @@ def train(args):
                     if dec > 0:
                         t = min(1.0, max(0.0, (step - start_step) / float(max(1, dec))))
                         alpha = (1.0 - t) * alpha + t * a_end
-                    with torch.no_grad():
-                        p_model = torch.softmax(logits_seq, dim=-1)
-                        p_knn = knn.posterior(feat)
+                with torch.no_grad():
+                    p_model = torch.softmax(logits_seq, dim=-1)
+                    p_knn = knn.posterior(feat)
+                    if p_knn.shape == p_model.shape:
                         p_mix = (alpha * p_model + (1.0 - alpha) * p_knn).clamp_min(1e-8)
                         # replace logits_seq by log of mixed prob for CE
                         logits_seq = torch.log(p_mix)
@@ -2631,7 +2765,12 @@ def train(args):
         if (step + 1) % args.log_every == 0:
             with torch.no_grad():
                 from concept_learner.utils import select_pair_columns_safe
-                lp = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab")
+                Clog = logits_seq.size(-1)
+                if Clog == tok.vocab_size:
+                    y_idx = tok.token_id("yes"); n_idx = tok.token_id("no")
+                else:
+                    y_idx = num_numbers; n_idx = num_numbers + 1
+                lp = select_pair_columns_safe(logits_seq, n_idx, y_idx, order="ab")
                 probs = torch.softmax(lp, dim=-1)[:, 1].mean().item()
                 # action entropy snapshot
                 try:
@@ -2893,6 +3032,12 @@ def train(args):
             )
             with torch.no_grad():
                 _, logits_b, _, _, _, _ = model(ids_b, mask_b)
+                # dynamic YES/NO indices
+                Cb = logits_b.size(-1)
+                if Cb == tok.vocab_size:
+                    YES_IDX = tok.token_id("yes"); NO_IDX = tok.token_id("no")
+                else:
+                    YES_IDX = num_numbers; NO_IDX = num_numbers + 1
                 if proto is not None:
                     h_b, _ = model.enc(ids_b, mask_b)
                     s_b = getattr(model.reasoner, "_last_s", None)
@@ -3083,14 +3228,10 @@ def evaluate(args):
     tok = HFTokenizerWrapper("bert-base-cased")
     vocab_size = tok.vocab_size
     num_numbers = ecfg.max_number
-    YES_IDX = num_numbers
-    NO_IDX = num_numbers + 1
-    EVEN_IDX = num_numbers + 2
-    ODD_IDX = num_numbers + 3
     model = CLModel(
         vocab_size=vocab_size,
         d_model=args.d_model,
-        num_classes=num_numbers + 4,
+        num_classes=vocab_size,
         pad_id=0,
         cls_id=1,
         max_len=args.max_len,
@@ -3123,7 +3264,12 @@ def evaluate(args):
                 y = batch["label"].to(device)
                 _, logits_seq_fit, _, _, _, _ = model(ids, mask)
                 from concept_learner.utils import select_pair_columns_safe
-                lp = select_pair_columns_safe(logits_seq_fit, NO_IDX, YES_IDX, order="ab")
+                Cfit = logits_seq_fit.size(-1)
+                if Cfit == tok.vocab_size:
+                    y_idx = tok.token_id("yes"); n_idx = tok.token_id("no")
+                else:
+                    y_idx = num_numbers; n_idx = num_numbers + 1
+                lp = select_pair_columns_safe(logits_seq_fit, n_idx, y_idx, order="ab")
                 logits_stack.append(lp)
                 labels_stack.append(y)
             if len(logits_stack) > 0:
@@ -3182,12 +3328,19 @@ def evaluate(args):
                 p_m = torch.softmax(logits_seq, dim=-1)
                 p_k = _eval_knn.posterior(feat_e)
                 a = float(getattr(args, 'knn_alpha_end', 0.1))
-                p_mix = (a * p_m + (1.0 - a) * p_k).clamp_min(1e-8)
-                logits_seq = torch.log(p_mix)
+                if p_k.shape == p_m.shape:
+                    p_mix = (a * p_m + (1.0 - a) * p_k).clamp_min(1e-8)
+                    logits_seq = torch.log(p_mix)
             except Exception:
                 pass
         from concept_learner.utils import select_pair_columns_safe
-        logits_pair = select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab") / T
+        # dynamic YES/NO indices
+        Ccur = logits_seq.size(-1)
+        if Ccur == tok.vocab_size:
+            y_idx = tok.token_id("yes"); n_idx = tok.token_id("no")
+        else:
+            y_idx = num_numbers; n_idx = num_numbers + 1
+        logits_pair = select_pair_columns_safe(logits_seq, n_idx, y_idx, order="ab") / T
         pred = logits_pair.argmax(dim=-1)
         probs = torch.softmax(logits_pair, dim=-1)[:, 1]
         correct += (pred == y).sum().item()
@@ -3297,7 +3450,12 @@ def evaluate(args):
                 y = batch["label"].to(device)
                 _, logits_seq_r, _, _, _, _ = model(ids, mask)
                 from concept_learner.utils import select_pair_columns_safe
-                logits_pair_r = select_pair_columns_safe(logits_seq_r, NO_IDX, YES_IDX, order="ab") / T
+                Cr = logits_seq_r.size(-1)
+                if Cr == tok.vocab_size:
+                    y_idx = tok.token_id("yes"); n_idx = tok.token_id("no")
+                else:
+                    y_idx = num_numbers; n_idx = num_numbers + 1
+                logits_pair_r = select_pair_columns_safe(logits_seq_r, n_idx, y_idx, order="ab") / T
                 pred_r = logits_pair_r.argmax(dim=-1)
                 acc_r = (pred_r == y).float().mean().item()
                 print(f"  {rname:12s}: acc={acc_r:.3f}")
@@ -3405,7 +3563,12 @@ def evaluate(args):
     rel = rel.tolist() if rel is not None else [None] * len(y)
     _, logits_seq, _, _, _, _ = model(ids, mask)
     from concept_learner.utils import select_pair_columns_safe
-    probs = torch.softmax(select_pair_columns_safe(logits_seq, NO_IDX, YES_IDX, order="ab"), dim=-1)[:, 1].tolist()
+    Csum = logits_seq.size(-1)
+    if Csum == tok.vocab_size:
+        y_idx = tok.token_id("yes"); n_idx = tok.token_id("no")
+    else:
+        y_idx = num_numbers; n_idx = num_numbers + 1
+    probs = torch.softmax(select_pair_columns_safe(logits_seq, n_idx, y_idx, order="ab"), dim=-1)[:, 1].tolist()
 
     def rel_name(r):
         names = [
@@ -3636,6 +3799,7 @@ def main():
     pt.add_argument("--lr", type=float, default=3e-4)
     pt.add_argument("--weight_decay", type=float, default=0.0)
     pt.add_argument("--label_smoothing", type=float, default=0.0)
+    pt.add_argument("--decoder_vocab", type=int, default=1, help="Use vocab-sized decoder head for token generation (1=on)")
     pt.add_argument("--amp", action="store_true", help="Enable CUDA AMP mixed precision to save memory")
     # Schedules / stability tweaks
     pt.add_argument("--head_boost_steps", type=int, default=5000, help="Multiply LR for action/STOP heads during first N steps")
@@ -3905,24 +4069,145 @@ def main():
     ask.add_argument("--checkpoint", type=str, required=True)
     ask.add_argument("--max_len", type=int, default=32)
     ask.add_argument("--text", type=str, required=True, help="Question text to ask")
+    # Token-generation training and inference
+    gen_train = sub.add_parser("gen-train", help="Train token generation on (input,target) pairs")
+    gen_train.add_argument("--device", type=str, default=None)
+    gen_train.add_argument("--d_model", type=int, default=128)
+    gen_train.add_argument("--max_len", type=int, default=64)
+    gen_train.add_argument("--steps", type=int, default=2000)
+    gen_train.add_argument("--batch_size", type=int, default=16)
+    gen_train.add_argument("--lr", type=float, default=3e-4)
+    gen_train.add_argument("--weight_decay", type=float, default=0.01)
+    gen_train.add_argument("--save_dir", type=str, default=None)
+    gen_train.add_argument("--ckpt_every", type=int, default=500)
+    gen_train.add_argument("--resume", type=str, default=None)
+    gen_train.add_argument("--amp", action="store_true")
+    gen_train.add_argument("--synth", action="store_true", help="Use built-in synthetic pairs (e.g., arithmetic/comparison)")
+    gen_train.add_argument("--max_number", type=int, default=100)
+    gen_train.add_argument("--base10", action="store_true")
+
+    gen_infer = sub.add_parser("generate", help="Generate a short free-text answer")
+    gen_infer.add_argument("--device", type=str, default=None)
+    gen_infer.add_argument("--d_model", type=int, default=128)
+    gen_infer.add_argument("--checkpoint", type=str, required=True)
+    gen_infer.add_argument("--max_len", type=int, default=64)
+    gen_infer.add_argument("--text", type=str, required=True)
+    gen_infer.add_argument("--max_new_tokens", type=int, default=8)
+    ask.add_argument("--generate", action="store_true", help="Use token-level generation over vocab (requires decoder_vocab checkpoint)")
 
     args = p.parse_args()
     if args.cmd == "eval":
         evaluate(args)
         return
+    if args.cmd == "generate":
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        tok = HFTokenizerWrapper("bert-base-cased")
+        model = CLModel(
+            vocab_size=tok.vocab_size,
+            d_model=args.d_model,
+            num_classes=tok.vocab_size,
+            pad_id=0,
+            cls_id=1,
+            max_len=args.max_len,
+        ).to(device)
+        load_checkpoint(args.checkpoint, model, opt=None, map_location=device)
+        model.eval()
+        ids, mask = _pack_text_batch([args.text], tok, args.max_len, device)
+        with torch.no_grad():
+            out = _generate_text(model, tok, ids, mask, max_new_tokens=args.max_new_tokens)
+            print(out)
+        return
+    if args.cmd == "gen-train":
+        # Minimal seq-to-seq training with token-level CE on target span
+        import random as _r
+        device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+        tok = HFTokenizerWrapper("bert-base-cased")
+        model = CLModel(
+            vocab_size=tok.vocab_size,
+            d_model=args.d_model,
+            num_classes=tok.vocab_size,
+            pad_id=0,
+            cls_id=1,
+            max_len=args.max_len,
+        ).to(device)
+        decay, no_decay = [], []
+        for n, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.endswith(".bias") or "norm" in n.lower() or "codebook" in n.lower():
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        opt = torch.optim.AdamW([
+            {"params": decay, "weight_decay": args.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ], lr=args.lr)
+        use_amp = bool(getattr(args, "amp", False)) and (str(device).startswith("cuda") and torch.cuda.is_available())
+        amp_ctx = (lambda: torch.amp.autocast("cuda")) if use_amp else nullcontext
+        scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+        start = 0
+        if args.resume and os.path.isfile(args.resume):
+            start = load_checkpoint(args.resume, model, opt, map_location=device)
+            print(f"Resumed from {args.resume} at step {start}")
+        # Optional synthetic pairs for a simple starting point
+        def synth_batch(B: int):
+            prompts, answers = [], []
+            # arithmetic and comparison
+            for _ in range(B):
+                a = _r.randrange(0, max(2, args.max_number))
+                b = _r.randrange(0, max(2, args.max_number))
+                if _r.random() < 0.5:
+                    k = _r.randrange(-5, 6)
+                    if k >= 0:
+                        prompts.append(f"What is {a}+{k}?")
+                        answers.append(str(a + k))
+                    else:
+                        prompts.append(f"What is {a}{k}?")
+                        answers.append(str(a + k))
+                else:
+                    prompts.append(f"Is {a} > {b}?")
+                    answers.append("yes" if a > b else "no")
+            return prompts, answers
+        for step in range(start, args.steps):
+            if args.synth:
+                x, y = synth_batch(args.batch_size)
+            else:
+                # Placeholder: extend to load user datasets
+                x, y = synth_batch(args.batch_size)
+            ids, mask, y_tok, lmask = _pack_io_pair_batch(tok, x, y, args.max_len, device)
+            with amp_ctx():
+                logits_tok, _, vq_loss, _, _, _ = model(ids, mask)
+                B, T, C = logits_tok.shape
+                import torch.nn.functional as _F
+                loss_all = _F.cross_entropy(logits_tok.view(-1, C), y_tok.view(-1), reduction="none").view(B, T)
+                denom = lmask.sum().clamp_min(1.0)
+                loss_tok = (loss_all * lmask).sum() / denom
+                loss = loss_tok + 0.1 * vq_loss
+            opt.zero_grad(set_to_none=True)
+            if use_amp:
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                opt.step()
+            if (step + 1) % 50 == 0:
+                print(f"step {step+1}/{args.steps} loss_tok={float(loss_tok.item()):.4f} vq={float(vq_loss.item()):.3f}")
+            if args.save_dir and (step + 1) % args.ckpt_every == 0:
+                os.makedirs(args.save_dir, exist_ok=True)
+                save_checkpoint(os.path.join(args.save_dir, "latest.pt"), model, opt, step + 1)
+        return
     if args.cmd == "ask":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
         tok = HFTokenizerWrapper("bert-base-cased")
         vocab_size = tok.vocab_size
-        num_numbers = args.max_number
-        YES_IDX = num_numbers
-        NO_IDX = num_numbers + 1
-        EVEN_IDX = num_numbers + 2
-        ODD_IDX = num_numbers + 3
         model = CLModel(
             vocab_size=vocab_size,
             d_model=args.d_model,
-            num_classes=num_numbers + 4,
+            num_classes=(vocab_size if bool(getattr(args, 'generate', False)) else (num_numbers + 4)),
             pad_id=0,
             cls_id=1,
             max_len=args.max_len,
@@ -3932,21 +4217,8 @@ def main():
         model.eval()
         ids, mask = _pack_text_batch([args.text], tok, args.max_len, device)
         with torch.no_grad():
-            _, logits_seq, _, _, _, _ = model(ids, mask)
-            pred = logits_seq.argmax(dim=-1)[0].item()
-            if pred < num_numbers:
-                ans = str(int(pred))
-            elif pred == YES_IDX:
-                ans = "yes"
-            elif pred == NO_IDX:
-                ans = "no"
-            elif pred == EVEN_IDX:
-                ans = "even"
-            elif pred == ODD_IDX:
-                ans = "odd"
-            else:
-                ans = str(int(pred))
-            print(ans)
+            out = _generate_text(model, tok, ids, mask, max_new_tokens=8)
+            print(out)
         return
     if args.cmd == "count-train":
         device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -3959,11 +4231,11 @@ def main():
         )
         gen = EpisodeGenerator(ecfg)
         tok = HFTokenizerWrapper("bert-base-cased")
-        # Use unified head (numbers + {YES,NO,EVEN,ODD}) to match training checkpoints
+        # Use vocab-sized head by default for generation-compatible training
         model = CLModel(
             vocab_size=tok.vocab_size,
             d_model=args.d_model,
-            num_classes=ecfg.max_number + 4,
+            num_classes=tok.vocab_size,
             pad_id=0,
             cls_id=1,
             max_len=args.max_len,
@@ -3994,15 +4266,30 @@ def main():
             start = load_checkpoint(args.resume, model, opt, map_location=device)
             print(f"Resumed from {args.resume} at step {start}")
         best = -1.0
+        def _count_questions(kind, a, c):
+            import random as _r
+            texts = []
+            for k, ai, ci in zip(kind.tolist(), a.tolist(), c.tolist()):
+                if k == 0:
+                    texts.append(_r.choice([f"What comes after {ai}?", f"What is the successor of {ai}?", f"Next number after {ai}?",]))
+                elif k == 1:
+                    texts.append(_r.choice([f"What comes before {ai}?", f"What is the predecessor of {ai}?", f"Previous number before {ai}?",]))
+                else:
+                    texts.append(_r.choice([f"What number comes between {ai} and {ci}?", f"Which number is between {ai} and {ci}?",]))
+            return texts
+
         for step in range(start, args.steps):
             data = gen.sample_counting(batch=args.batch_size)
-            ids, mask = _pack_count_examples_text(
-                data["kind"], data["a"], data["c"], tok, max_len=args.max_len
-            )
-            y = data["target"].to(device)
+            prompts = _count_questions(data["kind"], data["a"], data["c"]) 
+            targets = [str(int(t)) for t in data["target"].tolist()]
+            ids, mask, y_tok, lmask = _pack_io_pair_batch(tok, prompts, targets, args.max_len, device)
             with amp_ctx_ct():
-                _, logits_seq, vq_loss, _, stop_logits, _ = model(ids, mask)
-                loss = torch.nn.functional.cross_entropy(logits_seq, y)
+                logits_tok, _, vq_loss, _, stop_logits, _ = model(ids, mask)
+                import torch.nn.functional as _F
+                Bc, Tc, Cc = logits_tok.shape
+                loss_all = _F.cross_entropy(logits_tok.view(-1, Cc), y_tok.view(-1), reduction="none").view(Bc, Tc)
+                denom = lmask.sum().clamp_min(1.0)
+                loss = (loss_all * lmask).sum() / denom + 0.1 * vq_loss
             opt.zero_grad(set_to_none=True)
             if use_amp_ct:
                 scaler_ct.scale(loss).backward()
@@ -4015,24 +4302,24 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
             if (step + 1) % args.log_every == 0:
-                # quick eval
+                # quick eval via generation and integer parsing
+                import re as _re
                 model.eval()
                 tot, hit = 0, 0
                 with torch.no_grad():
                     for _ in range(args.eval_batches):
-                        data2 = gen.sample_counting(batch=min(args.batch_size, 128))
-                        ids2, mask2 = _pack_count_examples_text(
-                            data2["kind"],
-                            data2["a"],
-                            data2["c"],
-                            tok,
-                            max_len=args.max_len,
-                        )
-                        y2 = data2["target"].to(device)
-                        _, logits_seq2, _, _, _, _ = model(ids2, mask2)
-                        pred2 = logits_seq2.argmax(dim=-1)
-                        hit += (pred2 == y2).sum().item()
-                        tot += y2.numel()
+                        d2 = gen.sample_counting(batch=min(args.batch_size, 128))
+                        prompts2 = _count_questions(d2["kind"], d2["a"], d2["c"]) 
+                        y2 = d2["target"].tolist()
+                        for i in range(len(prompts2)):
+                            iids, imask = _pack_text_batch([prompts2[i]], tok, args.max_len, device)
+                            gen_ids = _generate_token_ids(model, iids, imask, max_new_tokens=4)
+                            txt = tok.decode(gen_ids, skip_special_tokens=True)
+                            m = _re.search(r"[-+]?\d+", txt)
+                            pred = int(m.group(0)) if m else None
+                            if pred is not None and pred == int(y2[i]):
+                                hit += 1
+                            tot += 1
                 model.train()
                 val_acc = hit / max(1, tot)
                 print(
@@ -4083,68 +4370,69 @@ def main():
         model = CLModel(
             vocab_size=tok.vocab_size,
             d_model=args.d_model,
-            num_classes=ecfg.max_number,
+            num_classes=tok.vocab_size,
             pad_id=0,
             cls_id=1,
             max_len=args.max_len,
         ).to(device)
         load_checkpoint(args.checkpoint, model, opt=None, map_location=device)
         model.eval()
-        # eval
+        # eval via generation and integer parsing
+        import re as _re
         tot, hit = 0, 0
         with torch.no_grad():
             for _ in range(args.eval_batches):
                 data2 = gen.sample_counting(batch=min(256, 128))
-                ids2, mask2 = _pack_count_examples_text(
-                    data2["kind"], data2["a"], data2["c"], tok, max_len=args.max_len
-                )
-                y2 = data2["target"].to(device)
-                _, logits_seq2, _, _, _, _ = model(ids2, mask2)
-                # Only consider number slice for counting
-                C2 = logits_seq2.size(-1)
-                if C2 < ecfg.max_number:
-                    print(f"[warn] count-eval head smaller than max_number: C={C2} < {ecfg.max_number}")
-                take = min(ecfg.max_number, C2)
-                pred2 = logits_seq2[:, :take].argmax(dim=-1)
-                hit += (pred2 == y2).sum().item()
-                tot += y2.numel()
+                prompts2 = []
+                for k, ai, ci in zip(data2["kind"].tolist(), data2["a"].tolist(), data2["c"].tolist()):
+                    if k == 0:
+                        prompts2.append(f"What comes after {ai}?")
+                    elif k == 1:
+                        prompts2.append(f"What comes before {ai}?")
+                    else:
+                        prompts2.append(f"What number comes between {ai} and {ci}?")
+                gold = data2["target"].tolist()
+                for i in range(len(prompts2)):
+                    ids2, mask2 = _pack_text_batch([prompts2[i]], tok, args.max_len, device)
+                    gen_ids = _generate_token_ids(model, ids2, mask2, max_new_tokens=4)
+                    txt = tok.decode(gen_ids, skip_special_tokens=True)
+                    m = _re.search(r"[-+]?\d+", txt)
+                    pred = int(m.group(0)) if m else None
+                    if pred is not None and pred == int(gold[i]):
+                        hit += 1
+                    tot += 1
         print(f"Counting eval accuracy: {hit / max(1, tot):.3f}")
-        # sample questions
+        # sample questions via generation
         import random as _r
-
+        import re as _re
         with torch.no_grad():
             data = gen.sample_counting(batch=6)
-            ids, mask = _pack_count_examples_text(
-                data["kind"], data["a"], data["c"], tok, max_len=args.max_len
-            )
+            kind = data["kind"].tolist(); a = data["a"].tolist(); c = data["c"].tolist()
             y = data["target"].tolist()
-            _, logits_seq, _, _, _, _ = model(ids, mask)
-            C3 = logits_seq.size(-1)
-            take3 = min(ecfg.max_number, C3)
-            pred = logits_seq[:, :take3].argmax(dim=-1).tolist()
-            kind = data["kind"].tolist()
-            a = data["a"].tolist()
-            c = data["c"].tolist()
             for i in range(len(kind)):
                 if kind[i] == 0:
-                    phr = [
-                        f"What is the successor of {a[i]}?",
+                    q = _r.choice([
                         f"What comes after {a[i]}?",
-                        f"What number comes after {a[i]}?",
-                    ]
+                        f"What is the successor of {a[i]}?",
+                        f"Next number after {a[i]}?",
+                    ])
                 elif kind[i] == 1:
-                    phr = [
-                        f"What is the predecessor of {a[i]}?",
+                    q = _r.choice([
                         f"What comes before {a[i]}?",
-                        f"What number comes before {a[i]}?",
-                    ]
+                        f"What is the predecessor of {a[i]}?",
+                        f"Previous number before {a[i]}?",
+                    ])
                 else:
-                    phr = [
+                    q = _r.choice([
                         f"What number comes between {a[i]} and {c[i]}?",
                         f"Which number is between {a[i]} and {c[i]}?",
-                    ]
-                q = phr[_r.randrange(len(phr))]
-                print(f"Q: {q}\n   gold={y[i]} pred={pred[i]}")
+                    ])
+                ids, mask = _pack_text_batch([q], tok, args.max_len, device)
+                gen_ids = _generate_token_ids(model, ids, mask, max_new_tokens=4)
+                txt = tok.decode(gen_ids, skip_special_tokens=True)
+                m = _re.search(r"[-+]?\d+", txt)
+                pred = int(m.group(0)) if m else None
+                print(f"Q: {q}\n   gold={y[i]} pred={pred}")
         return
     # default to pair training when no subcommand is provided
     train(args if args.cmd == "train" else p.parse_args(["train"]))

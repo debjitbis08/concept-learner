@@ -59,8 +59,8 @@ class KNNSoftClassifier(nn.Module):
         """Return class posterior for each query in q: (B,C)."""
         if q is None or q.numel() == 0:
             return torch.zeros(0, self.C, device=self.feats.device)
-        # select valid memory entries
-        valid = self.labels >= 0
+        # select valid memory entries (labels within [0, C))
+        valid = (self.labels >= 0) & (self.labels < self.C)
         if valid.sum().item() == 0:
             return torch.zeros(q.size(0), self.C, device=self.feats.device)
         M = self.feats[valid]  # (M,D)

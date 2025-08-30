@@ -227,3 +227,41 @@ class HFTokenizerWrapper:
 
     def decode(self, ids: List[int], skip_special_tokens: bool = False) -> str:
         return self.tok.decode(ids, skip_special_tokens=skip_special_tokens)
+
+    def token_id(self, token: str) -> int:
+        """Best-effort mapping from a token string to its id.
+
+        - HF backend: uses convert_tokens_to_ids; falls back to encoding.
+        - Simple backend: grows vocab on demand using internal map, else encodes and
+          returns the first non-special id it finds.
+        """
+        # HF fast path
+        try:
+            if self.backend == "hf" and hasattr(self.tok, "convert_tokens_to_ids"):
+                idx = int(self.tok.convert_tokens_to_ids(token))  # type: ignore[attr-defined]
+                if idx is not None and idx >= 0:
+                    return idx
+        except Exception:
+            pass
+        # Simple backend direct map if available
+        try:
+            if hasattr(self.tok, "_tok2id") and callable(getattr(self.tok, "_tok2id")):
+                return int(self.tok._tok2id(token))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        # Fallback: encode and pick first non-special
+        try:
+            enc = self.tok([token], is_split_into_words=True, add_special_tokens=True, max_length=4, padding="max_length", truncation=True, return_attention_mask=True)  # type: ignore[call-arg]
+            ids = enc.get("input_ids") or enc.get("ids")
+            if isinstance(ids, list):
+                # handle nested for batch
+                if ids and isinstance(ids[0], list):
+                    ids = ids[0]
+                specials = {self.pad_id, self.cls_id, self.sep_id}
+                for i in ids:  # type: ignore[assignment]
+                    if i not in specials:
+                        return int(i)
+        except Exception:
+            pass
+        # Fallback to UNK id
+        return int(self.unk_id)
